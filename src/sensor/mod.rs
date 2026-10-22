@@ -1,0 +1,327 @@
+//! Shared sensor boundary types.
+//!
+//! `RawEvent` preserves platform-native facts at the bounded sensor channel.
+//! `HostState` converts that input into the cross-platform canonical boundary;
+//! process is the first payload category migrated to typed raw fields.
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub(crate) mod dns;
+#[cfg(any(windows, test))]
+mod integrity_level;
+#[cfg(target_os = "linux")]
+pub mod linux;
+#[cfg(target_os = "macos")]
+pub mod macos;
+#[cfg(any(windows, test))]
+mod network_events;
+mod process;
+#[cfg(windows)]
+pub mod windows;
+
+pub use crate::models::event_actions::{self, SensorNormalization};
+pub use crate::vocab::{Platform, ProcessStartKey, SensorAction};
+pub use process::{
+    RawLinuxProcess, RawLinuxProcessIdentity, RawMacOsExec, RawMacOsProcess, RawProcessEvent,
+    RawProcessPlatform, RawUserId, RawWindowsProcess,
+};
+
+use std::time::SystemTime;
+
+use anyhow::Result;
+use tokio::sync::mpsc::Sender;
+
+use crate::models::{
+    ApplicationEventFields, DnsQueryFields, EventCategory, EventFields, FileEventFields,
+    ImageLoadFields, NetworkConnectionFields, PowerShellClassicStartFields, PowerShellModuleFields,
+    PowerShellScriptFields, RegistryEventFields, SecurityAuditFields, ServiceCreationFields,
+    TaskCreationFields, WmiEventFields,
+};
+
+/// Cross-platform sensor interface.
+///
+/// Concrete sensors are responsible for decoding platform-specific telemetry
+/// into [`RawEvent`] values and emitting them through a bounded channel.
+pub trait Sensor: Send + Sync {
+    fn start(&self, tx: Sender<RawEvent>) -> Result<()>;
+    fn shutdown(&self);
+}
+
+/// Shared event handler trait for the post-host-state pipeline.
+pub trait CanonicalEventHandler: Send + Sync {
+    fn handle_event(&self, event: &crate::models::CanonicalEvent);
+}
+
+/// Shared raw event emitted by any platform sensor.
+///
+/// Process payloads preserve platform-native numeric facts. Other payload
+/// categories retain their compatibility shapes until they are migrated one at
+/// a time.
+#[derive(Debug, Clone)]
+pub struct RawEvent {
+    /// Native short process name, never an executable path or Sigma field.
+    pub process_name: Option<String>,
+    /// Sparse evidence for fields reconstructed or limited by this decoder.
+    pub provenance: crate::models::Provenance,
+    pub platform: Platform,
+    pub provider: &'static str,
+    pub action: SensorAction,
+    pub normalization: SensorNormalization,
+    pub pid: Option<u32>,
+    pub timestamp: SystemTime,
+    /// Native source ordering token, absent when the source has none.
+    pub source_seq: Option<u64>,
+    pub process_start_key: Option<ProcessStartKey>,
+    pub parent_process_start_key: Option<ProcessStartKey>,
+    pub payload: RawPayload,
+}
+
+impl RawEvent {
+    /// Return the event category, derived from the payload variant.
+    ///
+    /// This is the single source of truth — category is not stored separately
+    /// to avoid the field and payload falling out of sync.
+    pub fn category(&self) -> EventCategory {
+        self.payload.category()
+    }
+}
+
+/// Shared event router that dispatches canonical events to downstream handlers.
+pub struct SensorEventRouter {
+    handlers: Vec<Box<dyn CanonicalEventHandler>>,
+}
+
+impl SensorEventRouter {
+    pub fn new() -> Self {
+        Self {
+            handlers: Vec::new(),
+        }
+    }
+
+    pub fn register_handler(&mut self, handler: Box<dyn CanonicalEventHandler>) {
+        self.handlers.push(handler);
+    }
+
+    pub fn route_event(&self, event: &crate::models::CanonicalEvent) {
+        for handler in &self.handlers {
+            handler.handle_event(event);
+        }
+    }
+
+    /// Cross the host-state boundary and route the resulting canonical event.
+    pub fn route_raw_event(&self, host_state: &crate::state::HostState, event: &RawEvent) {
+        if let Some(event) = host_state.canonicalize(event.clone()) {
+            self.route_event(&event);
+        }
+    }
+}
+
+impl Default for SensorEventRouter {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Typed payload emitted by a sensor.
+#[derive(Debug, Clone)]
+pub enum RawPayload {
+    Process(RawProcessEvent),
+    Network(NetworkConnectionFields),
+    File(FileEventFields),
+    Dns(DnsQueryFields),
+    Registry(RegistryEventFields),
+    ImageLoad(ImageLoadFields),
+    DriverLoad(ImageLoadFields),
+    Scripting(PowerShellScriptFields),
+    PowerShellModule(PowerShellModuleFields),
+    PowerShellClassicStart(PowerShellClassicStartFields),
+    Wmi(WmiEventFields),
+    Service(ServiceCreationFields),
+    Task(TaskCreationFields),
+    Security(SecurityAuditFields),
+    Defender(SecurityAuditFields),
+    Application(ApplicationEventFields),
+}
+
+impl RawPayload {
+    /// Return the shared event category for this payload.
+    pub fn category(&self) -> EventCategory {
+        match self {
+            Self::Process(_) => EventCategory::Process,
+            Self::Network(_) => EventCategory::Network,
+            Self::File(_) => EventCategory::File,
+            Self::Dns(_) => EventCategory::Dns,
+            Self::Registry(_) => EventCategory::Registry,
+            Self::ImageLoad(_) => EventCategory::ImageLoad,
+            Self::DriverLoad(_) => EventCategory::DriverLoad,
+            Self::Scripting(_) => EventCategory::Scripting,
+            Self::PowerShellModule(_) => EventCategory::PowerShellModule,
+            Self::PowerShellClassicStart(_) => EventCategory::PowerShellClassicStart,
+            Self::Wmi(_) => EventCategory::Wmi,
+            Self::Service(_) => EventCategory::Service,
+            Self::Task(_) => EventCategory::Task,
+            Self::Security(_) => EventCategory::Security,
+            Self::Defender(_) => EventCategory::Defender,
+            Self::Application(_) => EventCategory::Application,
+        }
+    }
+
+    #[cfg(test)]
+    /// Convert the sensor payload back into the existing shared field enum.
+    pub fn into_event_fields(self) -> EventFields {
+        match self {
+            Self::Process(fields) => EventFields::ProcessCreation(fields.compatibility_fields()),
+            Self::Network(fields) => EventFields::NetworkConnection(fields),
+            Self::File(fields) => EventFields::FileEvent(fields),
+            Self::Dns(fields) => EventFields::DnsQuery(fields),
+            Self::Registry(fields) => EventFields::RegistryEvent(fields),
+            Self::ImageLoad(fields) | Self::DriverLoad(fields) => EventFields::ImageLoad(fields),
+            Self::Scripting(fields) => EventFields::PowerShellScript(fields),
+            Self::PowerShellModule(fields) => EventFields::PowerShellModule(fields),
+            Self::PowerShellClassicStart(fields) => EventFields::PowerShellClassicStart(fields),
+            Self::Wmi(fields) => EventFields::WmiEvent(fields),
+            Self::Service(fields) => EventFields::ServiceCreation(fields),
+            Self::Task(fields) => EventFields::TaskCreation(fields),
+            Self::Security(fields) => EventFields::SecurityAudit(fields),
+            Self::Defender(fields) => EventFields::SecurityAudit(fields),
+            Self::Application(fields) => EventFields::ApplicationEvent(fields),
+        }
+    }
+}
+
+impl TryFrom<EventFields> for RawPayload {
+    type Error = EventFields;
+
+    fn try_from(fields: EventFields) -> std::result::Result<Self, Self::Error> {
+        match fields {
+            EventFields::NetworkConnection(fields) => Ok(Self::Network(fields)),
+            EventFields::FileEvent(fields) => Ok(Self::File(fields)),
+            EventFields::DnsQuery(fields) => Ok(Self::Dns(fields)),
+            EventFields::RegistryEvent(fields) => Ok(Self::Registry(fields)),
+            EventFields::ImageLoad(fields) => Ok(Self::ImageLoad(fields)),
+            EventFields::PowerShellScript(fields) => Ok(Self::Scripting(fields)),
+            EventFields::PowerShellModule(fields) => Ok(Self::PowerShellModule(fields)),
+            EventFields::PowerShellClassicStart(fields) => Ok(Self::PowerShellClassicStart(fields)),
+            EventFields::WmiEvent(fields) => Ok(Self::Wmi(fields)),
+            EventFields::ServiceCreation(fields) => Ok(Self::Service(fields)),
+            EventFields::TaskCreation(fields) => Ok(Self::Task(fields)),
+            EventFields::SecurityAudit(fields) => Ok(Self::Security(fields)),
+            EventFields::ApplicationEvent(fields) => Ok(Self::Application(fields)),
+            other => Err(other),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+    use std::time::SystemTime;
+
+    use super::*;
+
+    #[test]
+    fn payload_category_matches_variant() {
+        let payload = RawPayload::Process(RawProcessEvent::from_compatibility(
+            crate::models::ProcessCreationFields {
+                hashes: None,
+                imphash: None,
+                container: Default::default(),
+                linux_identity: Default::default(),
+                cgroup_id: None,
+                exec: Default::default(),
+                parent_process_id_derived: false,
+                windows: Default::default(),
+                image: Some("/usr/bin/bash".to_string()),
+                image_source: None,
+                image_truncated: None,
+                original_file_name: None,
+                product: None,
+                description: None,
+                company: None,
+                file_version: None,
+                target_image: None,
+                command_line: Some("/usr/bin/bash -c id".to_string()),
+                process_id: Some("42".to_string()),
+                process_start_time: None,
+                parent_process_id: None,
+                parent_image: None,
+                parent_command_line: None,
+                parent_user: None,
+                current_directory: None,
+                integrity_level: None,
+                logon_id: None,
+                user: None,
+            },
+            Platform::Linux,
+            Some(42),
+        ));
+
+        assert_eq!(payload.category(), EventCategory::Process);
+        assert!(RawPayload::try_from(payload.into_event_fields()).is_err());
+    }
+
+    #[test]
+    fn sensor_event_category_is_derived_from_payload() {
+        let payload = RawPayload::Network(NetworkConnectionFields {
+            destination_ip: Some("198.51.100.10".to_string()),
+            source_ip: Some("10.0.0.5".to_string()),
+            destination_port: Some("443".to_string()),
+            source_port: Some("51324".to_string()),
+            process_id: Some("4242".to_string()),
+            image: Some("/usr/bin/curl".to_string()),
+            user: None,
+            destination_hostname: None,
+            protocol: Some("tcp".to_string()),
+            initiated: Some(true),
+        });
+
+        let event = RawEvent {
+            process_name: None,
+            provenance: Default::default(),
+            platform: Platform::Linux,
+            provider: "ebpf",
+            action: SensorAction::Connect,
+            normalization: SensorNormalization {
+                event_id: 3,
+                action_code: 12,
+            },
+            pid: Some(4242),
+            timestamp: SystemTime::UNIX_EPOCH,
+            source_seq: None,
+            process_start_key: None,
+            parent_process_start_key: None,
+            payload,
+        };
+
+        assert_eq!(event.category(), EventCategory::Network);
+        assert_eq!(event.action, SensorAction::Connect);
+        assert_eq!(event.pid, Some(4242));
+    }
+
+    #[test]
+    fn payload_round_trips_through_event_fields() {
+        let payload = RawPayload::File(FileEventFields {
+            source_filename: None,
+            target_filename: Some("/tmp/example".to_string()),
+            process_id: Some("77".to_string()),
+            image: Some("/usr/bin/touch".to_string()),
+            creation_utc_time: None,
+            previous_creation_utc_time: None,
+            user: None,
+            file_identity: None,
+            path_truncated: None,
+        });
+
+        let fields = payload.into_event_fields();
+        let payload = RawPayload::try_from(fields).expect("file fields should map");
+
+        assert_eq!(payload.category(), EventCategory::File);
+    }
+
+    #[test]
+    fn try_from_rejects_untyped_event_fields() {
+        let fields =
+            EventFields::Generic(HashMap::from([("key".to_string(), "value".to_string())]));
+
+        assert!(RawPayload::try_from(fields).is_err());
+    }
+}

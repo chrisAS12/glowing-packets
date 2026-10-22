@@ -1,0 +1,124 @@
+//! ETW property parsing and timestamp conversion.
+
+use super::props::EtwProperties;
+use crate::sensor::network_events::{decode_etw_ipv4, decode_etw_port, NetworkAddressFamily};
+use std::net::IpAddr;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+pub(super) const WINDOWS_EPOCH_DELTA_100NS: i64 = 116444736000000000;
+
+pub(super) fn filetime_to_system_time(filetime: i64) -> SystemTime {
+    let unix_100ns = filetime.saturating_sub(WINDOWS_EPOCH_DELTA_100NS).max(0) as u64;
+    let secs = unix_100ns / 10_000_000;
+    let nanos = (unix_100ns % 10_000_000) * 100;
+    // An i64 FILETIME minus the epoch delta is below Windows' u64 FILETIME
+    // limit, and nanos is below one second. Both additions are representable.
+    UNIX_EPOCH + Duration::from_secs(secs) + Duration::from_nanos(nanos)
+}
+
+pub(super) fn try_get_string(parser: &impl EtwProperties, property_name: &str) -> Option<String> {
+    let value = parser.get_string(property_name)?;
+    let trimmed = value.trim_end_matches('\0');
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
+pub(super) fn try_get_string_any(
+    parser: &impl EtwProperties,
+    property_names: &[&str],
+) -> Option<String> {
+    for property_name in property_names {
+        if let Some(value) = try_get_string(parser, property_name) {
+            return Some(value);
+        }
+    }
+    None
+}
+
+pub(super) fn try_get_uint(parser: &impl EtwProperties, property_name: &str) -> Option<String> {
+    if let Some(value) = parser.get_u32(property_name) {
+        return Some(value.to_string());
+    }
+    if let Some(value) = parser.get_u64(property_name) {
+        return Some(value.to_string());
+    }
+    if let Some(value) = parser.get_u16(property_name) {
+        return Some(value.to_string());
+    }
+    if let Some(value) = parser.get_u8(property_name) {
+        return Some(value.to_string());
+    }
+    None
+}
+
+pub(super) fn try_get_uint_as_u64(parser: &impl EtwProperties, property_name: &str) -> Option<u64> {
+    if let Some(value) = parser.get_u64(property_name) {
+        return Some(value);
+    }
+    if let Some(value) = parser.get_i64(property_name) {
+        return Some(value as u64);
+    }
+    if let Some(value) = parser.get_u32(property_name) {
+        return Some(value as u64);
+    }
+    None
+}
+
+pub(super) fn try_get_port(parser: &impl EtwProperties, property_name: &str) -> Option<String> {
+    if let Some(value) = parser.get_u16(property_name) {
+        return Some(decode_etw_port(value).to_string());
+    }
+    if let Some(value) = parser.get_u32(property_name) {
+        return Some(decode_etw_port(value as u16).to_string());
+    }
+    None
+}
+
+pub(super) fn try_get_ip(
+    parser: &impl EtwProperties,
+    property_name: &str,
+    address_family: NetworkAddressFamily,
+) -> Option<String> {
+    match address_family {
+        NetworkAddressFamily::Ipv4 => {
+            if let Some(addr) = parser.get_u32(property_name) {
+                return Some(decode_etw_ipv4(addr).to_string());
+            }
+        }
+        NetworkAddressFamily::Ipv6 => {
+            if let Some(IpAddr::V6(addr)) = parser.get_ip(property_name) {
+                return Some(addr.to_string());
+            }
+        }
+        NetworkAddressFamily::Unspecified => {
+            if let Some(ip) = parser.get_ip(property_name) {
+                return Some(ip.to_string());
+            }
+        }
+    }
+    try_get_string(parser, property_name)
+}
+
+pub(super) fn parse_optional_u32(value: Option<&str>) -> Option<u32> {
+    value.and_then(|value| value.parse::<u32>().ok())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn filetime_extremes_are_representable_without_panicking() {
+        for timestamp in [i64::MIN, 0, WINDOWS_EPOCH_DELTA_100NS] {
+            assert_eq!(filetime_to_system_time(timestamp), UNIX_EPOCH);
+        }
+        let duration = filetime_to_system_time(i64::MAX)
+            .duration_since(UNIX_EPOCH)
+            .unwrap();
+        let expected = (i64::MAX - WINDOWS_EPOCH_DELTA_100NS) as u64;
+        assert_eq!(duration.as_nanos(), u128::from(expected) * 100);
+    }
+}

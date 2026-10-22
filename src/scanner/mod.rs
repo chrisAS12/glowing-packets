@@ -1,0 +1,1381 @@
+//! Yara scanner module
+//!
+//! Compiles rules and runs YARA scans. Live on-disk targets are resolved by
+//! `crate::artifact`; this module queues process-memory scans.
+
+use anyhow::{Context, Result};
+use std::cell::RefCell;
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use tokio::sync::mpsc::Sender;
+use tracing::{debug, info, warn};
+use yara_x::{Compiler, Rules, Scanner as XScanner};
+
+use crate::models::{
+    AlertSeverity, CanonicalEvent, EventFields, MatchDebugLevel, ProcessCreationFields, Provenance,
+    YaraRuleMatch, YaraStringMatch,
+};
+use crate::sensor::CanonicalEventHandler;
+use crate::utils::cache::trim_to_headroom;
+use crate::utils::file_identity::{self, FileIdentity};
+use crate::utils::rule_dirs::{RuleCollision, RuleDirectoryReport, RuleDirectoryRole};
+use crate::utils::{hash_command_line, query_process_identity, ProcessIdentity};
+use crate::vocab::{Platform, SensorAction};
+
+/// Strip NT namespace prefix and convert to a path the YARA scanner can open.
+/// On Windows raw ETW paths may arrive as `\??\C:\Windows\...`.
+/// On Linux eBPF paths are already native (`/usr/bin/bash`) — return as-is.
+#[cfg(windows)]
+fn normalize_yara_path(nt_path: &str) -> String {
+    let cleaned = nt_path.strip_prefix("\\??\\").unwrap_or(nt_path);
+    crate::utils::convert_nt_to_dos(cleaned)
+}
+
+#[cfg(not(windows))]
+fn normalize_yara_path(path: &str) -> String {
+    path.to_string()
+}
+
+/// Normalize directory prefixes using the scanner's native path policy.
+pub fn normalize_allowlist_paths(values: &[String]) -> Vec<String> {
+    crate::utils::path_allowlist::PathAllowlistPolicy::ScannerDirectory.normalize_prefixes(values)
+}
+
+pub fn is_path_allowlisted(path: &str, allowlist_paths: &[String]) -> bool {
+    crate::utils::path_allowlist::PathAllowlistPolicy::ScannerDirectory
+        .is_match(path, allowlist_paths)
+}
+
+mod alert;
+pub use crate::config::{ScanLimits, DEFAULT_MAX_FILE_MB, DEFAULT_SCAN_TIMEOUT_MS};
+pub use alert::{build_yara_alert, build_yara_match_details};
+
+/// Why a scan did not produce a match verdict.
+///
+/// Timed-out and oversized targets stay distinct from engine failures so
+/// operators never see them collapse into clean results.
+#[derive(Debug, thiserror::Error)]
+pub enum ScanError {
+    /// The scan hit the configured per-scan timeout.
+    #[error("YARA scan timed out after {} ms", timeout.as_millis())]
+    TimedOut { timeout: Duration },
+    /// The shared budget for all regions of a process was exhausted.
+    #[error("YARA process deadline exceeded after {} ms", timeout.as_millis())]
+    ProcessDeadline { timeout: Duration },
+    /// The target was larger than the configured maximum and was not scanned.
+    #[error("target of {size} bytes exceeds the maximum scan size of {limit} bytes")]
+    TooLarge { size: u64, limit: u64 },
+    /// The scan engine or the underlying I/O failed.
+    #[error("{0:#}")]
+    Failed(anyhow::Error),
+}
+
+impl ScanError {
+    /// Short, stable label for logs and counters.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            ScanError::TimedOut { .. } => "timeout",
+            ScanError::ProcessDeadline { .. } => "process_deadline",
+            ScanError::TooLarge { .. } => "oversized",
+            ScanError::Failed(_) => "failed",
+        }
+    }
+}
+
+/// Outcome of a single scan: matches (possibly empty) or a typed failure.
+pub type ScanResult = std::result::Result<Vec<YaraRuleMatch>, ScanError>;
+
+const MAX_YARA_STRINGS_PER_RULE: usize = 8;
+const MAX_YARA_SNIPPET_LEN: usize = 80;
+const YARA_CACHE_MAX_ENTRIES: usize = 10_000;
+const YARA_CACHE_TTL_SECS: u64 = 6 * 60 * 60;
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct YaraFileIdentity {
+    file: FileIdentity,
+    match_debug: MatchDebugLevel,
+}
+
+#[derive(Debug, Clone)]
+struct YaraCacheEntry {
+    matches: Vec<YaraRuleMatch>,
+    timestamp: u64,
+}
+
+#[derive(Debug)]
+struct YaraScanCache {
+    entries: HashMap<YaraFileIdentity, YaraCacheEntry>,
+    max_entries: usize,
+    ttl_secs: u64,
+}
+
+impl YaraScanCache {
+    fn new() -> Self {
+        Self {
+            entries: HashMap::new(),
+            max_entries: YARA_CACHE_MAX_ENTRIES,
+            ttl_secs: YARA_CACHE_TTL_SECS,
+        }
+    }
+
+    fn get(&mut self, identity: &YaraFileIdentity) -> Option<Vec<YaraRuleMatch>> {
+        let entry = self.entries.get(identity)?;
+        if self.is_expired(entry) {
+            self.entries.remove(identity);
+            return None;
+        }
+
+        Some(entry.matches.clone())
+    }
+
+    fn insert(&mut self, identity: YaraFileIdentity, matches: Vec<YaraRuleMatch>) {
+        let now = now_secs();
+        self.entries.insert(
+            identity,
+            YaraCacheEntry {
+                matches,
+                timestamp: now,
+            },
+        );
+
+        if self.entries.len() > self.max_entries {
+            self.trim();
+        }
+    }
+
+    fn is_expired(&self, entry: &YaraCacheEntry) -> bool {
+        now_secs().saturating_sub(entry.timestamp) > self.ttl_secs
+    }
+
+    fn trim(&mut self) {
+        trim_to_headroom(&mut self.entries, self.max_entries, |entry| entry.timestamp);
+    }
+}
+
+fn now_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+fn truncate_str(s: &str, max_len: usize) -> String {
+    if s.len() <= max_len {
+        return s.to_string();
+    }
+
+    if max_len <= 3 {
+        let mut end = max_len;
+        while end > 0 && !s.is_char_boundary(end) {
+            end -= 1;
+        }
+        return s[..end].to_string();
+    }
+
+    let limit = max_len - 3;
+    let mut end = limit;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    let mut out = s[..end].to_string();
+    out.push_str("...");
+    out
+}
+
+/// Job queued from a process-start event for background memory scanning.
+#[derive(Debug, Clone)]
+pub struct YaraMemoryJob {
+    pub expected_identity: ProcessIdentity,
+    /// Fidelity limitations on the image and PID the alert will report.
+    pub provenance: Provenance,
+    /// Monotonic enqueue time so queue waiting counts toward the scan delay.
+    pub enqueued_at: Instant,
+    /// Include memfd image mappings for a Linux fileless executable.
+    pub memfd_backed: bool,
+}
+
+/// Keep only the limitations on the fields a scan alert reports, so a queued
+/// job stays inline for the common all-measured case.
+pub(crate) fn scan_subject_provenance(provenance: &Provenance) -> Provenance {
+    let mut subject = Provenance::default();
+    for field in ["Image", "ProcessId"] {
+        subject.inherit(provenance, field, field);
+    }
+    subject
+}
+
+/// A reusable `yara_x::Scanner` together with the rules it borrows.
+///
+/// Building a scanner costs hundreds of microseconds on a large rule set, so
+/// each thread keeps one and reuses it while the rule set is unchanged. A
+/// reload swaps in a new `Arc<Rules>`, which makes the next scan on each
+/// thread rebuild its scanner; until then an idle thread keeps the old rules
+/// alive.
+struct PooledScanner {
+    // Field order matters: the scanner must drop before the rules it borrows.
+    scanner: XScanner<'static>,
+    _rules: Arc<Rules>,
+}
+
+thread_local! {
+    static THREAD_SCANNER: RefCell<Option<PooledScanner>> = const { RefCell::new(None) };
+}
+
+impl PooledScanner {
+    fn new(rules: &Arc<Rules>) -> Self {
+        // SAFETY: the reference points into the `Arc` allocation, which this
+        // struct keeps alive for as long as the scanner exists (`scanner` is
+        // declared before `_rules`, so it drops first), and `Rules` is never
+        // moved out of the `Arc` or mutated.
+        let rules_ref: &'static Rules = unsafe { &*Arc::as_ptr(rules) };
+        Self {
+            scanner: XScanner::new(rules_ref),
+            _rules: Arc::clone(rules),
+        }
+    }
+}
+
+/// Drop this thread's pooled scanner when no `Scanner` uses its rules any more.
+///
+/// A reload replaces the `Scanner`, but a thread that does not scan again keeps
+/// the old compiled rules alive through its pooled scanner. Long-lived worker
+/// threads call this between jobs and when idle so that memory is returned.
+pub(crate) fn release_stale_scanner() {
+    THREAD_SCANNER.with(|slot| {
+        if let Ok(mut slot) = slot.try_borrow_mut() {
+            if slot
+                .as_ref()
+                .is_some_and(|pooled| Arc::strong_count(&pooled._rules) == 1)
+            {
+                *slot = None;
+            }
+        }
+    });
+}
+
+/// Main Scanner struct holding compiled rules
+pub struct Scanner {
+    rules: Arc<Rules>,
+    compiled_files: usize,
+    files_found: usize,
+    failed_files: usize,
+    directories: Vec<RuleDirectoryReport>,
+    collisions: Vec<RuleCollision>,
+    /// `(namespace, rule name)` of pack rules a local rule replaced.
+    shadowed: HashSet<(String, String)>,
+    limits: ScanLimits,
+    cache: Mutex<YaraScanCache>,
+}
+
+impl Scanner {
+    /// Compile all .yar files in a directory
+    pub fn new<P: AsRef<Path>>(rules_dir: P) -> Result<Self> {
+        Self::new_with_trust(rules_dir, None)
+    }
+
+    pub fn new_with_trust<P: AsRef<Path>>(
+        rules_dir: P,
+        trust: Option<&crate::utils::trust::RuleTrust>,
+    ) -> Result<Self> {
+        Self::new_with_dirs_and_trust(rules_dir.as_ref(), &[], trust)
+    }
+
+    /// Compile the managed pack directory and then each local directory into
+    /// one scanner. Every directory is trust-checked before anything is read,
+    /// and any failure rejects the whole load. Local directories compile into
+    /// their own namespaces, so a local rule can reuse a pack rule's name; the
+    /// pack rule is then suppressed and the collision recorded.
+    pub fn new_with_dirs_and_trust(
+        pack_dir: &Path,
+        local_dirs: &[PathBuf],
+        trust: Option<&crate::utils::trust::RuleTrust>,
+    ) -> Result<Self> {
+        let mut compiler = Compiler::new();
+        let mut files_found = 0;
+        let mut files_compiled = 0;
+        let mut files_failed = 0;
+        let mut reports = Vec::new();
+        // Namespace of each directory, in load order. The pack keeps the
+        // default namespace so its alerts are unchanged.
+        let mut namespaces = Vec::new();
+        let directories = std::iter::once((pack_dir, RuleDirectoryRole::Pack)).chain(
+            local_dirs
+                .iter()
+                .map(|dir| (dir.as_path(), RuleDirectoryRole::Local)),
+        );
+
+        for (index, (dir, role)) in directories.enumerate() {
+            let mut report = RuleDirectoryReport::new(dir, role);
+            crate::utils::trust::verify_rule_input(dir, trust).with_context(|| {
+                format!("{} YARA rules directory {}", role.as_str(), dir.display())
+            })?;
+            info!(
+                role = role.as_str(),
+                "Loading YARA rules from: {:?} (recursive)", dir
+            );
+
+            let namespace = if role == RuleDirectoryRole::Pack {
+                "default".to_string()
+            } else {
+                let namespace = format!("local-{index}");
+                compiler.new_namespace(&namespace);
+                namespace
+            };
+
+            if dir.is_dir() {
+                let mut queue = VecDeque::from([dir.to_path_buf()]);
+                while let Some(current) = queue.pop_front() {
+                    for entry in fs::read_dir(&current)
+                        .with_context(|| format!("Failed to read {:?}", current))?
+                    {
+                        let entry = entry?;
+                        let path = entry.path();
+                        if path.is_dir() {
+                            queue.push_back(path);
+                            continue;
+                        }
+                        if let Some(ext) = path.extension() {
+                            if ext == "yar" || ext == "yara" {
+                                files_found += 1;
+                                report.files += 1;
+                                debug!("Found YARA rule file: {:?}", path);
+                                let src = fs::read_to_string(&path)
+                                    .with_context(|| format!("Failed to read {:?}", path))?;
+
+                                match compiler.add_source(src.as_str()) {
+                                    Ok(_) => {
+                                        files_compiled += 1;
+                                        debug!("✓ Compiled YARA rule: {:?}", path);
+                                    }
+                                    Err(e) => {
+                                        files_failed += 1;
+                                        info!("Failed to compile YARA rule {:?}: {}", path, e);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            } else {
+                info!(
+                    "YARA rules directory does not exist or is not a directory: {:?}",
+                    dir
+                );
+            }
+
+            namespaces.push(namespace);
+            reports.push(report);
+        }
+
+        if files_failed > 0 {
+            warn!(
+                path = ?pack_dir,
+                failed_files = files_failed,
+                compiled_files = files_compiled,
+                "Some YARA rule files failed to compile; see the operational log for details"
+            );
+        }
+
+        let rules = compiler.build();
+
+        // A later directory wins: suppress an earlier rule of the same name.
+        let mut positions_by_name: HashMap<String, Vec<usize>> = HashMap::new();
+        for rule in rules.iter() {
+            let Some(position) = namespaces.iter().position(|ns| ns == rule.namespace()) else {
+                continue;
+            };
+            reports[position].rules += 1;
+            positions_by_name
+                .entry(rule.identifier().to_string())
+                .or_default()
+                .push(position);
+        }
+        let mut shadowed = HashSet::new();
+        let mut collisions = Vec::new();
+        let mut names = positions_by_name.into_iter().collect::<Vec<_>>();
+        names.sort();
+        for (name, mut positions) in names {
+            positions.sort_unstable();
+            positions.dedup();
+            let Some((&winner, overridden)) = positions.split_last() else {
+                continue;
+            };
+            for &earlier in overridden {
+                shadowed.insert((namespaces[earlier].clone(), name.clone()));
+                reports[earlier].rules = reports[earlier].rules.saturating_sub(1);
+                warn!(
+                    rule = %name,
+                    overridden = %reports[earlier].path.display(),
+                    winner = %reports[winner].path.display(),
+                    "Local YARA rule replaces a rule with the same name"
+                );
+                collisions.push(RuleCollision {
+                    rule_id: name.clone(),
+                    overridden: reports[earlier].path.display().to_string(),
+                    winner: reports[winner].path.display().to_string(),
+                });
+            }
+        }
+
+        info!(
+            "YARA Scanner: Found {} rule files, compiled {} successfully",
+            files_found, files_compiled
+        );
+        for report in &reports {
+            info!(
+                role = report.role.as_str(),
+                path = ?report.path,
+                files = report.files,
+                rules = report.rules,
+                exists = report.exists,
+                "YARA rules directory loaded"
+            );
+        }
+        Ok(Self {
+            rules: Arc::new(rules),
+            compiled_files: files_compiled,
+            files_found,
+            failed_files: files_failed,
+            directories: reports,
+            collisions,
+            shadowed,
+            limits: ScanLimits::default(),
+            cache: Mutex::new(YaraScanCache::new()),
+        })
+    }
+
+    /// Build a scanner with zero rules without touching the filesystem.
+    ///
+    /// Used when YARA scanning is disabled or rule loading fails, so the
+    /// fallback never walks a directory tree.
+    pub fn empty() -> Self {
+        Self {
+            rules: Arc::new(Compiler::new().build()),
+            compiled_files: 0,
+            files_found: 0,
+            failed_files: 0,
+            directories: Vec::new(),
+            collisions: Vec::new(),
+            shadowed: HashSet::new(),
+            limits: ScanLimits::default(),
+            cache: Mutex::new(YaraScanCache::new()),
+        }
+    }
+
+    /// Override the default scan guards.
+    pub fn with_limits(mut self, limits: ScanLimits) -> Self {
+        self.limits = limits;
+        self
+    }
+
+    pub fn limits(&self) -> ScanLimits {
+        self.limits
+    }
+
+    pub fn compiled_files(&self) -> usize {
+        self.compiled_files
+    }
+
+    pub fn files_found(&self) -> usize {
+        self.files_found
+    }
+
+    pub fn failed_files(&self) -> usize {
+        self.failed_files
+    }
+
+    /// What each rules directory contributed, pack first.
+    pub fn directories(&self) -> &[RuleDirectoryReport] {
+        &self.directories
+    }
+
+    /// Pack rules a local rule replaced by reusing their name.
+    pub fn collisions(&self) -> &[RuleCollision] {
+        &self.collisions
+    }
+
+    /// Scan a file path and return matching rule details.
+    ///
+    /// Files above the configured maximum size are rejected before the scan
+    /// starts, and the scan itself is bounded by the configured timeout.
+    pub fn scan_file(&self, path: &str, match_debug: MatchDebugLevel) -> ScanResult {
+        if self.compiled_files == 0 {
+            return Ok(Vec::new());
+        }
+
+        let path = normalize_yara_path(path);
+        self.check_file_size(&path)?;
+        self.scan_file_cached(&path, match_debug, |path| {
+            self.with_scanner(self.limits.timeout, |scanner| {
+                let scan_results = scanner.scan_file(path).map_err(|err| {
+                    self.map_scan_error(err, || format!("YARA scan failed for {path}"))
+                })?;
+                Ok(collect_yara_matches(
+                    scan_results,
+                    match_debug,
+                    &self.shadowed,
+                ))
+            })
+        })
+    }
+
+    /// Reject targets above the configured maximum file size.
+    fn check_file_size(&self, path: &str) -> std::result::Result<(), ScanError> {
+        let limit = self.limits.max_file_bytes;
+        if limit == 0 {
+            return Ok(());
+        }
+
+        let size = fs::metadata(path)
+            .map(|metadata| metadata.len())
+            .map_err(|err| {
+                ScanError::Failed(
+                    anyhow::Error::new(err)
+                        .context(format!("YARA scan failed for {path}: cannot read metadata")),
+                )
+            })?;
+        if size > limit {
+            return Err(ScanError::TooLarge { size, limit });
+        }
+
+        Ok(())
+    }
+
+    /// Run `scan` on this thread's scanner with `timeout` applied. Zero disables it.
+    ///
+    /// yara-x cannot clear a timeout once set, so a scan without one always
+    /// uses a throwaway scanner. A scanner whose scan failed is dropped
+    /// rather than trusted after an abort.
+    fn with_scanner<T>(
+        &self,
+        timeout: Duration,
+        scan: impl FnOnce(&mut XScanner<'static>) -> std::result::Result<T, ScanError>,
+    ) -> std::result::Result<T, ScanError> {
+        if timeout.is_zero() {
+            let mut fresh = PooledScanner::new(&self.rules);
+            return scan(&mut fresh.scanner);
+        }
+
+        THREAD_SCANNER.with(|slot| {
+            // Taking the scanner out also covers a re-entrant call: it just
+            // builds its own instead of aliasing the borrowed one.
+            let reusable = slot
+                .borrow_mut()
+                .take()
+                .filter(|pooled| Arc::ptr_eq(&pooled._rules, &self.rules));
+            let mut pooled = reusable.unwrap_or_else(|| PooledScanner::new(&self.rules));
+            pooled.scanner.set_timeout(timeout);
+            let result = scan(&mut pooled.scanner);
+            if result.is_ok() {
+                *slot.borrow_mut() = Some(pooled);
+            }
+            result
+        })
+    }
+
+    fn map_scan_error<F: FnOnce() -> String>(
+        &self,
+        err: yara_x::ScanError,
+        context: F,
+    ) -> ScanError {
+        if matches!(err, yara_x::ScanError::Timeout) {
+            return ScanError::TimedOut {
+                timeout: self.limits.timeout,
+            };
+        }
+        ScanError::Failed(anyhow::Error::new(err).context(context()))
+    }
+
+    fn scan_file_cached<F>(&self, path: &str, match_debug: MatchDebugLevel, scan: F) -> ScanResult
+    where
+        F: FnOnce(&str) -> ScanResult,
+    {
+        let identity_guard = fs::File::open(path).ok();
+        let identity = identity_guard
+            .as_ref()
+            .and_then(file_identity::from_file)
+            .map(|file| YaraFileIdentity { file, match_debug });
+        if let Some(identity) = identity.as_ref() {
+            if let Ok(mut cache) = self.cache.lock() {
+                if let Some(cached_matches) = cache.get(identity) {
+                    if let Some(identity_guard) = identity_guard.as_ref() {
+                        if file_identity::unchanged(identity_guard, Path::new(path), &identity.file)
+                        {
+                            tracing::trace!(
+                                target: "scanner",
+                                file = %path,
+                                matches = cached_matches.len(),
+                                "YARA cache hit"
+                            );
+                            return Ok(cached_matches);
+                        }
+                    }
+                }
+            }
+        }
+
+        let matches = scan(path)?;
+
+        if let (Some(identity), Some(identity_guard)) = (identity, identity_guard) {
+            if file_identity::unchanged(&identity_guard, Path::new(path), &identity.file) {
+                if let Ok(mut cache) = self.cache.lock() {
+                    cache.insert(identity, matches.clone());
+                }
+            }
+        }
+
+        Ok(matches)
+    }
+
+    /// Scan a byte slice and return matching rule details.
+    ///
+    /// The scan is bounded by the configured timeout. Size limiting is the
+    /// caller's job here: memory scans are already bounded by
+    /// `MemoryScanConfig::max_region_bytes`.
+    pub fn scan_bytes(&self, data: &[u8], match_debug: MatchDebugLevel) -> ScanResult {
+        self.scan_bytes_with_timeout(data, match_debug, self.limits.timeout)
+    }
+
+    /// Scan one region with the remaining process budget. Zero disables the timeout.
+    pub(crate) fn scan_bytes_with_timeout(
+        &self,
+        data: &[u8],
+        match_debug: MatchDebugLevel,
+        timeout: Duration,
+    ) -> ScanResult {
+        if self.compiled_files == 0 {
+            return Ok(Vec::new());
+        }
+
+        self.with_scanner(timeout, |scanner| {
+            let scan_results = scanner.scan(data).map_err(|err| {
+                if matches!(err, yara_x::ScanError::Timeout) {
+                    ScanError::TimedOut { timeout }
+                } else {
+                    ScanError::Failed(anyhow::Error::new(err).context("YARA memory scan failed"))
+                }
+            })?;
+            Ok(collect_yara_matches(
+                scan_results,
+                match_debug,
+                &self.shadowed,
+            ))
+        })
+    }
+}
+
+fn collect_yara_matches(
+    scan_results: yara_x::ScanResults,
+    match_debug: MatchDebugLevel,
+    shadowed: &HashSet<(String, String)>,
+) -> Vec<YaraRuleMatch> {
+    let mut matches = Vec::new();
+
+    for rule in scan_results.matching_rules() {
+        let rule_name = rule.identifier().to_string();
+        if !shadowed.is_empty()
+            && shadowed.contains(&(rule.namespace().to_string(), rule_name.clone()))
+        {
+            continue;
+        }
+        let include_meta = !matches!(match_debug, MatchDebugLevel::Off);
+        let include_strings = matches!(match_debug, MatchDebugLevel::Full);
+
+        let tags = if include_meta {
+            rule.tags()
+                .map(|tag| tag.identifier().to_string())
+                .collect()
+        } else {
+            Vec::new()
+        };
+
+        let namespace = if include_meta {
+            Some(rule.namespace().to_string())
+        } else {
+            None
+        };
+
+        let mut strings = Vec::new();
+        if include_strings {
+            let mut count = 0usize;
+            for pattern in rule.patterns() {
+                let pattern_id = pattern.identifier().to_string();
+                for m in pattern.matches() {
+                    if count >= MAX_YARA_STRINGS_PER_RULE {
+                        break;
+                    }
+                    let offset = m.range().start as u64;
+                    let snippet_raw = String::from_utf8_lossy(m.data()).to_string();
+                    let snippet = truncate_str(&snippet_raw, MAX_YARA_SNIPPET_LEN);
+                    strings.push(YaraStringMatch {
+                        id: pattern_id.clone(),
+                        offset: Some(offset),
+                        snippet: Some(snippet),
+                    });
+                    count += 1;
+                }
+                if count >= MAX_YARA_STRINGS_PER_RULE {
+                    break;
+                }
+            }
+        }
+
+        let mut metadata_id = None;
+        let mut severity = None;
+        let mut level = None;
+        let mut score = None;
+        for (identifier, value) in rule.metadata() {
+            match (identifier, value) {
+                ("id", yara_x::MetaValue::String(s)) => {
+                    metadata_id = Some(s.to_string());
+                }
+                ("severity", yara_x::MetaValue::String(s)) => severity = yara_severity(s),
+                ("level", yara_x::MetaValue::String(s)) => level = yara_severity(s),
+                ("score", yara_x::MetaValue::Integer(n)) => score = yara_score_severity(n),
+                ("score", yara_x::MetaValue::String(s)) => {
+                    score = s.trim().parse().ok().and_then(yara_score_severity);
+                }
+                _ => {}
+            }
+        }
+
+        matches.push(YaraRuleMatch {
+            rule: rule_name,
+            severity: severity.or(level).or(score).unwrap_or(AlertSeverity::High),
+            metadata_id,
+            tags,
+            namespace,
+            strings,
+        });
+    }
+
+    matches
+}
+
+fn yara_severity(value: &str) -> Option<AlertSeverity> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "informational" | "info" => Some(AlertSeverity::Informational),
+        "low" => Some(AlertSeverity::Low),
+        "medium" => Some(AlertSeverity::Medium),
+        "high" => Some(AlertSeverity::High),
+        "critical" => Some(AlertSeverity::Critical),
+        _ => None,
+    }
+}
+
+fn yara_score_severity(score: i64) -> Option<AlertSeverity> {
+    match score {
+        0 => Some(AlertSeverity::Informational),
+        1..=39 => Some(AlertSeverity::Low),
+        40..=59 => Some(AlertSeverity::Medium),
+        60..=79 => Some(AlertSeverity::High),
+        80..=100 => Some(AlertSeverity::Critical),
+        _ => None,
+    }
+}
+
+/// Queues canonical process starts for YARA memory scanning.
+///
+/// On-disk scans belong to `ArtifactResolver`. Memory scans stay a separate
+/// worker by design: they read a live process keyed by [`ProcessIdentity`]
+/// rather than a file keyed by `FileIdentity`, wait `yara_memory_delay_ms`
+/// before reading, and share one budget across regions, none of which fits
+/// the resolver's bounded single-read file I/O slots.
+pub struct YaraMemoryEventHandler {
+    pub tx: Sender<YaraMemoryJob>,
+    pub allowlist_paths: Vec<String>,
+    /// Scan ordinary process starts as well as Linux fileless executions.
+    pub scan_all_processes: bool,
+}
+
+impl CanonicalEventHandler for YaraMemoryEventHandler {
+    fn handle_event(&self, event: &CanonicalEvent) {
+        if event.action != SensorAction::Start {
+            return;
+        }
+        let EventFields::ProcessCreation(fields) = &event.normalized().fields else {
+            return;
+        };
+        let Some(path) = fields.image.as_deref() else {
+            return;
+        };
+        if is_path_allowlisted(path, &self.allowlist_paths) {
+            return;
+        }
+        if !self.scan_all_processes
+            && !(event.normalized().platform == Platform::Linux
+                && crate::utils::process::linux_exec_uses_proc(path))
+        {
+            return;
+        }
+        let pid = event.pid.unwrap_or(0);
+        let expected_identity = capture_process_identity(event, fields, pid, path);
+        let memfd_backed = event.normalized().platform == Platform::Linux
+            && (crate::utils::process::is_memfd_image(path)
+                || crate::utils::process::is_memfd_image(&expected_identity.image));
+        if (!self.scan_all_processes && !memfd_backed)
+            || is_path_allowlisted(&expected_identity.image, &self.allowlist_paths)
+        {
+            return;
+        }
+        match crate::telemetry::try_send(
+            crate::telemetry::ChannelId::YaraMemoryScan,
+            &self.tx,
+            YaraMemoryJob {
+                expected_identity,
+                provenance: scan_subject_provenance(event.provenance()),
+                enqueued_at: Instant::now(),
+                memfd_backed,
+            },
+        ) {
+            Ok(()) => tracing::trace!(
+                target: "scanner",
+                pid,
+                file = path,
+                "YARA queued process for memory scan"
+            ),
+            Err(err) => warn!(
+                target: "scanner",
+                pid,
+                file = path,
+                error = %err,
+                "YARA memory queue full; dropping scan job"
+            ),
+        }
+    }
+}
+
+pub(crate) fn capture_process_identity(
+    event: &CanonicalEvent,
+    fields: &ProcessCreationFields,
+    pid: u32,
+    image: &str,
+) -> ProcessIdentity {
+    let queried = query_process_identity(pid);
+    #[cfg(target_os = "linux")]
+    // eBPF identities are CLOCK_BOOTTIME nanoseconds, but `/proc` validation
+    // exposes task birth in clock ticks. Prefer the measured kernel birth
+    // value, with live `/proc` as the exact fallback, and never retain raw ns.
+    let start_time = fields
+        .linux_identity
+        .kernel_start_boottime
+        .and_then(crate::utils::process::linux_boot_time_ns_to_start_ticks)
+        .or_else(|| {
+            event
+                .process_start_key
+                .filter(|key| key.pid == pid)
+                .and_then(|key| {
+                    crate::utils::process::linux_boot_time_ns_to_start_ticks(key.start_time)
+                })
+        })
+        .or_else(|| queried.as_ref().and_then(|identity| identity.start_time));
+    #[cfg(not(target_os = "linux"))]
+    let start_time = event
+        .process_start_key
+        .filter(|key| key.pid == pid)
+        .map(|key| key.start_time)
+        .or_else(|| queried.as_ref().and_then(|identity| identity.start_time))
+        .or(fields.process_start_time);
+    let command_line_hash = fields
+        .command_line
+        .as_deref()
+        .map(hash_command_line)
+        .or_else(|| {
+            queried
+                .as_ref()
+                .and_then(|identity| identity.command_line_hash.clone())
+        });
+
+    ProcessIdentity {
+        pid,
+        image: if event.normalized().platform == Platform::Linux
+            && crate::utils::process::linux_exec_uses_proc(image)
+            && !crate::utils::process::is_memfd_image(image)
+        {
+            queried
+                .as_ref()
+                .map(|identity| identity.image.clone())
+                .unwrap_or_default()
+        } else if event.normalized().platform == Platform::Linux
+            && crate::utils::process::is_memfd_image(image)
+        {
+            image
+                .strip_suffix(" (deleted)")
+                .unwrap_or(image)
+                .to_string()
+        } else {
+            image.to_string()
+        },
+        start_time,
+        command_line_hash,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_file_identity() -> FileIdentity {
+        let file = tempfile::NamedTempFile::new().expect("temp file");
+        file_identity::from_file(file.as_file()).expect("stable file identity")
+    }
+
+    fn scanner_with_marker_rule(dir: &Path) -> Scanner {
+        let rules_dir = dir.join("rules");
+        fs::create_dir_all(&rules_dir).expect("create rules directory");
+        fs::write(
+            rules_dir.join("malicious.yar"),
+            r#"rule Malicious { strings: $marker = "evil!!" condition: $marker }"#,
+        )
+        .expect("write rule");
+        Scanner::new(&rules_dir).expect("compile scanner")
+    }
+
+    #[test]
+    fn test_default_scan_limits_are_active() {
+        let limits = Scanner::empty().limits();
+        assert_eq!(
+            limits.timeout,
+            Duration::from_millis(DEFAULT_SCAN_TIMEOUT_MS)
+        );
+        assert_eq!(limits.max_file_bytes, DEFAULT_MAX_FILE_MB * 1024 * 1024);
+    }
+
+    #[test]
+    fn test_scan_file_rejects_oversized_target_before_scanning() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let scanner = scanner_with_marker_rule(tempdir.path()).with_limits(ScanLimits {
+            timeout: Duration::from_secs(1),
+            max_file_bytes: 4,
+        });
+        let path = tempdir.path().join("sample.bin");
+        fs::write(&path, b"evil!!").expect("write sample");
+
+        let error = scanner
+            .scan_file(path.to_str().unwrap(), MatchDebugLevel::Off)
+            .expect_err("oversized file must not be reported as a clean scan");
+
+        match error {
+            ScanError::TooLarge { size, limit } => {
+                assert_eq!(size, 6);
+                assert_eq!(limit, 4);
+            }
+            other => panic!("expected an oversized outcome, got {other:?}"),
+        }
+        assert_eq!(error.kind(), "oversized");
+    }
+
+    #[test]
+    fn test_scan_file_accepts_target_at_the_size_limit() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let scanner = scanner_with_marker_rule(tempdir.path()).with_limits(ScanLimits {
+            timeout: Duration::from_secs(1),
+            max_file_bytes: 6,
+        });
+        let path = tempdir.path().join("sample.bin");
+        fs::write(&path, b"evil!!").expect("write sample");
+
+        let matches = scanner
+            .scan_file(path.to_str().unwrap(), MatchDebugLevel::Off)
+            .expect("scan at the limit");
+        assert_eq!(matches[0].rule, "Malicious");
+    }
+
+    #[test]
+    fn test_zero_max_file_bytes_disables_the_size_guard() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let scanner = scanner_with_marker_rule(tempdir.path()).with_limits(ScanLimits {
+            timeout: Duration::from_secs(1),
+            max_file_bytes: 0,
+        });
+        let path = tempdir.path().join("sample.bin");
+        fs::write(&path, b"evil!!").expect("write sample");
+
+        let matches = scanner
+            .scan_file(path.to_str().unwrap(), MatchDebugLevel::Off)
+            .expect("scan with the size guard disabled");
+        assert_eq!(matches[0].rule, "Malicious");
+    }
+
+    #[test]
+    fn test_scan_file_reports_unstattable_target_as_failure() {
+        let scanner = scanner_with_marker_rule(tempfile::tempdir().expect("tempdir").path());
+        let error = scanner
+            .scan_file("definitely/missing/sample.bin", MatchDebugLevel::Off)
+            .expect_err("missing file must not be reported as a clean scan");
+        assert_eq!(error.kind(), "failed");
+        assert!(
+            error.to_string().contains("YARA scan failed"),
+            "failure should retain scan context: {error}"
+        );
+    }
+
+    #[test]
+    fn test_engine_timeout_maps_to_timed_out_outcome() {
+        let timeout = Duration::from_millis(25);
+        let scanner = Scanner::empty().with_limits(ScanLimits {
+            timeout,
+            max_file_bytes: 1,
+        });
+
+        let mapped = scanner.map_scan_error(yara_x::ScanError::Timeout, || "unused".to_string());
+
+        match mapped {
+            ScanError::TimedOut { timeout: reported } => assert_eq!(reported, timeout),
+            other => panic!("expected a timeout outcome, got {other:?}"),
+        }
+        assert_eq!(mapped.kind(), "timeout");
+    }
+
+    #[test]
+    fn a_reloaded_rule_set_is_not_kept_alive_by_a_pooled_scanner() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let scanner = scanner_with_marker_rule(tempdir.path());
+        let rules = Arc::downgrade(&scanner.rules);
+        scanner
+            .scan_bytes_with_timeout(b"evil!!", MatchDebugLevel::Off, Duration::from_secs(5))
+            .expect("scan");
+
+        release_stale_scanner();
+        assert!(rules.upgrade().is_some(), "rules are still in use");
+
+        drop(scanner);
+        assert!(rules.upgrade().is_some(), "the pooled scanner holds them");
+        release_stale_scanner();
+        assert!(rules.upgrade().is_none());
+    }
+
+    #[test]
+    fn test_scanner_reuse_keeps_results_and_varying_timeouts() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let scanner = scanner_with_marker_rule(tempdir.path());
+        let timeout = Duration::from_secs(5);
+
+        for _ in 0..3 {
+            let hit = scanner
+                .scan_bytes_with_timeout(b"xx evil!! xx", MatchDebugLevel::Off, timeout)
+                .expect("scan");
+            assert_eq!(hit.len(), 1);
+            let miss = scanner
+                .scan_bytes_with_timeout(b"benign", MatchDebugLevel::Off, Duration::from_secs(9))
+                .expect("scan");
+            assert!(miss.is_empty());
+        }
+
+        // A disabled timeout must not inherit the one set on a pooled scanner.
+        let hit = scanner
+            .scan_bytes_with_timeout(b"evil!!", MatchDebugLevel::Off, Duration::ZERO)
+            .expect("scan");
+        assert_eq!(hit.len(), 1);
+    }
+
+    #[test]
+    fn test_scanner_creation() {
+        // Test that we can create a scanner even with an empty/missing directory
+        let result = Scanner::new("nonexistent_dir");
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_empty_scanner_has_no_rules() {
+        let scanner = Scanner::empty();
+        assert_eq!(scanner.compiled_files(), 0);
+        assert_eq!(scanner.files_found(), 0);
+        assert_eq!(scanner.failed_files(), 0);
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn test_normalize_yara_path_strips_win32_prefix() {
+        let input = r"\??\C:\Windows\System32\cmd.exe";
+        let normalized = normalize_yara_path(input);
+        assert_eq!(normalized, r"C:\Windows\System32\cmd.exe");
+    }
+
+    #[test]
+    fn test_normalize_yara_path_passthrough() {
+        // On Windows: a plain DOS path passes through unchanged.
+        // On Linux: all paths pass through unchanged (no NT prefix exists).
+        #[cfg(windows)]
+        let input = r"C:\Temp\edrust.exe";
+        #[cfg(not(windows))]
+        let input = "/tmp/edrust";
+        let normalized = normalize_yara_path(input);
+        assert_eq!(normalized, input);
+    }
+
+    #[test]
+    fn test_normalize_allowlist_paths_adds_trailing_separator() {
+        #[cfg(windows)]
+        {
+            let paths = vec![r"C:\Windows".to_string()];
+            let normalized = normalize_allowlist_paths(&paths);
+            assert_eq!(normalized, vec![r"c:\windows\".to_string()]);
+        }
+        #[cfg(not(windows))]
+        {
+            let paths = vec!["/usr/bin".to_string()];
+            let normalized = normalize_allowlist_paths(&paths);
+            assert_eq!(normalized, vec!["/usr/bin/".to_string()]);
+        }
+    }
+
+    #[test]
+    fn test_is_path_allowlisted_matches_prefix() {
+        #[cfg(windows)]
+        {
+            let allowlist = normalize_allowlist_paths(&[r"C:\Windows".to_string()]);
+            assert!(is_path_allowlisted(
+                r"C:\Windows\System32\cmd.exe",
+                &allowlist
+            ));
+            assert!(!is_path_allowlisted(r"C:\Temp\evil.exe", &allowlist));
+        }
+        #[cfg(not(windows))]
+        {
+            let allowlist = normalize_allowlist_paths(&["/usr/bin".to_string()]);
+            assert!(is_path_allowlisted("/usr/bin/curl", &allowlist));
+            assert!(!is_path_allowlisted("/tmp/evil", &allowlist));
+        }
+    }
+
+    #[test]
+    fn test_yara_scan_cache_returns_cached_matches() {
+        let mut cache = YaraScanCache {
+            entries: HashMap::new(),
+            max_entries: 10,
+            ttl_secs: 60,
+        };
+        let identity = YaraFileIdentity {
+            file: test_file_identity(),
+            match_debug: MatchDebugLevel::Off,
+        };
+        let expected = vec![YaraRuleMatch {
+            rule: "TestRule".to_string(),
+            severity: AlertSeverity::High,
+            metadata_id: None,
+            tags: Vec::new(),
+            namespace: None,
+            strings: Vec::new(),
+        }];
+
+        cache.insert(identity.clone(), expected.clone());
+        let from_cache = cache.get(&identity);
+
+        let cached = from_cache.expect("expected cache hit");
+        assert_eq!(cached.len(), 1);
+        assert_eq!(cached[0].rule, expected[0].rule);
+    }
+
+    #[test]
+    fn test_yara_scan_cache_miss_on_identity_change() {
+        let mut cache = YaraScanCache {
+            entries: HashMap::new(),
+            max_entries: 10,
+            ttl_secs: 60,
+        };
+        let identity = YaraFileIdentity {
+            file: test_file_identity(),
+            match_debug: MatchDebugLevel::Off,
+        };
+        let updated = YaraFileIdentity {
+            file: test_file_identity(),
+            match_debug: MatchDebugLevel::Off,
+        };
+
+        cache.insert(identity, Vec::new());
+        assert!(cache.get(&updated).is_none());
+    }
+
+    #[test]
+    fn test_yara_scan_cache_hits_for_unchanged_file() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let path = tempdir.path().join("sample.bin");
+        fs::write(&path, b"clean!").expect("write sample");
+        let scanner = Scanner::empty();
+
+        scanner
+            .scan_file_cached(path.to_str().unwrap(), MatchDebugLevel::Off, |_| {
+                Ok(Vec::new())
+            })
+            .expect("initial scan");
+        scanner
+            .scan_file_cached(path.to_str().unwrap(), MatchDebugLevel::Off, |_| {
+                panic!("unchanged file should use cached result")
+            })
+            .expect("cached scan");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_yara_scan_cache_misses_after_same_metadata_replacement() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let path = tempdir.path().join("sample.bin");
+        fs::write(&path, b"clean!").expect("write sample");
+        let original_mtime = fs::metadata(&path)
+            .expect("metadata")
+            .modified()
+            .expect("mtime");
+        let scanner = Scanner::empty();
+
+        scanner
+            .scan_file_cached(path.to_str().unwrap(), MatchDebugLevel::Off, |_| {
+                Ok(Vec::new())
+            })
+            .expect("initial scan");
+
+        let replacement = tempdir.path().join("replacement.bin");
+        fs::write(&replacement, b"evil!!").expect("write replacement");
+        fs::File::options()
+            .write(true)
+            .open(&replacement)
+            .expect("open replacement")
+            .set_times(fs::FileTimes::new().set_modified(original_mtime))
+            .expect("preserve mtime");
+        fs::rename(&replacement, &path).expect("replace sample");
+
+        let matches = scanner
+            .scan_file_cached(path.to_str().unwrap(), MatchDebugLevel::Off, |_| {
+                Ok(vec![YaraRuleMatch {
+                    rule: "Malicious".to_string(),
+                    severity: AlertSeverity::High,
+                    metadata_id: None,
+                    tags: Vec::new(),
+                    namespace: None,
+                    strings: Vec::new(),
+                }])
+            })
+            .expect("replacement scan");
+        assert_eq!(matches[0].rule, "Malicious");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_yara_scan_detects_same_metadata_replacement() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let rules_dir = tempdir.path().join("rules");
+        fs::create_dir(&rules_dir).expect("create rules directory");
+        fs::write(
+            rules_dir.join("malicious.yar"),
+            r#"rule Malicious { strings: $marker = "evil!!" condition: $marker }"#,
+        )
+        .expect("write rule");
+        let path = tempdir.path().join("sample.bin");
+        fs::write(&path, b"clean!").expect("write clean sample");
+        let original_mtime = fs::metadata(&path)
+            .expect("metadata")
+            .modified()
+            .expect("mtime");
+        let scanner = Scanner::new(&rules_dir).expect("compile scanner");
+
+        assert!(scanner
+            .scan_file(path.to_str().unwrap(), MatchDebugLevel::Off)
+            .expect("scan clean sample")
+            .is_empty());
+
+        let replacement = tempdir.path().join("replacement.bin");
+        fs::write(&replacement, b"evil!!").expect("write malicious replacement");
+        fs::File::options()
+            .write(true)
+            .open(&replacement)
+            .expect("open replacement")
+            .set_times(fs::FileTimes::new().set_modified(original_mtime))
+            .expect("preserve mtime");
+        fs::rename(&replacement, &path).expect("replace sample");
+
+        let matches = scanner
+            .scan_file(path.to_str().unwrap(), MatchDebugLevel::Off)
+            .expect("scan malicious replacement");
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].rule, "Malicious");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_yara_scan_does_not_cache_file_changed_during_scan() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let path = tempdir.path().join("sample.bin");
+        fs::write(&path, b"clean!").expect("write sample");
+        let scanner = Scanner::empty();
+
+        scanner
+            .scan_file_cached(
+                path.to_str().unwrap(),
+                MatchDebugLevel::Off,
+                |scanned_path| {
+                    fs::write(scanned_path, b"evil!!").expect("mutate during scan");
+                    Ok(Vec::new())
+                },
+            )
+            .expect("scan mutated file");
+
+        assert!(scanner.cache.lock().unwrap().entries.is_empty());
+    }
+
+    #[test]
+    fn memory_scan_jobs_carry_the_scan_subject_provenance() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        let handler = YaraMemoryEventHandler {
+            tx,
+            scan_all_processes: true,
+            allowlist_paths: Vec::new(),
+        };
+        let mut normalized = crate::models::NormalizedEvent {
+            timestamp: "2026-09-14T00:00:00Z".to_string(),
+            source_seq: None,
+            ingest_seq: 1,
+            platform: crate::vocab::Platform::Linux,
+            provider: "ebpf".to_string(),
+            category: crate::models::EventCategory::Process,
+            event_id: 1,
+            event_id_string: "1".to_string(),
+            opcode: 1,
+            fields: EventFields::ProcessCreation(ProcessCreationFields {
+                hashes: None,
+                imphash: None,
+                container: Default::default(),
+                linux_identity: Default::default(),
+                cgroup_id: None,
+                exec: Default::default(),
+                parent_process_id_derived: false,
+                windows: Default::default(),
+                image: Some("/usr/bin/sample".to_string()),
+                image_source: None,
+                image_truncated: None,
+                original_file_name: None,
+                product: None,
+                description: None,
+                company: None,
+                file_version: None,
+                target_image: None,
+                command_line: None,
+                process_id: Some("4242".to_string()),
+                process_start_time: None,
+                parent_process_id: None,
+                parent_image: Some("/bin/bash".to_string()),
+                parent_command_line: None,
+                parent_user: None,
+                current_directory: None,
+                integrity_level: None,
+                logon_id: None,
+                user: None,
+            }),
+            process_name: None,
+            provenance: Provenance::default(),
+            process_context: None,
+        };
+        normalized.provenance.mark_derived("Image");
+        normalized.provenance.mark_derived("ParentImage");
+        handler.handle_event(&CanonicalEvent::from_normalized(normalized));
+
+        let mut expected = Provenance::default();
+        expected.mark_derived("Image");
+        assert_eq!(
+            rx.try_recv().expect("memory scan queued").provenance,
+            expected
+        );
+    }
+}

@@ -1,0 +1,35 @@
+//! Rustinel library interface
+//!
+//! Exposes core modules for use by binaries and tests.
+
+pub mod alerts;
+pub mod artifact;
+pub mod capture;
+pub mod cli;
+pub mod config;
+pub mod doctor;
+pub mod engine;
+pub mod field_availability;
+pub mod identity;
+pub mod ioc;
+pub mod memory;
+pub mod models;
+pub mod normalizer;
+pub mod observable;
+pub mod platform;
+pub mod reload;
+pub mod replay;
+pub mod response;
+pub mod rules;
+pub mod runtime;
+pub mod scanner;
+pub mod sensor;
+pub mod service;
+pub mod setup;
+mod signature;
+mod stages;
+pub mod state;
+pub mod telemetry;
+pub mod update;
+pub mod utils;
+pub mod vocab;

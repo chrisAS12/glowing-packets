@@ -1,0 +1,209 @@
+//! Kernel loss accounting, independent of pipeline channel shedding.
+use std::collections::BTreeMap;
+use std::sync::{Arc, Mutex};
+
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MacosCollectorSnapshot {
+    pub esf: Option<EsfSnapshot>,
+    pub bpf: Option<BpfSnapshot>,
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EsfSnapshot {
+    pub received: u64,
+    /// Global sequence gaps. Do not add per-type gaps to this total.
+    pub kernel_dropped: u64,
+    pub kernel_dropped_by_event_type: BTreeMap<String, u64>,
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BpfSnapshot {
+    #[serde(default)]
+    pub interfaces: BTreeMap<String, BpfInterfaceSnapshot>,
+    /// BIOCGSTATS bs_recv counts packets before the capture filter.
+    pub kernel_received: u64,
+    pub kernel_dropped: u64,
+    pub stats_polls: u64,
+    pub stats_errors: u64,
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BpfInterfaceSnapshot {
+    pub active: bool,
+    pub link_type: Option<u32>,
+    pub error: Option<String>,
+    /// Capture workers restarted after a failure.
+    #[serde(default)]
+    pub restarts: u64,
+    pub kernel_received: u64,
+    pub kernel_dropped: u64,
+    pub stats_polls: u64,
+    pub stats_errors: u64,
+}
+
+/// Collector health shared by the ESF and BPF sensors of one runtime.
+pub type MacosCollectors = Arc<Mutex<MacosCollectorSnapshot>>;
+
+pub(crate) fn snapshot(collectors: &MacosCollectors) -> Option<MacosCollectorSnapshot> {
+    let counters = collectors.lock().unwrap_or_else(|e| e.into_inner());
+    (counters.esf.is_some() || counters.bpf.is_some()).then(|| counters.clone())
+}
+
+/// First observations establish a baseline. Missing version-gated fields do
+/// not change it. Duplicate or older values cannot move the high-water mark.
+#[cfg(any(target_os = "macos", test))]
+#[derive(Default)]
+pub(crate) struct EsfSequences {
+    global: Option<u64>,
+    event_types: BTreeMap<String, Option<u64>>,
+}
+
+#[cfg(any(target_os = "macos", test))]
+impl EsfSequences {
+    pub(crate) fn observe(
+        &mut self,
+        counters: &mut EsfSnapshot,
+        event_type: String,
+        sequence: Option<u64>,
+        global: Option<u64>,
+    ) {
+        counters.received = counters.received.saturating_add(1);
+        counters.kernel_dropped = counters
+            .kernel_dropped
+            .saturating_add(sequence_gap(&mut self.global, global));
+        let previous = self.event_types.entry(event_type.clone()).or_default();
+        let dropped = counters
+            .kernel_dropped_by_event_type
+            .entry(event_type)
+            .or_default();
+        *dropped = dropped.saturating_add(sequence_gap(previous, sequence));
+    }
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn sequence_gap(previous: &mut Option<u64>, current: Option<u64>) -> u64 {
+    let Some(current) = current else { return 0 };
+    match *previous {
+        Some(last) if current <= last => 0,
+        last => {
+            *previous = Some(current);
+            last.map_or(0, |last| current - last - 1)
+        }
+    }
+}
+
+/// One tracker per newly configured device. No filter changes or resets occur
+/// during capture, so decreases are 32-bit kernel counter wraparound.
+#[cfg(any(target_os = "macos", test))]
+#[derive(Default)]
+pub(crate) struct BpfStatsTracker {
+    received: u32,
+    dropped: u32,
+}
+
+#[cfg(any(target_os = "macos", test))]
+impl BpfStatsTracker {
+    pub(crate) fn observe_interface(
+        &mut self,
+        counters: &mut BpfSnapshot,
+        interface: &str,
+        received: u32,
+        dropped: u32,
+    ) {
+        let received_delta = u64::from(received.wrapping_sub(self.received));
+        let dropped_delta = u64::from(dropped.wrapping_sub(self.dropped));
+        self.observe(counters, received, dropped);
+        let entry = counters
+            .interfaces
+            .entry(interface.to_string())
+            .or_default();
+        entry.kernel_received += received_delta;
+        entry.kernel_dropped += dropped_delta;
+        entry.stats_polls += 1;
+    }
+
+    pub(crate) fn observe(&mut self, counters: &mut BpfSnapshot, received: u32, dropped: u32) {
+        counters.kernel_received += u64::from(received.wrapping_sub(self.received));
+        counters.kernel_dropped += u64::from(dropped.wrapping_sub(self.dropped));
+        counters.stats_polls += 1;
+        self.received = received;
+        self.dropped = dropped;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sequence_gaps_saturate_instead_of_panicking_on_large_values() {
+        let mut tracker = EsfSequences::default();
+        let mut counters = EsfSnapshot {
+            received: u64::MAX,
+            kernel_dropped: u64::MAX - 1,
+            kernel_dropped_by_event_type: BTreeMap::from([("exec".into(), u64::MAX - 1)]),
+        };
+        tracker.observe(&mut counters, "exec".into(), Some(0), Some(0));
+        tracker.observe(&mut counters, "exec".into(), Some(u64::MAX), Some(u64::MAX));
+        tracker.observe(&mut counters, "exec".into(), Some(u64::MAX), Some(u64::MAX));
+        assert_eq!(counters.received, u64::MAX);
+        assert_eq!(counters.kernel_dropped, u64::MAX);
+        assert_eq!(counters.kernel_dropped_by_event_type["exec"], u64::MAX);
+    }
+
+    #[test]
+    fn sequence_gaps_are_separate_and_ignore_missing_or_old_values() {
+        let mut tracker = EsfSequences::default();
+        let mut counters = EsfSnapshot::default();
+        for (kind, seq, global) in [
+            ("exec", Some(10), Some(20)),
+            ("exit", Some(4), Some(21)),
+            ("exec", Some(14), Some(27)),
+            ("exec", None, None),
+            ("exec", Some(12), Some(23)),
+            ("exec", Some(15), Some(28)),
+        ] {
+            tracker.observe(&mut counters, kind.into(), seq, global);
+        }
+        assert_eq!(counters.kernel_dropped, 5);
+        assert_eq!(counters.kernel_dropped_by_event_type["exec"], 3);
+        assert_eq!(counters.kernel_dropped_by_event_type["exit"], 0);
+        assert_eq!(counters.received, 6);
+    }
+
+    #[test]
+    fn bpf_polls_accumulate_deltas_and_wrap() {
+        let mut tracker = BpfStatsTracker::default();
+        let mut counters = BpfSnapshot::default();
+        tracker.observe(&mut counters, u32::MAX, u32::MAX);
+        tracker.observe(&mut counters, 2, 1);
+        tracker.observe(&mut counters, 2, 1);
+        assert_eq!(counters.kernel_received, u64::from(u32::MAX) + 3);
+        assert_eq!(counters.kernel_dropped, u64::from(u32::MAX) + 2);
+        assert_eq!(counters.stats_polls, 3);
+    }
+    #[test]
+    fn interface_samples_reconcile_with_totals_and_wrap_independently() {
+        let mut counters = BpfSnapshot::default();
+        let mut wifi = BpfStatsTracker::default();
+        let mut vpn = BpfStatsTracker::default();
+        wifi.observe_interface(&mut counters, "en0", 100, 3);
+        vpn.observe_interface(&mut counters, "utun0", u32::MAX, 7);
+        vpn.observe_interface(&mut counters, "utun0", 2, 8);
+        wifi.observe_interface(&mut counters, "en0", 120, 4);
+        assert_eq!(
+            counters.kernel_received,
+            counters
+                .interfaces
+                .values()
+                .map(|i| i.kernel_received)
+                .sum::<u64>()
+        );
+        assert_eq!(counters.kernel_dropped, 12);
+        assert_eq!(counters.interfaces["en0"].kernel_dropped, 4);
+        assert_eq!(counters.interfaces["utun0"].kernel_dropped, 8);
+        assert_eq!(counters.stats_polls, 4);
+    }
+}

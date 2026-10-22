@@ -1,0 +1,801 @@
+//! Windows Event Log subscription infrastructure.
+//!
+//! Each source supplies a channel, an XPath query, and an XML decoder. The
+//! subscription lifecycle, native handles, shutdown, and sensor-channel
+//! delivery stay shared across System, Security, Defender, and Application sources.
+
+mod application;
+mod defender;
+mod powershell_classic;
+mod recovery;
+mod security;
+mod service;
+
+use std::io::Write;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{mpsc, Arc, Mutex};
+use std::thread::{self, JoinHandle};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+use crate::telemetry::EventLogHealth;
+use crate::utils::LogRateLimiter;
+use anyhow::{anyhow, Context, Result};
+use tokio::sync::mpsc::{error::TrySendError, Sender};
+use tracing::{error, info, trace, warn};
+use windows::core::PCWSTR;
+use windows::Win32::Foundation::{
+    ERROR_EVT_QUERY_RESULT_STALE, ERROR_NOT_FOUND, ERROR_NO_MORE_ITEMS,
+};
+use windows::Win32::System::EventLog::*;
+
+use crate::sensor::RawEvent;
+
+use super::etw::{PROCESS_TRACE_SESSION_NAME, TRACE_SESSION_NAME};
+
+const EVENT_LOG_WAIT: Duration = Duration::from_millis(250);
+const DECODE_WARNING_WINDOW: Duration = Duration::from_secs(60);
+
+type EventDecoder = fn(&str) -> Result<RawEvent>;
+
+#[derive(Clone, Copy)]
+struct EventLogSource {
+    name: &'static str,
+    channel: &'static str,
+    query: &'static str,
+    decoder: EventDecoder,
+}
+
+impl EventLogSource {
+    const fn new(
+        name: &'static str,
+        channel: &'static str,
+        query: &'static str,
+        decoder: EventDecoder,
+    ) -> Self {
+        Self {
+            name,
+            channel,
+            query,
+            decoder,
+        }
+    }
+}
+
+pub(super) struct EventLogSubscriptions {
+    workers: Vec<EventLogSubscription>,
+}
+
+impl EventLogSubscriptions {
+    pub(super) fn start(
+        tx: Sender<RawEvent>,
+        shutdown: Arc<AtomicBool>,
+        directory: &Path,
+        security_filtering_platform_connections: bool,
+        security_long_tail_events: bool,
+        security_domain_controller_events: bool,
+        health: Arc<EventLogHealth>,
+    ) -> Result<Self> {
+        let sources = [
+            application::source(),
+            service::source(),
+            powershell_classic::source(),
+            security::source(
+                security_filtering_platform_connections,
+                security_long_tail_events,
+                security_domain_controller_events,
+            ),
+            defender::source(),
+        ];
+        let mut workers = Vec::with_capacity(sources.len());
+
+        for source in sources {
+            match EventLogSubscription::start(
+                source,
+                tx.clone(),
+                Arc::clone(&shutdown),
+                directory.join(format!("{}.xml", source.channel)),
+                Arc::clone(&health),
+            ) {
+                Ok(worker) => workers.push(worker),
+                Err(err) => {
+                    shutdown.store(true, Ordering::Relaxed);
+                    for worker in workers {
+                        let _ = worker.join();
+                    }
+                    return Err(err);
+                }
+            }
+        }
+
+        Ok(Self { workers })
+    }
+
+    pub(super) fn join(self) -> Result<()> {
+        let mut first_error = None;
+        for worker in self.workers {
+            if let Err(err) = worker.join() {
+                first_error.get_or_insert(err);
+            }
+        }
+        first_error.map_or(Ok(()), Err)
+    }
+}
+
+struct EventLogSubscription {
+    worker: JoinHandle<Result<()>>,
+}
+
+impl EventLogSubscription {
+    fn start(
+        source: EventLogSource,
+        tx: Sender<RawEvent>,
+        shutdown: Arc<AtomicBool>,
+        checkpoint: PathBuf,
+        health: Arc<EventLogHealth>,
+    ) -> Result<Self> {
+        let (startup_tx, startup_rx) = mpsc::sync_channel(1);
+        let worker = thread::Builder::new()
+            .name(format!("event-log-{}", source.name))
+            .spawn(move || run_subscription(source, tx, shutdown, startup_tx, checkpoint, health))
+            .with_context(|| format!("failed to spawn {} event log worker", source.name))?;
+
+        match startup_rx.recv() {
+            Ok(Ok(())) => Ok(Self { worker }),
+            Ok(Err(err)) => {
+                let _ = worker.join();
+                Err(anyhow!(err).context(format!(
+                    "{} event log source (channel {}) failed during startup",
+                    source.name, source.channel
+                )))
+            }
+            Err(_) => {
+                let result = worker.join().map_err(|_| {
+                    anyhow!("{} event log worker panicked during startup", source.name)
+                })?;
+                result?;
+                Err(anyhow!(
+                    "{} event log worker stopped during startup",
+                    source.name
+                ))
+            }
+        }
+    }
+
+    fn join(self) -> Result<()> {
+        self.worker
+            .join()
+            .map_err(|_| anyhow!("event log worker panicked"))?
+    }
+}
+
+fn run_subscription(
+    source: EventLogSource,
+    tx: Sender<RawEvent>,
+    shutdown: Arc<AtomicBool>,
+    startup_tx: mpsc::SyncSender<std::result::Result<(), String>>,
+    checkpoint: PathBuf,
+    health: Arc<EventLogHealth>,
+) -> Result<()> {
+    let mut startup = Some(startup_tx);
+    let mut retry = recovery::RetryState::default();
+    let result = loop {
+        let started = Instant::now();
+        let outcome = run_subscription_inner(
+            source,
+            tx.clone(),
+            Arc::clone(&shutdown),
+            &mut startup,
+            &checkpoint,
+            &health,
+        );
+        let failure = match outcome {
+            Ok(SessionEnd::Shutdown) => break Ok(()),
+            Ok(SessionEnd::Failed(failure)) => failure,
+            Err(err) => break Err(err),
+        };
+        health.update(source.channel, |health| {
+            health.active = false;
+            health.last_error = Some(failure.message.clone());
+        });
+        // A permanent failure before the subscription ever started keeps the
+        // startup contract: the sensor refuses to start instead of running
+        // blind. A transient one (a channel being re-registered right after
+        // boot) lets startup proceed and this source recovers in the
+        // background under the same bounded budget, visible as inactive in
+        // the health snapshot until it does.
+        if startup.is_some() {
+            if recovery::classify(failure.code) == recovery::Retryability::Permanent {
+                break Err(anyhow!(failure.message));
+            }
+            warn!(
+                source = source.name,
+                channel = source.channel,
+                error = %failure.message,
+                "Event Log source unavailable at startup; retrying in the background"
+            );
+            if let Some(startup_tx) = startup.take() {
+                let _ = startup_tx.send(Ok(()));
+            }
+        }
+        match retry.on_failure(failure.code, started.elapsed()) {
+            recovery::Decision::Retry(delay) => {
+                warn!(
+                    channel = source.channel,
+                    error = %failure.message,
+                    retry_in_ms = delay.as_millis() as u64,
+                    "Event Log subscription lost; re-subscribing from the saved bookmark"
+                );
+                if !sleep_unless_shutdown(&shutdown, delay) {
+                    break Ok(());
+                }
+            }
+            recovery::Decision::Escalate => {
+                error!(
+                    channel = source.channel,
+                    error = %failure.message,
+                    "Event Log subscription failed permanently or retries are exhausted"
+                );
+                break Err(anyhow!(failure.message));
+            }
+        }
+    };
+    health.update(source.channel, |health| {
+        health.active = false;
+        if let Err(err) = &result {
+            health.last_error = Some(err.to_string());
+        }
+    });
+    if let (Err(err), Some(startup_tx)) = (&result, &startup) {
+        let _ = startup_tx.try_send(Err(err.to_string()));
+    }
+
+    if result.is_err() && !shutdown.swap(true, Ordering::Relaxed) {
+        // ETW processing is blocking. Stop it so an event log failure reaches
+        // the sensor caller instead of silently removing telemetry. Both
+        // sessions are stopped: each has a thread parked in `process()`, and
+        // leaving either running holds the sensor open.
+        for session in [TRACE_SESSION_NAME, PROCESS_TRACE_SESSION_NAME] {
+            let _ = ferrisetw::trace::stop_trace_by_name(session);
+        }
+    }
+
+    result
+}
+
+/// Sleeps in short slices; returns false when shutdown arrived first.
+fn sleep_unless_shutdown(shutdown: &AtomicBool, total: Duration) -> bool {
+    let deadline = Instant::now() + total;
+    while !shutdown.load(Ordering::Relaxed) {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return true;
+        }
+        thread::sleep(remaining.min(EVENT_LOG_WAIT));
+    }
+    false
+}
+
+/// How one subscription session ended.
+enum SessionEnd {
+    Shutdown,
+    Failed(SessionFailure),
+}
+
+struct SessionFailure {
+    /// Win32 error code when the failure has one; absence means permanent.
+    code: Option<u32>,
+    message: String,
+}
+
+// The box remains alive until EvtClose has waited for outstanding callbacks.
+struct CallbackContext {
+    source: EventLogSource,
+    tx: Sender<RawEvent>,
+    health: Arc<EventLogHealth>,
+    state: Mutex<CallbackState>,
+}
+
+struct CallbackState {
+    bookmark: OwnedEvtHandle,
+    pending: Option<String>,
+    failure: Option<String>,
+    failure_code: Option<u32>,
+    decode_warnings: LogRateLimiter,
+}
+
+fn run_subscription_inner(
+    source: EventLogSource,
+    tx: Sender<RawEvent>,
+    shutdown: Arc<AtomicBool>,
+    startup: &mut Option<mpsc::SyncSender<std::result::Result<(), String>>>,
+    checkpoint: &Path,
+    health: &Arc<EventLogHealth>,
+) -> Result<SessionEnd> {
+    health.update(source.channel, |health| health.active = false);
+    let saved = match std::fs::read_to_string(checkpoint) {
+        Ok(xml) => Some(xml),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
+        Err(err) => {
+            health.update(source.channel, |health| health.checkpoint_errors += 1);
+            return Err(err).context("failed to read Event Log checkpoint");
+        }
+    };
+    let saved_wide = saved.as_deref().map(wide_string);
+    // SAFETY: the argument is null or a NUL-terminated wide string that outlives
+    // the call. The new handle is owned by `OwnedEvtHandle`.
+    let bookmark = unsafe {
+        EvtCreateBookmark(
+            saved_wide
+                .as_ref()
+                .map_or(PCWSTR::null(), |xml| PCWSTR(xml.as_ptr())),
+        )
+    }
+    .map(OwnedEvtHandle)
+    .map_err(|err| {
+        health.update(source.channel, |health| health.checkpoint_errors += 1);
+        anyhow!("invalid {} Event Log bookmark: {err}", source.channel)
+    })?;
+    let mut saved_record_id = None;
+    if let Some(xml) = &saved {
+        let record_id = bookmark_record_id(xml, source.channel).inspect_err(|_| {
+            health.update(source.channel, |health| health.checkpoint_errors += 1);
+        })?;
+        saved_record_id = Some(record_id);
+        let oldest = match oldest_record(source.channel) {
+            Ok(oldest) => oldest,
+            Err(err) => {
+                health.update(source.channel, |health| health.subscription_errors += 1);
+                return Ok(SessionEnd::Failed(failure_from_error(source, &err)));
+            }
+        };
+        if retention_wrapped(record_id, oldest) {
+            health.update(source.channel, |health| health.retention_wraps += 1);
+            warn!(
+                channel = source.channel,
+                record_id,
+                oldest,
+                "Event Log downtime retention loss; matching record count unknown"
+            );
+        }
+    }
+    // Establish a baseline even when no matching record has been delivered yet.
+    // Reading the newest unfiltered record does not infer loss from record gaps.
+    let resume = if let Some(record_id) = saved_record_id {
+        record_id != 0
+    } else {
+        match seed_bookmark(source.channel, bookmark.0, checkpoint) {
+            Ok(resume) => resume,
+            Err(err) => {
+                // A channel that is missing right now (15007) is a subscription
+                // problem the retry policy handles, not a checkpoint fault.
+                let failure = failure_from_error(source, &err);
+                if recovery::classify(failure.code) == recovery::Retryability::Retryable {
+                    health.update(source.channel, |health| health.subscription_errors += 1);
+                    return Ok(SessionEnd::Failed(failure));
+                }
+                health.update(source.channel, |health| health.checkpoint_errors += 1);
+                return Err(err);
+            }
+        }
+    };
+    let context = Box::new(CallbackContext {
+        source,
+        tx,
+        health: Arc::clone(health),
+        state: Mutex::new(CallbackState {
+            bookmark,
+            pending: None,
+            failure: None,
+            failure_code: None,
+            decode_warnings: LogRateLimiter::new(DECODE_WARNING_WINDOW),
+        }),
+    });
+    let channel = wide_string(source.channel);
+    let query = wide_string(source.query);
+    let bookmark_handle = context
+        .state
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .bookmark
+        .0;
+    // SAFETY: the channel and query are NUL-terminated wide strings that outlive
+    // the call. The context pointer targets the boxed `CallbackContext`, which
+    // stays allocated until after the subscription is closed (`drop(subscription)`
+    // below runs before `context` is dropped), and the callback has the
+    // signature EvtSubscribe expects.
+    let subscribe = |origin: u32| unsafe {
+        EvtSubscribe(
+            None,
+            None,
+            PCWSTR(channel.as_ptr()),
+            PCWSTR(query.as_ptr()),
+            (origin == EvtSubscribeStartAfterBookmark.0).then_some(bookmark_handle),
+            Some((&*context as *const CallbackContext).cast()),
+            Some(subscription_callback),
+            origin | EvtSubscribeStrict.0,
+        )
+    };
+    let origin = if resume {
+        EvtSubscribeStartAfterBookmark.0
+    } else {
+        EvtSubscribeStartAtOldestRecord.0
+    };
+    let subscription = match subscribe(origin) {
+        Ok(handle) => OwnedEvtHandle(handle),
+        Err(err)
+            if resume
+                && (err.code() == ERROR_NOT_FOUND.to_hresult()
+                    || err.code() == ERROR_EVT_QUERY_RESULT_STALE.to_hresult()) =>
+        {
+            health.update(source.channel, |health| {
+                health.resume_failures += 1;
+                health.last_error = Some(format!("strict bookmark resume failed: {err}"));
+            });
+            warn!(channel = source.channel, error = %err, "Event Log bookmark missing; resuming at oldest available record");
+            match subscribe(EvtSubscribeStartAtOldestRecord.0).map(OwnedEvtHandle) {
+                Ok(handle) => handle,
+                Err(err) => return Ok(subscription_error(health, source, err)),
+            }
+        }
+        Err(err) => return Ok(subscription_error(health, source, err)),
+    };
+    {
+        let state = context.state.lock().unwrap_or_else(|e| e.into_inner());
+        health.update(source.channel, |health| {
+            health.active = state.failure.is_none()
+        });
+    }
+    if let Some(startup_tx) = startup.take() {
+        let _ = startup_tx.send(Ok(()));
+    }
+    info!(channel = source.channel, "Event log subscription started");
+    let result = (|| {
+        while !shutdown.load(Ordering::Relaxed) {
+            persist_pending(&context, checkpoint)?;
+            let state = context.state.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(message) = &state.failure {
+                return Ok(SessionEnd::Failed(SessionFailure {
+                    code: state.failure_code,
+                    message: message.clone(),
+                }));
+            }
+            drop(state);
+            thread::sleep(EVENT_LOG_WAIT);
+        }
+        Ok(SessionEnd::Shutdown)
+    })();
+    // Close before the final checkpoint: no callback may change it afterward.
+    // The bookmark stays on disk so the next session resumes after it.
+    drop(subscription);
+    let final_write = persist_pending(&context, checkpoint);
+    match result {
+        Ok(end) => final_write.map(|()| end),
+        Err(err) => Err(err),
+    }
+}
+
+fn subscription_error(
+    health: &EventLogHealth,
+    source: EventLogSource,
+    err: windows::core::Error,
+) -> SessionEnd {
+    health.update(source.channel, |health| health.subscription_errors += 1);
+    SessionEnd::Failed(SessionFailure {
+        code: recovery::win32_code(err.code().0),
+        message: format!("{} Event Log subscription failed: {err}", source.channel),
+    })
+}
+
+fn failure_from_error(source: EventLogSource, err: &anyhow::Error) -> SessionFailure {
+    SessionFailure {
+        code: err
+            .chain()
+            .find_map(|cause| cause.downcast_ref::<windows::core::Error>())
+            .and_then(|err| recovery::win32_code(err.code().0)),
+        message: format!("{} Event Log subscription failed: {err}", source.channel),
+    }
+}
+
+unsafe extern "system" fn subscription_callback(
+    action: EVT_SUBSCRIBE_NOTIFY_ACTION,
+    user_context: *const core::ffi::c_void,
+    event: EVT_HANDLE,
+) -> u32 {
+    // SAFETY: EvtSubscribe was given a pointer to the boxed `CallbackContext`,
+    // which outlives the subscription, so it is valid whenever this callback runs.
+    let context = &*(user_context as *const CallbackContext);
+    guard_callback(context, |state| {
+        if action == EvtSubscribeActionError {
+            let code = event.0 as u32;
+            let message = if code == ERROR_EVT_QUERY_RESULT_STALE.0 {
+                format!("ERROR_EVT_QUERY_RESULT_STALE ({code}): subscribed records are missing")
+            } else {
+                format!("Event Log subscription error {code}")
+            };
+            context.health.update(context.source.channel, |health| {
+                health.subscription_errors += 1;
+                if code == ERROR_EVT_QUERY_RESULT_STALE.0 {
+                    health.live_stale += 1;
+                }
+                health.active = false;
+                health.last_error = Some(message.clone());
+            });
+            warn!(
+                channel = context.source.channel,
+                code, "Event Log subscription error"
+            );
+            state.failure = Some(message);
+            state.failure_code = Some(code);
+            return;
+        }
+        if action != EvtSubscribeActionDeliver || state.failure.is_some() {
+            return;
+        }
+        let decoded = render_event_xml(event).and_then(|xml| (context.source.decoder)(&xml));
+        match decoded {
+            Ok(decoded) => {
+                context.health.update(context.source.channel, |health| {
+                    health.delivered += 1;
+                    // XPath excludes records. Differences are never counted as loss.
+                    health.last_record_id = decoded.source_seq;
+                });
+                if let Err(TrySendError::Closed(_)) =
+                    crate::telemetry::try_send_sensor_event(&context.tx, decoded)
+                {
+                    trace!(channel = context.source.channel, "Sensor channel closed");
+                    return;
+                }
+            }
+            Err(err) => {
+                let mut decode_errors = 0;
+                context.health.update(context.source.channel, |health| {
+                    health.decode_errors += 1;
+                    decode_errors = health.decode_errors;
+                });
+                let decision = state.decode_warnings.should_emit("decode");
+                if decision.should_emit {
+                    warn!(
+                        channel = context.source.channel,
+                        error = %err,
+                        decode_errors,
+                        suppressed_warnings = decision.suppressed_since_last_emit,
+                        "Failed to decode Event Log record"
+                    );
+                } else {
+                    tracing::debug!(
+                        channel = context.source.channel,
+                        error = %err,
+                        "Failed to decode Event Log record"
+                    );
+                }
+            }
+        }
+        // Checkpoint records handled here, including explicitly accounted queue shedding.
+        // Native callback event handles belong to Windows and must not be closed.
+        let checkpoint = EvtUpdateBookmark(state.bookmark.0, event)
+            .map_err(anyhow::Error::from)
+            .and_then(|()| render_xml(state.bookmark.0, EvtRenderBookmark.0));
+        match checkpoint {
+            Ok(xml) => state.pending = Some(xml),
+            Err(err) => {
+                context.health.update(context.source.channel, |health| {
+                    health.checkpoint_errors += 1
+                });
+                state.failure = Some(format!("Event Log checkpoint update failed: {err}"));
+            }
+        }
+    });
+    0
+}
+
+fn guard_callback(context: &CallbackContext, callback: impl FnOnce(&mut CallbackState)) {
+    // Development and tests unwind: prevent unwinding through the Windows ABI
+    // and fail this source, which stops deliveries and propagates to the sensor.
+    // Release uses panic = "abort": this guard cannot recover; the service
+    // manager must restart the terminated process.
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let mut state = context.state.lock().unwrap_or_else(|e| e.into_inner());
+        callback(&mut state);
+    }));
+    if outcome.is_err() {
+        context.health.update(context.source.channel, |health| {
+            health.subscription_errors += 1;
+            health.active = false;
+            health.last_error = Some("Event Log callback panicked".into());
+        });
+        context
+            .state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .failure = Some("Event Log callback panicked".into());
+    }
+}
+
+fn persist_pending(context: &CallbackContext, path: &Path) -> Result<()> {
+    let pending = context
+        .state
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .pending
+        .take();
+    if let Some(xml) = pending {
+        write_checkpoint(path, &xml).inspect_err(|_| {
+            context.health.update(context.source.channel, |health| {
+                health.checkpoint_errors += 1
+            });
+        })?;
+    }
+    Ok(())
+}
+
+fn write_checkpoint(path: &Path, xml: &str) -> Result<()> {
+    let directory = path
+        .parent()
+        .context("checkpoint needs a parent directory")?;
+    std::fs::create_dir_all(directory)?;
+    let mut file = tempfile::NamedTempFile::new_in(directory)?;
+    file.write_all(xml.as_bytes())?;
+    file.as_file().sync_all()?;
+    file.persist(path).map_err(|err| err.error)?;
+    Ok(())
+}
+
+fn seed_bookmark(channel: &str, bookmark: EVT_HANDLE, path: &Path) -> Result<bool> {
+    let channel_name = channel;
+    let channel = wide_string(channel);
+    let query = wide_string("*");
+    // SAFETY: the channel and query are NUL-terminated wide strings that outlive
+    // the call. The result handle is owned by `OwnedEvtHandle`.
+    let result = OwnedEvtHandle(unsafe {
+        EvtQuery(
+            None,
+            PCWSTR(channel.as_ptr()),
+            PCWSTR(query.as_ptr()),
+            EvtQueryChannelPath.0 | EvtQueryReverseDirection.0,
+        )
+    }?);
+    let mut events = [0isize; 1];
+    let mut returned = 0;
+    // SAFETY: `result` is an open query handle, and `events` and `returned` are
+    // valid for the one handle requested.
+    match unsafe { EvtNext(result.0, &mut events, 0, 0, &mut returned) } {
+        Err(err) if err.code() == ERROR_NO_MORE_ITEMS.to_hresult() => {
+            // Zero means the channel was empty, not a missing processed record.
+            // Resume it from the oldest record so downtime events are replayed.
+            let escaped = channel_name
+                .replace('&', "&amp;")
+                .replace('"', "&quot;")
+                .replace('<', "&lt;");
+            write_checkpoint(
+                path,
+                &format!(
+                    r#"<BookmarkList><Bookmark Channel="{escaped}" RecordId="0" IsCurrent="true"/></BookmarkList>"#
+                ),
+            )?;
+            return Ok(false);
+        }
+        other => other?,
+    }
+    let event = OwnedEvtHandle(EVT_HANDLE(events[0]));
+    // SAFETY: `bookmark` is an open bookmark handle from the caller, and
+    // `event` is the open event handle EvtNext just returned.
+    unsafe { EvtUpdateBookmark(bookmark, event.0) }?;
+    write_checkpoint(path, &render_xml(bookmark, EvtRenderBookmark.0)?)?;
+    Ok(true)
+}
+
+fn retention_wrapped(record_id: u64, oldest: u64) -> bool {
+    // The bookmark itself was already processed. Only records after it matter.
+    oldest > record_id.saturating_add(1)
+}
+
+fn bookmark_record_id(xml: &str, channel: &str) -> Result<u64> {
+    let document = roxmltree::Document::parse(xml)?;
+    document
+        .descendants()
+        .find(|node| node.has_tag_name("Bookmark") && node.attribute("Channel") == Some(channel))
+        .and_then(|node| node.attribute("RecordId"))
+        .context("bookmark has no channel record ID")?
+        .parse()
+        .context("invalid bookmark record ID")
+}
+
+fn oldest_record(channel: &str) -> Result<u64> {
+    let channel = wide_string(channel);
+    // SAFETY: the channel is a NUL-terminated wide string that outlives the call.
+    // The log handle is owned by `OwnedEvtHandle`.
+    let log = OwnedEvtHandle(unsafe {
+        EvtOpenLog(None, PCWSTR(channel.as_ptr()), EvtOpenChannelPath.0)
+    }?);
+    let mut value = EVT_VARIANT::default();
+    let mut used = 0;
+    // SAFETY: `log` is an open log handle, and `value` is a writable EVT_VARIANT
+    // whose size is passed with it.
+    unsafe {
+        EvtGetLogInfo(
+            log.0,
+            EvtLogOldestRecordNumber,
+            std::mem::size_of_val(&value) as u32,
+            Some(&mut value),
+            &mut used,
+        )
+    }?;
+    if value.Type != EvtVarTypeUInt64.0 as u32 {
+        return Err(anyhow!("unexpected oldest record number type"));
+    }
+    // SAFETY: the type tag was checked to be UInt64 above, so that union arm is
+    // the initialized one.
+    Ok(unsafe { value.Anonymous.UInt64Val })
+}
+
+fn render_event_xml(event: EVT_HANDLE) -> Result<String> {
+    render_xml(event, EvtRenderEventXml.0)
+}
+
+fn render_xml(event: EVT_HANDLE, flags: u32) -> Result<String> {
+    let mut bytes_needed = 0u32;
+    let mut property_count = 0u32;
+    // SAFETY: with no buffer, the call only reports the required size through
+    // valid out-pointers.
+    let _ = unsafe {
+        EvtRender(
+            None,
+            event,
+            flags,
+            0,
+            None,
+            &mut bytes_needed,
+            &mut property_count,
+        )
+    };
+    if bytes_needed < 2 {
+        return Err(anyhow!("event XML render returned an empty buffer"));
+    }
+
+    let mut buffer = vec![0u16; bytes_needed.div_ceil(2) as usize];
+    // SAFETY: `buffer` is writable for at least `bytes_needed` bytes, which is
+    // passed as its size, and the out-pointers are valid.
+    unsafe {
+        EvtRender(
+            None,
+            event,
+            flags,
+            bytes_needed,
+            Some(buffer.as_mut_ptr().cast()),
+            &mut bytes_needed,
+            &mut property_count,
+        )
+    }
+    .map_err(|err| anyhow!("failed to render event XML: {err}"))?;
+
+    let length = buffer
+        .iter()
+        .position(|value| *value == 0)
+        .unwrap_or(buffer.len());
+    String::from_utf16(&buffer[..length]).context("event XML was not valid UTF-16")
+}
+
+fn parse_system_time(value: &str) -> Option<SystemTime> {
+    let timestamp = chrono::DateTime::parse_from_rfc3339(value).ok()?;
+    let seconds = u64::try_from(timestamp.timestamp()).ok()?;
+    UNIX_EPOCH.checked_add(Duration::new(seconds, timestamp.timestamp_subsec_nanos()))
+}
+
+fn wide_string(value: &str) -> Vec<u16> {
+    value.encode_utf16().chain(std::iter::once(0)).collect()
+}
+
+struct OwnedEvtHandle(EVT_HANDLE);
+
+impl Drop for OwnedEvtHandle {
+    fn drop(&mut self) {
+        // SAFETY: this wrapper owns the handle and closes it once.
+        unsafe {
+            let _ = EvtClose(self.0);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests;

@@ -1,0 +1,155 @@
+[package]
+name = "rustinel"
+version = "1.11.0-rc.1"
+edition = "2021"
+authors = []
+description = "Open-source EDR for Windows, Linux, and macOS with Sigma, YARA, and IOC detection"
+license = "Apache-2.0"
+rust-version = "1.98"
+default-run = "rustinel"
+
+[workspace]
+members = ["."]
+default-members = ["."]
+resolver = "2"
+
+[lints.rust]
+warnings = "deny"
+
+[lints.clippy]
+undocumented_unsafe_blocks = "warn"
+
+[profile.release]
+# Unexpected panics terminate the agent for service-manager recovery.
+# Callback guards still serve unwinding development and test builds.
+panic = "abort"
+
+[dependencies]
+# Sigma detection engine: rule parsing (rsigma-parser) plus stateless detection
+# and stateful correlation evaluation (rsigma-eval). Rustinel keeps ownership of
+# normalization, logsource routing, ECS alerts, hot reload, and IOC/YARA.
+rsigma-parser = "0.24"
+rsigma-eval = "0.24"
+
+regex = "1.10"
+
+# Network and encoding utilities
+ipnetwork = "0.21.1"
+digest = "0.11"
+hex = "0.4"
+md-5 = "0.11"
+sha1 = "0.11"
+sha2 = "0.11"
+hmac = "0.13"
+
+# Async runtime
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "signal", "time", "net"] }
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+# Use the same maintained YAML parser as RSigma, including document streams.
+yaml_serde = "0.10.4"
+chrono = { version = "0.4", features = ["clock"] }
+semver = "1.0"
+uuid = { version = "1", default-features = false, features = ["v4"] }
+
+# Utilities
+anyhow = "1.0"
+thiserror = "2.0.18"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json", "fmt"] }
+tracing-appender = "0.2"
+clap = { version = "4.4", features = ["derive"] }
+arc-swap = "1.7"
+smallvec = { version = "1", features = ["serde"] }
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls-native-roots"] }
+url = "2.5"
+# Public Suffix List, compiled in, for the derived DNS registered domain.
+psl = "2"
+zip = { version = "9.0", default-features = false, features = ["deflate"] }
+
+flate2 = "1"
+tar = "0.4"
+self-replace = "1.5"
+tempfile = "3.8"
+minisign-verify = "0.3"
+
+# Configuration
+config = "0.15.23"
+notify = "8.2.0"
+
+# Linux-specific
+[target.'cfg(target_os = "linux")'.dependencies]
+aya = { version = "0.14", default-features = false }
+rustinel-ebpf-common = { version = "1.0.2", path = "ebpf-common", features = ["aya"] }
+libc = "0.2"
+object = { version = "0.40", default-features = false, features = ["elf", "read_core", "std"] }
+
+# YARA-X uses its native JIT outside macOS.
+[target.'cfg(not(target_os = "macos"))'.dependencies]
+yara-x = "1.21"
+
+# macOS-specific
+[target.'cfg(target_os = "macos")'.dependencies]
+libc = "0.2"
+# Endpoint Security clients cannot use hardened runtime relaxation
+# entitlements, so use the Pulley interpreter instead of YARA-X's native JIT.
+yara-x = { version = "1.21", features = ["pulley"] }
+# Endpoint Security framework bindings (process and file telemetry).
+# macos_11_0_0 sets the minimum supported macOS to Big Sur and enables
+# reference-counted message handling.
+endpoint-sec = { version = "0.6", features = ["macos_11_0_0"] }
+endpoint-sec-sys = "0.6"
+# Process/socket inspection for best-effort PID attribution of captured flows.
+libproc = "0.14"
+# Mach VM APIs for YARA process-memory scanning (task_for_pid, mach_vm_read).
+mach2 = "0.7"
+
+# Windows-specific
+[target.'cfg(windows)'.dependencies]
+# PE parsing and memory-mapped I/O (Windows-only; PE metadata is not used on Linux)
+goblin = { version = "0.10", default-features = false, features = ["std", "pe32", "pe64"] }
+memmap2 = "0.9"
+ferrisetw = "1.2"
+roxmltree = "0.21"
+windows = { version = "0.62.2", features = ["Win32_Foundation", "Win32_System_Diagnostics_Etw", "Win32_System_Time", "Win32_System_EventLog", "Win32_System_Registry", "Win32_Security", "Win32_Security_Authorization", "Win32_Security_WinTrust", "Win32_Security_Cryptography", "Win32_Security_Cryptography_Catalog", "Win32_Security_Cryptography_Sip", "Win32_System_Threading", "Win32_System_Diagnostics_ToolHelp", "Win32_System_ProcessStatus", "Win32_Storage_FileSystem", "Win32_System_Memory", "Win32_System_Diagnostics_Debug", "Win32_UI_WindowsAndMessaging"] }
+windows-service = "0.8.1"
+
+[build-dependencies]
+# Embeds the PE version resource that SignPath checks on signed binaries.
+winresource = { version = "0.1.34", default-features = false }
+
+[dev-dependencies]
+tempfile = "3.8"
+criterion = "0.8"
+
+# Sigma detection throughput, measured with `cargo bench --bench sigma_engine`.
+[[bench]]
+name = "sigma_engine"
+harness = false
+
+# Wildcard-domain IOC matching, measured with `cargo bench --bench ioc_domains`.
+[[bench]]
+name = "ioc_domains"
+harness = false
+
+# CIDR IOC matching, measured with `cargo bench --bench ioc_ips`.
+[[bench]]
+name = "ioc_ips"
+harness = false
+
+# Per-event inline IOC matching, measured with `cargo bench --bench ioc_observables`.
+[[bench]]
+name = "ioc_observables"
+harness = false
+
+# Bounded-cache eviction cost, measured with `cargo bench --bench cache_eviction`.
+[[bench]]
+name = "cache_eviction"
+harness = false
+
+# Field availability lookup cost, measured with `cargo bench --bench field_lookup`.
+[[bench]]
+name = "field_lookup"
+harness = false

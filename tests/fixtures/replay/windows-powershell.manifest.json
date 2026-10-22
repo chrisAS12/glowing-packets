@@ -1,0 +1,16 @@
+{
+  "schema_version": 2,
+  "payload": "windows-powershell.ndjson",
+  "rustinel_version": "1.3.0",
+  "platform": "windows",
+  "started_at": "2026-08-16T09:40:58.004Z",
+  "ended_at": "2026-08-16T09:41:11.663Z",
+  "status": "complete",
+  "events": {
+    "received": 4,
+    "written": 4,
+    "lost": 0
+  },
+  "payload_bytes": 1823,
+  "payload_sha256": "beb84611054e2aecf36ea3389fa856e466d7a742ddfb052fb8ad4a4d18ac0481"
+}

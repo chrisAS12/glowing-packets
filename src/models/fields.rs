@@ -1,0 +1,812 @@
+use serde::{Deserialize, Serialize};
+use std::collections::{BTreeMap, HashMap};
+
+use super::EventCategory;
+
+/// Event fields enum containing category-specific data
+///
+/// Serialization is untagged: the payload is the stable schema-v2 recording
+/// view. Reading that payload back therefore needs
+/// the event category to say which variant it is — see
+/// [`EventFields::from_recorded`]. Structural inference is not good enough,
+/// because a minimal event carries too few fields to tell the variants apart.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+#[allow(clippy::large_enum_variant)]
+pub enum EventFields {
+    ProcessCreation(ProcessCreationFields),
+    FileEvent(FileEventFields),
+    RegistryEvent(RegistryEventFields),
+    NetworkConnection(NetworkConnectionFields),
+    DnsQuery(DnsQueryFields),
+    ImageLoad(ImageLoadFields),
+    PowerShellScript(PowerShellScriptFields),
+    PowerShellModule(PowerShellModuleFields),
+    PowerShellClassicStart(PowerShellClassicStartFields),
+    WmiEvent(WmiEventFields),
+    ServiceCreation(ServiceCreationFields),
+    TaskCreation(TaskCreationFields),
+    SecurityAudit(SecurityAuditFields),
+    ApplicationEvent(ApplicationEventFields),
+    Generic(HashMap<String, String>),
+}
+
+impl EventFields {
+    /// Rebuild the fields of a recorded event from its category and payload.
+    ///
+    /// Each event category maps to exactly one typed variant, mirroring the
+    /// sensor payload it was normalized from. Dispatching on the category is
+    /// what keeps a two-field file event from being read back as a process
+    /// event, which is all an untagged structural guess could conclude from
+    /// `{"Image": ..., "ProcessId": ...}`.
+    ///
+    /// [`EventFields::Generic`] has no category of its own and is never
+    /// produced by normalization, so it never appears in a recording; a
+    /// payload written from one is read back as the typed variant of its
+    /// category.
+    pub fn from_recorded(
+        category: EventCategory,
+        payload: serde_json::Value,
+    ) -> Result<Self, serde_json::Error> {
+        match category {
+            EventCategory::Process => serde_json::from_value(payload).map(Self::ProcessCreation),
+            EventCategory::Network => serde_json::from_value(payload).map(Self::NetworkConnection),
+            EventCategory::File => serde_json::from_value(payload).map(Self::FileEvent),
+            EventCategory::Registry => serde_json::from_value(payload).map(Self::RegistryEvent),
+            EventCategory::Dns => serde_json::from_value(payload).map(Self::DnsQuery),
+            EventCategory::ImageLoad | EventCategory::DriverLoad => {
+                serde_json::from_value(payload).map(Self::ImageLoad)
+            }
+            EventCategory::Scripting => serde_json::from_value(payload).map(Self::PowerShellScript),
+            EventCategory::PowerShellModule => {
+                serde_json::from_value(payload).map(Self::PowerShellModule)
+            }
+            EventCategory::PowerShellClassicStart => {
+                serde_json::from_value(payload).map(Self::PowerShellClassicStart)
+            }
+            EventCategory::Wmi => serde_json::from_value(payload).map(Self::WmiEvent),
+            EventCategory::Service => serde_json::from_value(payload).map(Self::ServiceCreation),
+            EventCategory::Task => serde_json::from_value(payload).map(Self::TaskCreation),
+            EventCategory::Security => serde_json::from_value(payload).map(Self::SecurityAudit),
+            EventCategory::Defender => serde_json::from_value(payload).map(Self::SecurityAudit),
+            EventCategory::Application => {
+                serde_json::from_value(payload).map(Self::ApplicationEvent)
+            }
+        }
+    }
+}
+
+/// Optional authoritative exec metadata. Absent signature fields mean unknown.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ExecMetadata {
+    #[serde(rename = "Signed", skip_serializing_if = "Option::is_none")]
+    pub signed: Option<String>,
+    #[serde(rename = "PreExecImage", skip_serializing_if = "Option::is_none")]
+    pub pre_exec_image: Option<String>,
+    #[serde(rename = "RealUserId", skip_serializing_if = "Option::is_none")]
+    pub real_user_id: Option<String>,
+    #[serde(rename = "Script", skip_serializing_if = "Option::is_none")]
+    pub script: Option<String>,
+    #[serde(rename = "SignatureStatus", skip_serializing_if = "Option::is_none")]
+    pub signature_status: Option<String>,
+    #[serde(rename = "SigningId", skip_serializing_if = "Option::is_none")]
+    pub signing_id: Option<String>,
+    #[serde(rename = "TeamId", skip_serializing_if = "Option::is_none")]
+    pub team_id: Option<String>,
+    #[serde(rename = "CdHash", skip_serializing_if = "Option::is_none")]
+    pub cdhash: Option<String>,
+    #[serde(rename = "CodeSigningFlags", skip_serializing_if = "Option::is_none")]
+    pub codesigning_flags: Option<String>,
+    #[serde(rename = "IsPlatformBinary", skip_serializing_if = "Option::is_none")]
+    pub is_platform_binary: Option<bool>,
+    /// Kernel argv snapshot with its argument boundaries kept, Linux only.
+    /// `CommandLine` is this vector joined with spaces.
+    #[serde(rename = "Argv", skip_serializing_if = "Option::is_none")]
+    pub argv: Option<Vec<String>>,
+    /// `execve` or `execveat`: the entry point that staged the argv snapshot.
+    #[serde(rename = "ExecSyscall", skip_serializing_if = "Option::is_none")]
+    pub exec_syscall: Option<String>,
+    #[serde(skip)]
+    pub(crate) file_identity: Option<crate::utils::file_identity::FileIdentity>,
+}
+
+/// Linux kernel process identity measured at the event, when available.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct LinuxProcessIdentity {
+    #[serde(rename = "RealGroupId", skip_serializing_if = "Option::is_none")]
+    pub real_group_id: Option<String>,
+    #[serde(rename = "EffectiveUserId", skip_serializing_if = "Option::is_none")]
+    pub effective_user_id: Option<String>,
+    #[serde(rename = "EffectiveGroupId", skip_serializing_if = "Option::is_none")]
+    pub effective_group_id: Option<String>,
+    #[serde(rename = "MountNamespace", skip_serializing_if = "Option::is_none")]
+    pub mount_namespace: Option<String>,
+    #[serde(rename = "PidNamespace", skip_serializing_if = "Option::is_none")]
+    pub pid_namespace: Option<String>,
+    #[serde(rename = "NetworkNamespace", skip_serializing_if = "Option::is_none")]
+    pub network_namespace: Option<String>,
+    #[serde(rename = "SessionId", skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+    #[serde(rename = "ControllingTty", skip_serializing_if = "Option::is_none")]
+    pub controlling_tty: Option<String>,
+    #[serde(
+        rename = "KernelStartBoottime",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub kernel_start_boottime: Option<u64>,
+}
+
+/// Linux cgroup and container context resolved from the measured cgroup
+/// identifier. Absent fields mean unresolved.
+///
+/// `CgroupPath` present with `ContainerId` absent is a host process;
+/// `CgroupPath` absent means the event could not be classified either way.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LinuxContainerContext {
+    /// Cgroup v2 path relative to the cgroup2 mount, as in `/proc/PID/cgroup`.
+    #[serde(rename = "CgroupPath", skip_serializing_if = "Option::is_none")]
+    pub cgroup_path: Option<String>,
+    #[serde(rename = "ContainerId", skip_serializing_if = "Option::is_none")]
+    pub container_id: Option<String>,
+    #[serde(rename = "ContainerRuntime", skip_serializing_if = "Option::is_none")]
+    pub container_runtime: Option<String>,
+}
+
+/// Windows creation source evidence, retained through recording and ECS output.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct WindowsProcessMetadata {
+    pub command_line_source: Option<String>,
+    pub conflicting_live_command_line: Option<String>,
+    /// Original creation-time value when detection uses the longer live value.
+    pub classic_command_line: Option<String>,
+    /// The observed Windows source limit was reached; completeness is unknown.
+    #[serde(default)]
+    pub command_line_may_be_truncated: bool,
+    pub user_sid: Option<String>,
+    pub session_id: Option<u32>,
+}
+
+/// Process creation/access event fields (Sigma: process_creation, process_access)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProcessCreationFields {
+    #[serde(flatten, default)]
+    pub exec: Option<Box<ExecMetadata>>,
+    #[serde(flatten, default)]
+    pub linux_identity: Box<LinuxProcessIdentity>,
+    #[serde(flatten, default)]
+    pub container: Box<LinuxContainerContext>,
+    #[serde(rename = "Image", skip_serializing_if = "Option::is_none")]
+    pub image: Option<String>,
+
+    /// Legacy Sysmon compatibility marker: `execve` for the kernel filename,
+    /// or `proc` in older recordings. General fidelity lives on the event.
+    #[serde(rename = "ImageSource", skip_serializing_if = "Option::is_none")]
+    pub image_source: Option<String>,
+    /// True when the sensor had to cut the end off `Image`.
+    #[serde(rename = "ImageTruncated", skip_serializing_if = "Option::is_none")]
+    pub image_truncated: Option<bool>,
+
+    #[serde(rename = "OriginalFileName", skip_serializing_if = "Option::is_none")]
+    pub original_file_name: Option<String>,
+
+    #[serde(rename = "Product", skip_serializing_if = "Option::is_none")]
+    pub product: Option<String>,
+
+    #[serde(rename = "Description", skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+
+    #[serde(rename = "Company", skip_serializing_if = "Option::is_none")]
+    pub company: Option<String>,
+
+    #[serde(rename = "FileVersion", skip_serializing_if = "Option::is_none")]
+    pub file_version: Option<String>,
+
+    /// Sysmon-format digests of the image file, filled by artifact resolution
+    /// after admission: `SHA1=...,MD5=...,SHA256=...,IMPHASH=...`.
+    #[serde(rename = "Hashes", skip_serializing_if = "Option::is_none")]
+    pub hashes: Option<String>,
+
+    /// Lowercase import hash of the image file, filled with `Hashes`.
+    #[serde(rename = "Imphash", skip_serializing_if = "Option::is_none")]
+    pub imphash: Option<String>,
+
+    #[serde(rename = "TargetImage", skip_serializing_if = "Option::is_none")]
+    pub target_image: Option<String>,
+
+    #[serde(rename = "CommandLine", skip_serializing_if = "Option::is_none")]
+    pub command_line: Option<String>,
+
+    #[serde(rename = "ProcessId", skip_serializing_if = "Option::is_none")]
+    pub process_id: Option<String>,
+
+    #[serde(rename = "ProcessStartTime", skip_serializing_if = "Option::is_none")]
+    pub process_start_time: Option<u64>,
+
+    /// Kernel cgroup identifier measured at exec time on Linux.
+    #[serde(rename = "CgroupId", skip_serializing_if = "Option::is_none")]
+    pub cgroup_id: Option<String>,
+
+    #[serde(rename = "ParentProcessId", skip_serializing_if = "Option::is_none")]
+    pub parent_process_id: Option<String>,
+
+    #[serde(rename = "ParentImage", skip_serializing_if = "Option::is_none")]
+    pub parent_image: Option<String>,
+
+    #[serde(rename = "ParentCommandLine", skip_serializing_if = "Option::is_none")]
+    pub parent_command_line: Option<String>,
+
+    #[serde(rename = "ParentUser", skip_serializing_if = "Option::is_none")]
+    pub parent_user: Option<String>,
+
+    #[serde(rename = "CurrentDirectory", skip_serializing_if = "Option::is_none")]
+    pub current_directory: Option<String>,
+
+    #[serde(rename = "IntegrityLevel", skip_serializing_if = "Option::is_none")]
+    pub integrity_level: Option<String>,
+
+    #[serde(rename = "User", skip_serializing_if = "Option::is_none")]
+    pub user: Option<String>,
+
+    /// Logon session of the process token, formatted as Sysmon does
+    /// (`0x3e7`). On Linux this is the audit login UID, `0` for root.
+    #[serde(rename = "LogonId", skip_serializing_if = "Option::is_none")]
+    pub logon_id: Option<String>,
+
+    /// Internal fidelity marker consumed by normalization.
+    #[serde(skip)]
+    pub parent_process_id_derived: bool,
+    #[serde(
+        default,
+        rename = "WindowsProcessMetadata",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub windows: Option<Box<WindowsProcessMetadata>>,
+}
+
+/// Sensor-measured identity of a filesystem object.
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct FileObjectIdentity {
+    pub device: u64,
+    pub inode: u64,
+}
+
+/// File event fields (Sigma: file_access, file_delete, file_event)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FileEventFields {
+    #[serde(rename = "SourceFilename", skip_serializing_if = "Option::is_none")]
+    pub source_filename: Option<String>,
+
+    #[serde(rename = "TargetFilename", skip_serializing_if = "Option::is_none")]
+    pub target_filename: Option<String>,
+
+    #[serde(rename = "ProcessId", skip_serializing_if = "Option::is_none")]
+    pub process_id: Option<String>,
+
+    #[serde(rename = "Image", skip_serializing_if = "Option::is_none")]
+    pub image: Option<String>,
+
+    #[serde(rename = "CreationUtcTime", skip_serializing_if = "Option::is_none")]
+    pub creation_utc_time: Option<String>,
+
+    #[serde(
+        rename = "PreviousCreationUtcTime",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub previous_creation_utc_time: Option<String>,
+
+    #[serde(rename = "User", skip_serializing_if = "Option::is_none")]
+    pub user: Option<String>,
+
+    /// Filesystem object identity measured by the sensor at event time.
+    #[serde(skip)]
+    #[doc(hidden)]
+    pub file_identity: Option<FileObjectIdentity>,
+
+    /// Which paths on this event were cut short by the sensor's capture buffer:
+    /// `"target"`, `"source"`, or `"source,target"`. Absent when both are
+    /// complete.
+    ///
+    /// Truncation removes the end of a path, which is what `endswith` rules and
+    /// extension IOCs match on, so a rule that does not fire on an event
+    /// carrying this marker has not cleared the file.
+    #[serde(rename = "PathTruncated", skip_serializing_if = "Option::is_none")]
+    pub path_truncated: Option<String>,
+}
+
+/// Registry event fields (Sigma: registry_event, registry_add, registry_delete, registry_set)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RegistryEventFields {
+    #[serde(rename = "TargetObject", skip_serializing_if = "Option::is_none")]
+    pub target_object: Option<String>,
+
+    #[serde(rename = "Details", skip_serializing_if = "Option::is_none")]
+    pub details: Option<String>,
+
+    #[serde(rename = "ProcessId", skip_serializing_if = "Option::is_none")]
+    pub process_id: Option<String>,
+
+    #[serde(rename = "Image", skip_serializing_if = "Option::is_none")]
+    pub image: Option<String>,
+
+    #[serde(rename = "EventType", skip_serializing_if = "Option::is_none")]
+    pub event_type: Option<String>,
+
+    #[serde(rename = "User", skip_serializing_if = "Option::is_none")]
+    pub user: Option<String>,
+
+    #[serde(rename = "NewName", skip_serializing_if = "Option::is_none")]
+    pub new_name: Option<String>,
+}
+
+/// Network connection event fields (Sigma: network_connection)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NetworkConnectionFields {
+    #[serde(rename = "DestinationIp", skip_serializing_if = "Option::is_none")]
+    pub destination_ip: Option<String>,
+
+    #[serde(rename = "SourceIp", skip_serializing_if = "Option::is_none")]
+    pub source_ip: Option<String>,
+
+    #[serde(rename = "DestinationPort", skip_serializing_if = "Option::is_none")]
+    pub destination_port: Option<String>,
+
+    #[serde(rename = "SourcePort", skip_serializing_if = "Option::is_none")]
+    pub source_port: Option<String>,
+
+    #[serde(rename = "ProcessId", skip_serializing_if = "Option::is_none")]
+    pub process_id: Option<String>,
+
+    #[serde(rename = "Image", skip_serializing_if = "Option::is_none")]
+    pub image: Option<String>,
+
+    #[serde(rename = "User", skip_serializing_if = "Option::is_none")]
+    pub user: Option<String>,
+
+    #[serde(
+        rename = "DestinationHostname",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub destination_hostname: Option<String>,
+
+    #[serde(rename = "Protocol", skip_serializing_if = "Option::is_none")]
+    pub protocol: Option<String>,
+
+    /// Whether the local host initiated the connection, as Sysmon Event ID 3
+    /// defines `Initiated`.
+    ///
+    /// Absent rather than guessed when the sensor cannot tell the direction: a
+    /// wire-level capture sees both ends of a handshake, and a rule asking for
+    /// `Initiated: 'false'` must not match an outbound connection because the
+    /// sensor defaulted. Sigma sees the value as the string `true` or `false`
+    /// via [`NormalizedEvent::get_field`](crate::models::NormalizedEvent::get_field);
+    /// it is a JSON boolean on the wire.
+    #[serde(rename = "Initiated", skip_serializing_if = "Option::is_none")]
+    pub initiated: Option<bool>,
+}
+
+/// DNS query event fields (Sigma: dns_query)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DnsQueryFields {
+    #[serde(rename = "User", skip_serializing_if = "Option::is_none")]
+    pub user: Option<String>,
+
+    #[serde(rename = "QueryName", skip_serializing_if = "Option::is_none")]
+    pub query_name: Option<String>,
+
+    #[serde(rename = "QueryResults", skip_serializing_if = "Option::is_none")]
+    pub query_results: Option<String>,
+
+    #[serde(rename = "RecordType", skip_serializing_if = "Option::is_none")]
+    pub record_type: Option<String>,
+
+    #[serde(rename = "QueryStatus", skip_serializing_if = "Option::is_none")]
+    pub query_status: Option<String>,
+
+    /// `"true"` when the sensor saw only the start of the message and the name
+    /// ends where the capture did. Absent when the whole question was read.
+    #[serde(rename = "QueryTruncated", skip_serializing_if = "Option::is_none")]
+    pub query_truncated: Option<String>,
+
+    #[serde(rename = "ProcessId", skip_serializing_if = "Option::is_none")]
+    pub process_id: Option<String>,
+
+    #[serde(rename = "Image", skip_serializing_if = "Option::is_none")]
+    pub image: Option<String>,
+}
+
+impl DnsQueryFields {
+    /// The query name when it is whole, for fields derived from its shape.
+    /// A name cut off by the capture would give a wrong label count, length,
+    /// and registered domain, so those fields stay absent for it.
+    pub(crate) fn derivable_query_name(&self) -> Option<&str> {
+        self.query_name
+            .as_deref()
+            .filter(|_| self.query_truncated.as_deref() != Some("true"))
+    }
+}
+
+/// Image load event fields (Sigma: image_load)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ImageLoadFields {
+    #[serde(rename = "ImageLoaded", skip_serializing_if = "Option::is_none")]
+    pub image_loaded: Option<String>,
+
+    #[serde(rename = "ProcessId", skip_serializing_if = "Option::is_none")]
+    pub process_id: Option<String>,
+
+    #[serde(rename = "Image", skip_serializing_if = "Option::is_none")]
+    pub image: Option<String>,
+
+    #[serde(rename = "OriginalFileName", skip_serializing_if = "Option::is_none")]
+    pub original_file_name: Option<String>,
+
+    #[serde(rename = "Product", skip_serializing_if = "Option::is_none")]
+    pub product: Option<String>,
+
+    #[serde(rename = "Description", skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+
+    #[serde(rename = "Company", skip_serializing_if = "Option::is_none")]
+    pub company: Option<String>,
+
+    #[serde(rename = "FileVersion", skip_serializing_if = "Option::is_none")]
+    pub file_version: Option<String>,
+
+    /// Sysmon-format digests of the loaded image file, filled by artifact
+    /// resolution after admission.
+    #[serde(rename = "Hashes", skip_serializing_if = "Option::is_none")]
+    pub hashes: Option<String>,
+
+    /// Lowercase import hash of the loaded image file, filled with `Hashes`.
+    #[serde(rename = "Imphash", skip_serializing_if = "Option::is_none")]
+    pub imphash: Option<String>,
+
+    #[serde(rename = "Signed", skip_serializing_if = "Option::is_none")]
+    pub signed: Option<String>,
+
+    #[serde(rename = "Signature", skip_serializing_if = "Option::is_none")]
+    pub signature: Option<String>,
+
+    /// Sysmon's `Valid`, `Expired`, `Revoked`, `Invalid`, or `Unavailable`
+    /// (unsigned), filled by artifact resolution after admission. Absent means
+    /// verification did not complete, never unsigned.
+    #[serde(rename = "SignatureStatus", skip_serializing_if = "Option::is_none")]
+    pub signature_status: Option<String>,
+
+    #[serde(rename = "User", skip_serializing_if = "Option::is_none")]
+    pub user: Option<String>,
+}
+
+/// PowerShell script event fields (Sigma: ps_script)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PowerShellScriptFields {
+    #[serde(rename = "ScriptBlockText", skip_serializing_if = "Option::is_none")]
+    pub script_block_text: Option<String>,
+
+    #[serde(rename = "ScriptBlockId", skip_serializing_if = "Option::is_none")]
+    pub script_block_id: Option<String>,
+
+    /// 1-based position of this fragment within the script block (event 4104 `MessageNumber`).
+    /// Long blocks are split by the provider; one fragment is not the whole script.
+    #[serde(
+        rename = "MessageNumber",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub message_number: Option<String>,
+
+    /// Total fragment count for the script block (event 4104 `MessageTotal`).
+    #[serde(
+        rename = "MessageTotal",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub message_total: Option<String>,
+
+    #[serde(rename = "Path", skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+
+    #[serde(rename = "ProcessId", skip_serializing_if = "Option::is_none")]
+    pub process_id: Option<String>,
+
+    #[serde(rename = "Image", skip_serializing_if = "Option::is_none")]
+    pub image: Option<String>,
+
+    #[serde(rename = "User", skip_serializing_if = "Option::is_none")]
+    pub user: Option<String>,
+}
+
+/// PowerShell module logging event fields (Sigma: ps_module)
+///
+/// `ContextInfo` and `Payload` are the two fields the `ps_module` rule family
+/// reads. Both are the provider's own free-form text: `ContextInfo` is a
+/// newline-separated `name = value` block (host application, command name,
+/// user), and `Payload` is the parameter-binding transcript. Windows writes
+/// both in the host's display language, so a rule that matches on the label
+/// rather than the value only fires on an English host.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PowerShellModuleFields {
+    #[serde(rename = "ContextInfo", skip_serializing_if = "Option::is_none")]
+    pub context_info: Option<String>,
+
+    #[serde(rename = "Payload", skip_serializing_if = "Option::is_none")]
+    pub payload: Option<String>,
+
+    #[serde(rename = "ProcessId", skip_serializing_if = "Option::is_none")]
+    pub process_id: Option<String>,
+
+    #[serde(rename = "Image", skip_serializing_if = "Option::is_none")]
+    pub image: Option<String>,
+
+    #[serde(rename = "User", skip_serializing_if = "Option::is_none")]
+    pub user: Option<String>,
+}
+
+/// Classic Windows PowerShell engine-start fields (Sigma: ps_classic_start).
+///
+/// Event 400 stores the complete engine and host description in its third
+/// unnamed EventData value. Sigma rules call that raw value `Data`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PowerShellClassicStartFields {
+    #[serde(rename = "Data", skip_serializing_if = "Option::is_none")]
+    pub data: Option<String>,
+}
+
+/// WMI trace and Operational event fields.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct WmiEventFields {
+    #[serde(rename = "Operation", skip_serializing_if = "Option::is_none")]
+    pub operation: Option<String>,
+
+    #[serde(rename = "User", skip_serializing_if = "Option::is_none")]
+    pub user: Option<String>,
+
+    #[serde(rename = "Query", skip_serializing_if = "Option::is_none")]
+    pub query: Option<String>,
+
+    #[serde(rename = "ProcessId", skip_serializing_if = "Option::is_none")]
+    pub process_id: Option<String>,
+
+    #[serde(rename = "Image", skip_serializing_if = "Option::is_none")]
+    pub image: Option<String>,
+
+    #[serde(rename = "EventNamespace", skip_serializing_if = "Option::is_none")]
+    pub event_namespace: Option<String>,
+
+    #[serde(rename = "EventType", skip_serializing_if = "Option::is_none")]
+    pub event_type: Option<String>,
+
+    #[serde(
+        rename = "DestinationHostname",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub destination_hostname: Option<String>,
+
+    #[serde(rename = "ConsumerClass", skip_serializing_if = "Option::is_none")]
+    pub consumer_class: Option<String>,
+
+    #[serde(rename = "ConsumerName", skip_serializing_if = "Option::is_none")]
+    pub consumer_name: Option<String>,
+
+    #[serde(rename = "ConsumerText", skip_serializing_if = "Option::is_none")]
+    pub consumer_text: Option<String>,
+
+    #[serde(rename = "Destination", skip_serializing_if = "Option::is_none")]
+    pub destination: Option<String>,
+
+    #[serde(rename = "FilterName", skip_serializing_if = "Option::is_none")]
+    pub filter_name: Option<String>,
+
+    #[serde(rename = "PossibleCause", skip_serializing_if = "Option::is_none")]
+    pub possible_cause: Option<String>,
+
+    #[serde(rename = "ProviderName", skip_serializing_if = "Option::is_none")]
+    pub provider_name: Option<String>,
+
+    #[serde(rename = "ProviderPath", skip_serializing_if = "Option::is_none")]
+    pub provider_path: Option<String>,
+
+    #[serde(rename = "HostProcess", skip_serializing_if = "Option::is_none")]
+    pub host_process: Option<String>,
+
+    #[serde(rename = "Component", skip_serializing_if = "Option::is_none")]
+    pub component: Option<String>,
+
+    #[serde(rename = "ResultCode", skip_serializing_if = "Option::is_none")]
+    pub result_code: Option<String>,
+}
+
+/// Service creation event fields
+/// Maps to Windows Event ID 7045 (A service was installed)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ServiceCreationFields {
+    /// Windows Event Log provider that wrote the record, as Sigma names it.
+    ///
+    /// This is the `<Provider Name=..>` of the originating record
+    /// (`Service Control Manager` for 7045), not
+    /// [`NormalizedEvent::provider`](crate::models::NormalizedEvent), which
+    /// names the Rustinel sensor that collected it (`windows_event_log`).
+    /// Most `service: system` rules select on `Provider_Name` alongside
+    /// `EventID`, so they cannot fire without it.
+    #[serde(rename = "Provider_Name", skip_serializing_if = "Option::is_none")]
+    pub provider_name: Option<String>,
+
+    #[serde(rename = "ServiceName", skip_serializing_if = "Option::is_none")]
+    pub service_name: Option<String>,
+
+    #[serde(rename = "ServiceFileName", skip_serializing_if = "Option::is_none")]
+    pub service_file_name: Option<String>,
+
+    #[serde(rename = "ServiceType", skip_serializing_if = "Option::is_none")]
+    pub service_type: Option<String>,
+
+    #[serde(rename = "StartType", skip_serializing_if = "Option::is_none")]
+    pub start_type: Option<String>,
+
+    #[serde(rename = "AccountName", skip_serializing_if = "Option::is_none")]
+    pub account_name: Option<String>,
+
+    #[serde(rename = "User", skip_serializing_if = "Option::is_none")]
+    pub user: Option<String>,
+
+    #[serde(rename = "ProcessId", skip_serializing_if = "Option::is_none")]
+    pub process_id: Option<String>,
+
+    #[serde(rename = "Image", skip_serializing_if = "Option::is_none")]
+    pub image: Option<String>,
+}
+
+/// Task scheduler event fields
+/// Maps to Windows Event ID 106 (Task Registered)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TaskCreationFields {
+    #[serde(rename = "TaskName", skip_serializing_if = "Option::is_none")]
+    pub task_name: Option<String>,
+
+    #[serde(rename = "TaskContent", skip_serializing_if = "Option::is_none")]
+    pub task_content: Option<String>,
+
+    #[serde(rename = "UserName", skip_serializing_if = "Option::is_none")]
+    pub user_name: Option<String>,
+
+    #[serde(rename = "User", skip_serializing_if = "Option::is_none")]
+    pub user: Option<String>,
+
+    #[serde(rename = "ProcessId", skip_serializing_if = "Option::is_none")]
+    pub process_id: Option<String>,
+
+    #[serde(rename = "Image", skip_serializing_if = "Option::is_none")]
+    pub image: Option<String>,
+}
+
+/// Named Windows Event Log fields for Security and Defender Operational.
+///
+/// Every other category is a single event shape, so a struct of named options
+/// models it exactly. The Security channel is not: one logsource carries event
+/// families whose field sets barely overlap — a logon (4624), a handle request
+/// (4656), a share access (5145) and a directory service change (5136) share
+/// only the `Subject*` identity block — and each family the collector grows
+/// brings its own. Keeping the record as the event's own field names avoids a
+/// union struct that would be `None` in almost every slot on every event.
+///
+/// The names and the values are Windows' own, exactly as the channel renders
+/// them, because that is what Sigma rules for this logsource are written
+/// against: `SubjectLogonId` matches `0x3e4`, not `996`, and `AccessList`
+/// matches the raw `%%4417` access-right codes.
+///
+/// The set is not open-ended. The event log decoders use the field availability
+/// table as an allowlist for each supported event ID.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct SecurityAuditFields {
+    pub fields: BTreeMap<String, String>,
+}
+
+/// Allowlisted properties from one Windows Application channel record.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct ApplicationEventFields {
+    pub fields: BTreeMap<String, String>,
+}
+
+impl ApplicationEventFields {
+    pub fn get(&self, name: &str) -> Option<&str> {
+        self.fields.get(name).map(String::as_str)
+    }
+
+    pub fn insert(&mut self, name: &str, value: &str) {
+        if !value.is_empty() {
+            self.fields.insert(name.to_string(), value.to_string());
+        }
+    }
+}
+
+impl SecurityAuditFields {
+    /// Read a decoded field by its Windows name, preserving its native value.
+    ///
+    /// In particular, Windows uses `-` when a field does not apply. Sigma
+    /// rules can match that placeholder explicitly, so it must remain distinct
+    /// from an absent field in the detection view.
+    pub fn get(&self, name: &str) -> Option<&str> {
+        self.fields.get(name).map(String::as_str)
+    }
+
+    /// Read a field only when it contains a value suitable for enrichment.
+    ///
+    /// Native placeholders remain available through [`Self::get`] for Sigma,
+    /// but must not become values such as ECS `source.ip` or
+    /// `process.executable`.
+    pub fn get_non_placeholder(&self, name: &str) -> Option<&str> {
+        self.get(name).filter(|value| *value != "-")
+    }
+
+    /// Record a decoded field, ignoring empty values.
+    ///
+    /// A literal `-` is not empty: it is Windows' explicit placeholder for a
+    /// property that does not apply, and Sigma rules rely on being able to
+    /// distinguish it from a missing field.
+    pub fn insert(&mut self, name: &str, value: &str) {
+        if value.is_empty() {
+            return;
+        }
+        self.fields.insert(name.to_string(), value.to_string());
+    }
+
+    /// The process this event is attributed to, if it carries one.
+    ///
+    /// The Security channel renders process IDs in hex (`0x4d8`), unlike every
+    /// other field in the model that holds a decimal PID string. The raw
+    /// rendering stays in [`Self::fields`] for rules to match; this is the
+    /// parse the pipeline itself needs for process-cache lookups.
+    ///
+    /// The Windows Filtering Platform connection templates spell the field
+    /// `ProcessID`, and in decimal.
+    pub fn process_id(&self) -> Option<u32> {
+        parse_windows_process_id(self.get("ProcessId").or_else(|| self.get("ProcessID"))?)
+    }
+}
+
+/// Parse a process ID as the Windows Security channel renders it.
+///
+/// Accepts the hex form the channel emits and a plain decimal, so a value that
+/// arrives already normalized is not rejected.
+pub fn parse_windows_process_id(value: &str) -> Option<u32> {
+    let value = value.trim();
+    match value
+        .strip_prefix("0x")
+        .or_else(|| value.strip_prefix("0X"))
+    {
+        Some(hex) => u32::from_str_radix(hex, 16).ok(),
+        None => value.parse::<u32>().ok(),
+    }
+}
+
+#[cfg(test)]
+mod powershell_fragment_tests {
+    use super::*;
+
+    #[test]
+    fn fragment_metadata_round_trips_and_old_captures_still_load() {
+        let fragment = PowerShellScriptFields {
+            script_block_text: Some("part two".into()),
+            script_block_id: Some("block".into()),
+            message_number: Some("2".into()),
+            message_total: Some("3".into()),
+            path: None,
+            process_id: None,
+            image: None,
+            user: None,
+        };
+        let json = serde_json::to_string(&fragment).unwrap();
+        assert!(json.contains(r#""MessageNumber":"2""#));
+        assert!(json.contains(r#""MessageTotal":"3""#));
+        let back: PowerShellScriptFields = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.message_number.as_deref(), Some("2"));
+        assert_eq!(back.message_total.as_deref(), Some("3"));
+
+        let old: PowerShellScriptFields =
+            serde_json::from_str(r#"{"ScriptBlockText":"x","ScriptBlockId":"b"}"#).unwrap();
+        assert!(old.message_number.is_none() && old.message_total.is_none());
+    }
+}

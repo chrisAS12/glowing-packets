@@ -1,0 +1,75 @@
+name: SigmaHQ Compatibility
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'src/engine/**'
+      - 'src/sensor/mod.rs'
+      - 'tests/sigma_corpus_compatibility.rs'
+      - 'compatibility/sigmahq-baseline.json'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - '.github/workflows/sigma-compatibility.yml'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'src/engine/**'
+      - 'src/sensor/mod.rs'
+      - 'tests/sigma_corpus_compatibility.rs'
+      - 'compatibility/sigmahq-baseline.json'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - '.github/workflows/sigma-compatibility.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  SIGMAHQ_COMMIT: c04ad420b46c0fb4dba3ce55ce52d0e4f570cc86
+
+jobs:
+  corpus:
+    name: Pinned corpus
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          repository: SigmaHQ/sigma
+          ref: ${{ env.SIGMAHQ_COMMIT }}
+          path: sigmahq
+          persist-credentials: false
+      - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2.0.0
+        with:
+          cache: false
+          rustflags: ""
+      - name: Keep only the pinned toolchain
+        shell: bash
+        run: |
+          pin="$(sed -n 's/^channel = "\(.*\)"/\1/p' rust-toolchain.toml)"
+          rustup toolchain list --quiet | tr -d '\r' | { grep -v "^${pin}-" || true; } |
+            xargs -r -n1 rustup toolchain uninstall
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Check pinned SigmaHQ compatibility
+        env:
+          RUSTINEL_EBPF_STUB: "1"
+          RUSTINEL_SIGMA_CORPUS_DIR: ${{ github.workspace }}/sigmahq
+          RUSTINEL_SIGMA_COMPAT_OUTPUT: ${{ github.workspace }}/artifacts/sigma-compatibility.json
+        run: cargo test --locked --test sigma_corpus_compatibility -- --include-ignored
+      - name: Upload compatibility summary
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: sigmahq-compatibility
+          path: artifacts/sigma-compatibility.json
+          if-no-files-found: warn

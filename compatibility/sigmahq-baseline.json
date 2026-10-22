@@ -1,0 +1,76 @@
+{
+  "schema_version": 1,
+  "corpus": {
+    "repository": "https://github.com/SigmaHQ/sigma",
+    "commit": "c04ad420b46c0fb4dba3ce55ce52d0e4f570cc86",
+    "roots": [
+      "rules",
+      "rules-compliance",
+      "rules-emerging-threats",
+      "rules-placeholder",
+      "rules-threat-hunting"
+    ]
+  },
+  "platforms": {
+    "linux": {
+      "rule_files_found": 3793,
+      "verdicts": {
+        "failed": {
+          "rule_file": 0
+        },
+        "loaded": {
+          "active_collector": 232,
+          "inactive_collector": 0
+        },
+        "skipped": {
+          "deferred_logsource": 27,
+          "product_mismatch": 3376,
+          "unknown_logsource": 158
+        },
+        "unsupported": {
+          "unresolved_reference": 0
+        }
+      }
+    },
+    "macos": {
+      "rule_files_found": 3793,
+      "verdicts": {
+        "failed": {
+          "rule_file": 0
+        },
+        "loaded": {
+          "active_collector": 86,
+          "inactive_collector": 0
+        },
+        "skipped": {
+          "deferred_logsource": 0,
+          "product_mismatch": 3549,
+          "unknown_logsource": 158
+        },
+        "unsupported": {
+          "unresolved_reference": 0
+        }
+      }
+    },
+    "windows": {
+      "rule_files_found": 3793,
+      "verdicts": {
+        "failed": {
+          "rule_file": 0
+        },
+        "loaded": {
+          "active_collector": 2738,
+          "inactive_collector": 0
+        },
+        "skipped": {
+          "deferred_logsource": 0,
+          "product_mismatch": 739,
+          "unknown_logsource": 316
+        },
+        "unsupported": {
+          "unresolved_reference": 0
+        }
+      }
+    }
+  }
+}

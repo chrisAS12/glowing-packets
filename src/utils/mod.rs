@@ -1,0 +1,46 @@
+//! Utility modules for Rustinel
+//!
+//! Path handling, process and user lookup, PE parsing, caching, and
+//! filesystem helpers shared across the sensor, engine, and runtime layers.
+
+pub(crate) mod authenticode;
+pub(crate) mod cache;
+pub(crate) mod file_identity;
+pub mod fs;
+#[cfg(windows)]
+pub(crate) mod imphash;
+pub mod log_rate_limiter;
+pub mod path;
+pub(crate) mod path_allowlist;
+#[cfg(windows)]
+pub mod pe;
+pub mod process;
+pub mod rule_dirs;
+#[cfg(test)]
+pub(crate) mod test_skip;
+pub mod time;
+pub mod trust;
+pub mod user;
+
+pub use log_rate_limiter::LogRateLimiter;
+pub use path::{convert_nt_to_dos, normalize_path_for_comparison};
+#[cfg(windows)]
+pub use pe::parse_metadata;
+#[cfg(target_os = "macos")]
+pub use process::process_image_path;
+#[cfg(target_os = "linux")]
+pub use process::query_process_details;
+pub use process::{
+    hash_command_line, query_process_command_line, query_process_identity,
+    validate_process_identity, ProcessIdentity,
+};
+#[cfg(windows)]
+pub use process::{
+    query_live_process_at_start, query_process_command_line_at_start,
+    query_process_command_line_from_handle,
+};
+pub use time::now_timestamp_string;
+#[cfg(windows)]
+pub use user::lookup_account_sid;
+#[cfg(unix)]
+pub use user::lookup_username_by_uid;

@@ -1,0 +1,187 @@
+# Rustinel Configuration File
+# This file is optional - the agent will use defaults if not present
+
+# 1. Feature Toggles & Rules
+[scanner]
+sigma_enabled = true
+sigma_rules_path = "rules/sigma"
+sigma_match_mode = "best"      # "all" emits one alert per matching Sigma rule
+yara_enabled = true
+yara_rules_path = "rules/yara"
+
+[reload]
+enabled = true
+debounce_ms = 2000          # debounces real-time filesystem events; fallback polling is 60s
+
+# Shared allowlist applied to:
+# - response.allowlist_paths
+# - ioc.hash_allowlist_paths
+# - scanner.yara_allowlist_paths
+#
+# Platform defaults are compiled in - only set this to override them.
+#
+# Windows defaults:
+#   C:\Windows\System32\, C:\Windows\SysWOW64\, C:\Windows\WinSxS\,
+#   C:\Program Files\, C:\Program Files (x86)\
+# Windows exclusions include C:\Windows\Temp\, Tasks\, Tracing\,
+# System32\Tasks\, and System32\spool\drivers\color\.
+# Linux defaults:
+#   /usr/bin/, /usr/sbin/, /usr/lib/, /usr/lib64/, /usr/libexec/,
+#   /bin/, /sbin/, /lib/, /lib64/
+#
+# [allowlist]
+# paths = [
+#   "/usr/bin/",
+#   "/usr/sbin/",
+#   "/custom/trusted/path/",
+# ]
+# excluded_paths = ["/custom/untrusted/path/"]
+
+# 2. Operational Logging (The Agent's internal health)
+#    Writes to: {directory}/{filename}.<date>
+[logging]
+level = "info"              # trace, debug, info, warn, error
+# Optional target-aware filter (takes precedence over level when set)
+# Interactive commands use a compact console view at info; the operational
+# file keeps the configured detail. Use --log-level debug for console details.
+# Path-resolution drops are counted by the sensors; detailed notices are
+# debug-level and hidden by the default info level.
+# filter = "info,engine=info,scanner=info,ioc=info,rustinel::normalizer=info"
+directory = "logs"
+filename = "rustinel.log"
+console_output = false      # Default outside interactive `run`; use `run --no-console` to suppress console logs
+
+# 3. Security Alerts (The Detection Output)
+#    Writes to: {directory}/{filename}.<date>
+[alerts]
+directory = "logs"
+filename = "alerts.json"    # Will contain newline-delimited JSON (NDJSON)
+match_debug = "off"         # off | summary | full (attach match details to alerts.json)
+
+# Optional: also POST every alert (the same ECS JSON object) to HTTP endpoints.
+# Repeat the table for more destinations. The alert file is unaffected by
+# delivery failures. Header values and secret are credentials: never logged.
+# [[alerts.webhook]]
+# url = "https://collector.example/rustinel"
+# headers = { Authorization = "Bearer <token>" }
+# secret = "<shared secret>"   # adds an X-Rustinel-Signature HMAC-SHA256 header
+
+# 3a. Alert Deduplication
+#   Collapses repeated identical alerts within a fixed window anchored to the
+#   first occurrence into a single rollup alert carrying event.count.  The first
+#   occurrence always emits immediately - there is no detection latency penalty.
+#
+#   event.count on the rollup is the number of *suppressed* repeats (the first
+#   occurrence is already its own line, which carries no event.count).  Summing
+#   event.count across lines - absent meaning 1 - gives the true event volume.
+#
+#   Disable for high-fidelity environments where every individual event matters.
+[dedup]
+enabled = true
+window_secs = 60    # window length; repeats within this period are aggregated
+max_entries = 10000 # memory cap on distinct alert keys tracked simultaneously
+
+# 4. Active Response (Optional Prevention)
+[response]
+enabled = false
+prevention_enabled = false
+min_severity = "critical"   # sigma: critical only; yara always treated as critical
+channel_capacity = 128
+# Processes that will never be terminated, matched by image basename or full path.
+# Complement the compiled-in path allowlist above for named system processes.
+#
+# Windows examples: smss.exe, csrss.exe, wininit.exe, lsass.exe, svchost.exe
+# Linux examples:  systemd, systemd-journald, sshd, dbus-daemon, auditd
+#
+# allowlist_images = []
+
+# 5. Process Metadata Cache
+[process]
+max_entries = 65536 # maximum process records retained when exit events are missed
+
+# 6. Behavioral Recording (rustinel capture)
+#   Recordings hold normalized events - command lines, file paths, destinations,
+#   and user names - so treat them like alert output: they are written
+#   owner-only and kept apart from alert and operational logs.
+[capture]
+directory = "captures"      # default parent for rustinel-capture-<UTC timestamp>.ndjson
+
+# 6a. Pipeline Telemetry Counters
+#   Every channel between a sensor and the detectors is bounded and sheds load
+#   rather than blocking, so a burst produces a detection gap instead of a
+#   slowdown. The counters below make that gap measurable: `rustinel doctor`
+#   reads the snapshot and reports how many events were dropped, per channel.
+#
+#   The counters and their rate-limited warnings are always on. This section
+#   only controls whether they are written to {logging.directory}/telemetry.json
+#   for another process to read.
+[telemetry]
+enabled = true
+snapshot_interval_secs = 30 # a snapshot is also written at shutdown
+loss_alert_interval_secs = 60 # one alert per lost-event stage and category per window; 0 disables
+
+# 6c. Agent Heartbeat
+#   One NDJSON line per snapshot interval in {logging.directory}/heartbeat.json.<date>,
+#   so a SIEM can alert on a host that went quiet. Always on, at the
+#   telemetry.snapshot_interval_secs interval; ship heartbeat.json.* with the alerts.
+[heartbeat]
+webhooks = false # also send each heartbeat to the alert webhooks
+
+# 6b. Windows ETW Delivery
+#   ETW's native flush timer has a one-second minimum. Rustinel requests an
+#   earlier handoff for partially filled buffers so isolated events reach the
+#   detector promptly. Set to 0 to use only ETW's native timer.
+#
+#   Rustinel runs two ETW sessions and they are tuned separately.
+#
+#   `etw_flush_interval_ms` is the main session (file, registry, network, DNS,
+#   PowerShell, WMI, tasks). It trades alert latency against one periodic
+#   syscall; 0 is a reasonable choice. Values below 20 are clamped to 20. Its
+#   forced flush pauses when the shared sensor queue is at least half full.
+#
+#   `etw_process_flush_interval_ms` is the Kernel-Process session, and it is
+#   NOT a latency preference. `CommandLine` is not carried by any ETW process
+#   event - it is read back out of the live process, so the event has to reach
+#   Rustinel before the process exits. Measured over 2,000 `cmd /c echo` runs:
+#   5 ms captured 99.9% of their command lines, 20 ms only 61.5%.
+#   This session keeps flushing under queue pressure to preserve that lookup.
+#   SETTING THIS TO 0 GIVES UP ~83% OF SHORT-LIVED COMMAND LINES (measured:
+#   16.6% captured, because the session falls back to ETW's one-second timer),
+#   and with them every Sigma process_creation rule that matches on CommandLine
+#   (78% of them). Raise it only if you have measured that you can afford to.
+#
+#   `security_filtering_platform_connections` adds Security events 5156, 5157,
+#   and 5152: one record per allowed connection, blocked connection, and
+#   dropped packet. They are off by default because they are the Security
+#   channel's highest-volume events. The host must also audit the Filtering
+#   Platform Connection and Packet Drop subcategories.
+#
+#   `security_long_tail_events` adds Security events 4672 (special privileges
+#   assigned), 5140 (network share accessed), and 4799 (local group membership
+#   enumerated). They are off by default because 4672 and 5140 follow logon
+#   and file-server traffic. The host must also audit the Special Logon,
+#   File Share, and Security Group Management subcategories.
+#
+#   `security_domain_controller_events` adds Security events 4768 and 4769
+#   (Kerberos ticket requests), 4662 (directory object operation), 4742
+#   (computer account changed), 4661 (SAM or directory handle), 4673
+#   (privileged service called), 5137 and 5141 (directory object created,
+#   deleted). A domain controller writes them at the rate of its Kerberos and
+#   directory traffic, so they are off by default. The host must also audit
+#   the Kerberos, Directory Service Access, and related subcategories.
+[windows]
+etw_flush_interval_ms = 20
+etw_process_flush_interval_ms = 5
+security_filtering_platform_connections = false
+security_long_tail_events = false
+security_domain_controller_events = false
+
+# 7. Atomic IOC Detection (Hashes, IPs, Domains, Path Regex)
+[ioc]
+enabled = true
+hashes_path = "rules/ioc/hashes.txt"
+ips_path = "rules/ioc/ips.txt"
+domains_path = "rules/ioc/domains.txt"
+paths_regex_path = "rules/ioc/paths_regex.txt"
+default_severity = "high"
+max_file_size_mb = 50

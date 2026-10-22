@@ -1,0 +1,385 @@
+# Alert and recording format
+
+| Output | Default location | Written by |
+| --- | --- | --- |
+| Alerts (ECS NDJSON) | `logs/alerts.json.<date>` | `run` |
+| Alerts (HTTP POST) | each configured [webhook](#webhooks) | `run` |
+| Operational log | `logs/rustinel.log.<date>` | every command |
+| Recordings | `captures/rustinel-capture-<timestamp>.ndjson` | `capture` |
+| Replay results | console, or `--output` | `replay` |
+
+On Linux and macOS these files are readable by their owner only, unless [integration access](security.md#integration-access) grants a group read access to logs and alerts.
+
+## Alerts
+
+One JSON object per line, following ECS 9.5.0.
+
+```json
+{
+  "@timestamp": "2026-08-16T21:00:05Z",
+  "ecs.version": "9.5.0",
+  "event.kind": "alert",
+  "event.category": ["process"],
+  "event.type": ["start"],
+  "event.action": "process-start",
+  "event.code": "1",
+  "event.module": "edr",
+  "event.dataset": "edr.process",
+  "event.provider": "ebpf",
+  "rule.name": "Example - Whoami Execution (Linux)",
+  "rule.id": "sigma::d3b073c6-e265-4f40-a1c1-42e8f17a9c67",
+  "edr.rule.severity": "Low",
+  "edr.rule.engine": "Sigma",
+  "host.id": "9f2c7a41b3d84e6a8c0d5e1f7b2a4c93",
+  "host.name": "lab-01",
+  "host.os.type": "linux",
+  "agent.id": "6f1c2f4e-7a58-4b52-9f55-0d1c7e3a9b10",
+  "agent.type": "rustinel",
+  "agent.version": "1.10.0",
+  "process.executable": "/usr/bin/whoami",
+  "process.name": "whoami",
+  "user.name": "root"
+}
+```
+
+### Common fields
+
+| Field | Value |
+| --- | --- |
+| `@timestamp` | Event time, UTC |
+| `event.kind` | Always `alert` |
+| `event.code` | Sysmon-style or native event ID |
+| `event.dataset` | `edr.<family>`, see below |
+| `event.provider` | The originating Rustinel sensor: `etw`, `windows_event_log`, `ebpf`, `esf`, or `bpf` |
+| `event.sequence` | Native sequence number, when the source has one |
+| `event.count` | Rollup alerts only: repeats suppressed by [deduplication](detection.md#deduplication) |
+| `rule.name` | Rule title |
+| `rule.id` | `sigma::<id>`, `yara::<id>`, or `ioc::<type>::<value>` |
+| `edr.rule.severity` | `Informational`, `Low`, `Medium`, `High`, or `Critical` |
+| `edr.rule.engine` | `Sigma`, `Yara`, or `Ioc`, or `Agent` for [sensor loss](#sensor-loss-alerts) and [ETW provider tamper](#etw-provider-tamper-alerts) alerts |
+| `edr.yara.scan_source` | YARA alerts only: `file` or `process_memory` |
+| `edr.event.ingest_seq` | Order in which Rustinel processed the event |
+| `edr.event.provenance` | Populated fields with fidelity limitations, see below |
+| `edr.match` | Why the rule matched, when `alerts.match_debug` is on |
+
+Sigma alerts can also carry bounded rule metadata and ECS ATT&CK fields; see [Sigma metadata in alerts](detection.md#sigma-metadata-in-alerts).
+
+### Host and agent identity
+
+Every live alert, rollups included, carries five identity fields, in the file and in every webhook body.
+They are resolved once at startup, never per event.
+A field that cannot be determined reliably is omitted, never invented.
+
+| Field | Meaning |
+| --- | --- |
+| `host.id` | 32 hex characters: a keyed one-way digest of the OS machine identity, so the raw identifier is never exposed. Stable across restarts, upgrades, and Rustinel reinstalls while the OS identity is unchanged. |
+| `host.name` | The hostname, trimmed, lowercased, without a trailing dot. It follows a rename at the next start; `host.id` does not change. |
+| `agent.id` | A random UUID identifying this Rustinel installation. |
+| `agent.type` | Always `rustinel`. |
+| `agent.version` | The running Rustinel version. |
+
+The machine identity comes from `/etc/machine-id` (falling back to `/var/lib/dbus/machine-id`) on Linux, the IOPlatformUUID on macOS, and `HKLM\SOFTWARE\Microsoft\Cryptography\MachineGuid` on Windows.
+An empty, all-zero, or `uninitialized` machine id yields no `host.id`.
+
+`agent.id` is generated on first start and stored in `<agent.directory>/agent-id`, owner-only (`0600`).
+It survives restarts and upgrades.
+Deleting the file, as a clean reinstall does, issues a new `agent.id`.
+If the file cannot be read or created, Rustinel logs a warning and omits `agent.id` rather than emitting one that would change on the next start.
+
+**Cloning and machine images.**
+A cloned VM or disk image copies both identities.
+Clones share `host.id` until the OS regenerates its machine id, and share `agent.id` because the `agent-id` file is copied with the disk.
+Before capturing a golden image, stop Rustinel, delete `agent-id`, and reset the OS machine id (`/etc/machine-id` truncated on Linux, sysprep on Windows).
+Each clone then generates its own `agent.id` on first start.
+
+**Replay.**
+`rustinel replay` runs on whatever machine you analyse on, so replayed alerts carry none of these fields.
+Recordings do not store an identity, so there is no recorded identity to preserve.
+
+### Field provenance
+
+`edr.event.provenance` lists `{ "field": "Image", "fidelity": "derived" }` entries using the recorded field names.
+It is omitted when no populated event field has a known fidelity limitation.
+A missing value stays absent; provenance never supplies a value or turns unknown into `false`.
+
+| Fidelity | Meaning |
+| --- | --- |
+| `derived` | Reconstructed from a process cache, account lookup, filesystem, or `/proc` |
+| `best_effort` | Inferred, for example a connection event inferred from a captured SYN |
+| `truncated` | Incomplete because a capture limit cut the value |
+| `stale` | Retained evidence whose freshness is limited |
+
+A field can have several entries, such as a truncated image copied from the process cache.
+Recordings keep these entries, but Sigma rules cannot match on them.
+
+### ECS version
+
+Rustinel targets ECS 9.5.0, and moves to a newer release only after checking every field it emits against it.
+`host.tags` is not emitted.
+
+### Event families
+
+| Dataset | Events |
+| --- | --- |
+| `edr.process` | Process start and exit |
+| `edr.network` | Network connections |
+| `edr.file` | File activity |
+| `edr.dns` | DNS queries |
+| `edr.registry` | Registry (Windows) |
+| `edr.library` | Image load (Windows) |
+| `edr.scripting` | PowerShell script blocks (Windows) |
+| `edr.powershell_module` | PowerShell module logging (Windows) |
+| `edr.powershell_classic_start` | Classic Windows PowerShell engine starts |
+| `edr.wmi` | WMI activity (Windows) |
+| `edr.service` | Service installs (Windows) |
+| `edr.task` | Scheduled tasks (Windows) |
+| `edr.security` | Security audit events (Windows) |
+| `edr.agent` | Operational alerts about the agent itself: [sensor loss](#sensor-loss-alerts), [ETW provider tamper](#etw-provider-tamper-alerts), and [start and stop](agent-health.md#lifecycle-alerts) |
+
+### Sensor loss alerts
+
+Events can be lost in the kernel before a sensor reads them, in the bounded queue between a sensor and the detectors, or in the queues that feed file enrichment.
+When any of these lost events, Rustinel writes one alert per affected stage and category at the end of each `telemetry.loss_alert_interval_secs` window (60 by default, `0` disables), to the alert file and to every webhook.
+It writes one more at shutdown for any drops since the last window.
+
+| Field | Value |
+| --- | --- |
+| `rule.name` | `agent::loss::<channel>` |
+| `edr.rule.engine` | `Agent`, not a detection engine |
+| `event.dataset` | `edr.agent` |
+| `edr.agent.loss.channel` | The stage that lost events, see the table below |
+| `edr.agent.loss.category` | What was lost there. For `sensor_events` it is the sensor event category, named as in `telemetry.json`, where `windefend_application` is one count for both Windows Event Log sources. For the other stages it is the value in the table below |
+| `edr.agent.loss.dropped` | Events of that category lost inside this window. It is a delta, not a running total, so sum it across alerts to size a gap |
+| `edr.agent.loss.window_secs` | The window the count covers. The shutdown alert reports the configured value but covers at most that long |
+
+| `edr.agent.loss.channel` | `edr.agent.loss.category` | Platform | Meaning |
+| --- | --- | --- | --- |
+| `sensor_events` | Sensor event category | All | The queue between the sensor and the detectors was full. Detections on those events did not run |
+| `etw_session` | `kernel_buffer` | Windows | ETW discarded events because its kernel buffer pool was exhausted, summed over all sessions. The sensor never saw them. A blind sensor |
+| `ebpf_ring` | The eBPF ring, such as `process` or `file` | Linux | The kernel ring was full, so the event was not submitted. A blind sensor |
+| `ebpf_oversized` | The eBPF ring | Linux | The record was larger than the ring reservation. A blind sensor |
+| `ebpf_map_full` | The eBPF ring | Linux | A kernel scratch map was full. A blind sensor |
+| `macos_esf` | `endpoint_security` | macOS | Endpoint Security reported a gap in its sequence numbers. A blind sensor |
+| `macos_bpf` | `network` | macOS | `/dev/bpf` dropped packets before they were read. A blind sensor |
+| `artifact_resolution` | `artifact_enrichment` | All | Base events still reach the rules. Hashes, PE metadata and YARA results for process and loaded-image events are missing |
+| `artifact_written_files` | `written_file_enrichment` | All | Base file events still reach the rules. Hashes and YARA results for written files are missing |
+| `yara_memory_scan` | `memory_scan` | All | Base events still reach the rules. The process was not memory scanned |
+
+Stages that only appear in [`rustinel doctor`](doctor.md) or the log, not as alerts, are listed in [Telemetry loss](telemetry-loss.md#which-loss-raises-an-alert).
+
+Read an alert as: detections that needed events of that category in that window did not all run, and the host may have had matching activity that was never evaluated.
+For the enrichment stages the events themselves were evaluated, and only their file-derived fields are missing.
+The count says how many events were lost, not how many would have matched.
+`edr.rule.severity` is `Medium` and is not tuned per category.
+
+Loss alerts are written directly to the sink, so they bypass [deduplication](detection.md#deduplication) and active response never sees them.
+They use a path that does not touch the sensor queue, so a stalled alert file cannot cause more loss alerts.
+Kernel counters are read from the same sources as `rustinel doctor`, so an alert always matches what `doctor` shows.
+If the alert file's own queue is full, the loss alert is dropped like any other alert and counted in the `alert_writer` entry of [`telemetry.json`](telemetry.md), which is the only record in that case.
+
+### ETW provider tamper alerts
+
+On Windows, an administrator can leave an ETW session running and switch one provider off inside it, for example `logman update trace rustinel-etw-trace --p Microsoft-Windows-Kernel-Registry 0 0 -ets`.
+The session stays alive and that telemetry family goes silent.
+A session that stops entirely already makes the agent exit, so this covers the case nothing else reports.
+
+At startup Rustinel records the level and keywords it enabled for each provider on `rustinel-etw-trace` and `rustinel-etw-process`, and the process flag of `rustinel-etw-classic`.
+Every 30 seconds it asks the kernel what each session has enabled and compares.
+`rustinel-etw-file-rundown` is a one-shot startup snapshot that ends by design, so it is not checked.
+
+| Field | Value |
+| --- | --- |
+| `rule.name` | `agent::tamper::etw_provider_modified` |
+| `edr.rule.engine` | `Agent`, not a detection engine |
+| `edr.rule.severity` | `High` |
+| `event.dataset` | `edr.agent` |
+| `event.action` | What changed: `provider_disabled`, `keywords_changed`, `level_changed`, or `kernel_flags_changed` |
+| `edr.agent.tamper.session` | The trace session the provider belongs to |
+| `edr.agent.tamper.provider` | The provider name |
+| `edr.agent.tamper.provider_guid` | The provider GUID |
+| `edr.agent.tamper.expected` | The level and keywords Rustinel enabled |
+| `edr.agent.tamper.observed` | What the session reports now, or `not enabled` |
+
+One alert is written per change, not per check.
+If the provider is restored and then changed again, the second change alerts again.
+Changing the level or keywords to a different wrong value alerts again.
+The comparison covers enablement, level, and keywords, and for the classic session whether the process provider is still on.
+The kernel does not report event ID filters or the registry value-data request, so a re-enable that restores the original level and keywords without them is not detected.
+Rustinel does not re-enable the provider itself.
+
+Tamper alerts are written directly to the sink like [loss alerts](#sensor-loss-alerts), so they bypass deduplication and active response never sees them.
+The checks and mismatches are counted in the [`etw_provider_watch`](telemetry.md#etw_provider_watch) entry of `telemetry.json`.
+
+### Heartbeat and lifecycle alerts
+
+The agent writes a [heartbeat file](agent-health.md#heartbeat) and [`agent::lifecycle::*` alerts](agent-health.md#lifecycle-alerts) so a SIEM can tell a stop, a crash, and a silent host apart.
+
+### Platform-specific fields
+
+| Field | Platform | Value |
+| --- | --- | --- |
+| `edr.event_log.provider_name` | Windows | The provider that wrote an Event Log record. Sigma sees it as `Provider_Name` |
+| `edr.powershell.data` | Windows | Raw classic Windows PowerShell event 400 engine-start description. Sigma sees it as `Data` |
+| `edr.security` | Windows | The full decoded Security event, with Windows field names. Identity, address, process, and service values are also copied to ECS fields |
+| `edr.process.windows_metadata` | Windows | Where the command line came from, the raw SID, and the session ID |
+| `edr.process.image_source` | Linux | `execve`: the path as passed to `execve()` |
+| `edr.process.image_truncated` | Linux | `true` when the executable path was cut |
+| `edr.file.path_truncated` | Linux | Which side of a file path was cut |
+| `edr.dns.query_truncated` | Linux | `true` when the DNS message was cut short and the name ends where the capture did |
+| `edr.process.real_user_id`, `edr.process.real_group_id` | Linux | Real credentials |
+| `edr.process.effective_user_id`, `edr.process.effective_group_id` | Linux | Effective credentials. `user.name` resolves the effective UID |
+| `edr.process.cgroup_id` | Linux | Kernel cgroup ID at exec |
+| `edr.process.cgroup_path` | Linux | Cgroup v2 path of `edr.process.cgroup_id`. Present without `container.id` on a host process |
+| `container.id`, `container.runtime` | Linux | Container named by the process cgroup. The runtime is `docker`, `containerd`, `cri-o`, `podman`, or `lxc`, and is absent when the cgroup layout does not name one |
+| `edr.process.mount_namespace`, `edr.process.pid_namespace`, `edr.process.network_namespace` | Linux | Namespace inode numbers |
+| `edr.process.session_id`, `edr.process.controlling_tty` | Linux | Session ID and terminal as `major:minor` |
+| `edr.process.kernel_start_boottime` | Linux | Process start time in nanoseconds since boot |
+
+## Webhooks
+
+Each [`[[alerts.webhook]]`](configuration.md#webhook-destinations) destination receives every alert written to the alert file, as one `POST` per alert.
+The body is the same ECS JSON object as the file line, without the trailing newline.
+The file is written first and does not depend on delivery: a slow, failing, or unreachable endpoint never delays or removes an alert from it.
+
+| Header | Value |
+| --- | --- |
+| `Content-Type` | `application/json` |
+| `User-Agent` | `rustinel/<version>` |
+| `X-Rustinel-Delivery` | ID of this alert, the same on every retry and every destination |
+| `X-Rustinel-Timestamp` | Unix time in seconds, when `secret` is set |
+| `X-Rustinel-Signature` | `sha256=` and the hex HMAC-SHA256 of `<timestamp>.<body>` keyed with `secret`, when `secret` is set |
+
+Configured `headers` are added to every request.
+Configuration syntax errors report the file without source excerpts, and invalid values are omitted from type errors, so diagnostics cannot expose credentials.
+
+### Delivery
+
+- A `2xx` response is a delivery.
+- Connection errors, timeouts, `408`, `425`, `429`, and `5xx` are retried.
+  The delay starts at `retry_initial_ms`, doubles each time up to `retry_max_ms`, and is randomized within its upper half.
+  A `Retry-After` in seconds raises the delay, up to `retry_max_ms`.
+- Any other response, including redirects, is not retried.
+- After `max_attempts` attempts the alert is given up for that destination.
+- Each destination delivers one alert at a time, in order, from its own queue.
+  When the queue is full, new alerts are dropped for that destination only.
+- An alert larger than `max_payload_bytes` is not sent to that destination.
+- At shutdown, queued alerts get 5 seconds to be delivered; the rest are counted as abandoned.
+
+Delivery is at least once: a request that times out after the receiver processed it is sent again.
+Discard repeats with `X-Rustinel-Delivery`.
+
+Every outcome is counted in [`telemetry.json`](telemetry.md#alert_webhooks), and `rustinel doctor` warns under `alert_webhooks` when alerts went undelivered.
+Failures are logged at most once a minute per destination, naming the destination by its `name` and host only.
+The URL path, header values, and `secret` never appear in logs, telemetry, or doctor output.
+
+### Deduplication
+
+Webhooks receive exactly what the file receives.
+With [deduplication](detection.md#deduplication) on, that is the first alert when it fires and, if it repeated, one rollup with `event.count` when the window closes.
+
+### Receiver example
+
+A receiver that checks the signature, in Python with only the standard library:
+
+```python
+import hashlib, hmac, json, time
+from http.server import BaseHTTPRequestHandler, HTTPServer
+
+SECRET = b"change-me"
+
+class Receiver(BaseHTTPRequestHandler):
+    def do_POST(self):
+        body = self.rfile.read(int(self.headers["Content-Length"]))
+        timestamp = self.headers.get("X-Rustinel-Timestamp", "0")
+        expected = "sha256=" + hmac.new(SECRET, f"{timestamp}.".encode() + body, hashlib.sha256).hexdigest()
+        fresh = abs(time.time() - int(timestamp)) < 300
+        if not (fresh and hmac.compare_digest(expected, self.headers.get("X-Rustinel-Signature", ""))):
+            self.send_response(401)
+            self.end_headers()
+            return
+        alert = json.loads(body)
+        print(alert["rule.name"], alert.get("process.executable"))
+        self.send_response(204)
+        self.end_headers()
+
+HTTPServer(("0.0.0.0", 8080), Receiver).serve_forever()
+```
+
+With this configuration:
+
+```toml
+[[alerts.webhook]]
+url = "http://receiver.example:8080/"
+secret = "change-me"
+```
+
+Use `https` for anything but a lab: over `http` the headers and the alert travel in clear text.
+
+## Recordings
+
+`rustinel capture` writes two files:
+
+| File | Content |
+| --- | --- |
+| `<name>.ndjson` | One normalized event per line, in processing order |
+| `<name>.manifest.json` | What the recording contains and whether it is complete |
+
+```json
+{"event_time":"2026-08-16T09:12:44.123456789Z","ingest_seq":42,"platform":"windows","provider":"etw","category":"Process","event_id":1,"opcode":1,"fields":{"Image":"C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe","CommandLine":"powershell.exe -EncodedCommand ...","ProcessId":"6132"}}
+```
+
+Events are recorded before any rule runs, so they carry no alert fields and are not deduplicated.
+
+```json
+{
+  "schema_version": 2,
+  "payload": "rustinel-capture-20260816T091240Z.ndjson",
+  "rustinel_version": "1.6.0",
+  "platform": "windows",
+  "started_at": "2026-08-16T09:12:40Z",
+  "ended_at": "2026-08-16T09:14:02Z",
+  "status": "complete",
+  "events": { "received": 1841, "written": 1841, "lost": 0, "source_lost": 0 },
+  "payload_bytes": 612884,
+  "payload_sha256": "9f2c…"
+}
+```
+
+`status` is `complete` only when capture stopped cleanly with no lost events.
+On Linux and macOS, SIGINT, SIGTERM, and SIGHUP all finalize the recording and its manifest.
+It stays `incomplete` when capture was killed, the writer fell behind (`lost`), or the OS dropped events first (`source_lost`).
+Replay rejects incomplete recordings, and any payload whose checksum does not match.
+Never edit a recording by hand.
+Capture never overwrites: it refuses to start when either file already exists, naming the one in the way, and leaves both untouched.
+
+## Replay results
+
+By default `rustinel replay` prints a summary and one block per alert:
+
+```text
+Replay of /tmp/lab/run-42.ndjson
+  recorded   1841 events on windows at 2026-08-16T09:12:40Z by Rustinel v1.6.0
+  sigma      412 rules for windows from /opt/rustinel/rules/current/sigma
+  ioc        37 inline indicators (IP, domain, and path)
+  skipped    YARA and hash IOC checks; a recording holds events, not file artifacts
+  response   disabled; replay never acts on the host it runs on
+  dedup      disabled; every detector match is reported
+
+[1] Medium Sigma Encoded PowerShell Command
+    rule                 sigma::6f0d5a2c-7b41-4f2e-9d0a-1c8f3ab5e410
+    time                 2026-08-16T09:12:44Z
+    event                Process EventID 1 (windows/etw)
+    Image                C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe
+
+1841 events replayed, 1 alerts (1 sigma, 0 ioc)
+```
+
+With `--output <PATH>`, alerts are written as ECS NDJSON, like live alerts plus an `edr.replay` object:
+
+| Field | Value |
+| --- | --- |
+| `edr.replay.recording` | Recording file name |
+| `edr.replay.platform` | Platform the recording was made on |
+| `edr.replay.recorded_at` | When the recording started |
+
+Replay refuses to write inside the configured alert directory, so replayed alerts never mix with live ones.

@@ -1,0 +1,3032 @@
+//! Linux eBPF sensor — userspace loader and ring-buffer dispatcher.
+//!
+//! [`EbpfSensor`] implements [`Sensor`] for Linux. On `start()` it:
+//!
+//! 1. Loads the eBPF object embedded at compile time (or from the path given
+//!    by `RUSTINEL_EBPF_OBJECT` for development overrides).
+//! 2. Loads and attaches the Linux telemetry eBPF programs.
+//! 3. Takes ownership of the ring-buffer maps.
+//! 4. Spawns a tokio task that polls all ring buffers and converts raw events
+//!    into [`RawEvent`] values for the shared pipeline.
+//!
+//! Requirements: Linux 5.8+ and eBPF privileges; runtime BTF enables task identity.
+
+use std::net::{Ipv4Addr, Ipv6Addr};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+
+use anyhow::{Context, Result};
+use aya::maps::{Array, MapData, PerCpuArray, RingBuf};
+use aya::programs::{FEntry, FExit, KProbe, TracePoint};
+use aya::{Ebpf, EbpfLoader};
+use tokio::io::unix::AsyncFd;
+use tokio::sync::mpsc::Sender;
+use tracing::{debug, error, info, warn};
+
+use super::telemetry::{LinuxEbpfCounters, LinuxEbpfFamily, LinuxEbpfKernelSample};
+use crate::models::{DnsQueryFields, FileEventFields, NetworkConnectionFields};
+use crate::sensor::{
+    Platform, ProcessStartKey, RawEvent, RawLinuxProcess, RawPayload, RawProcessEvent,
+    RawProcessPlatform, RawUserId, Sensor, SensorAction, SensorNormalization,
+};
+
+use super::abi::validate_object_abi;
+use super::events::{
+    bytes_to_string, connect_result_is_connection, parse_event, BootTimeConverter, DnsEvent,
+    FileEvent, FileEventHeader, FileIndexEvent, NetworkEvent, NetworkEventExt, ProcessEvent,
+    ProcessEventExt, DNS_EVENT_QUERY, DNS_EVENT_RESPONSE, DNS_FLAG_TCP, DNS_FLAG_TRUNCATED,
+};
+use super::paths::{resolve_at_path, resolve_indexable_dir_path, truncation_marker, DirFdIndex};
+use super::tracepoint_format::{tracepoint_exists, TracepointLayouts};
+
+/// Sysmon-compatible event IDs emitted for Linux events.
+const EVENT_ID_PROCESS_CREATE: u16 = 1;
+const EVENT_ID_PROCESS_TERMINATE: u16 = 5;
+const EVENT_ID_NETWORK_CONNECT: u16 = 3;
+const EVENT_ID_DNS_QUERY: u16 = 22;
+// File event IDs come from `SensorNormalization::for_file_action`, the shared
+// table in `crate::sensor`, so they cannot drift from the other platforms.
+
+const PROCESS_EVENT_EXEC: u32 = 1;
+const PROCESS_EVENT_EXIT: u32 = 2;
+const PROCESS_EVENT_FORK: u32 = 3;
+
+const FILE_EVENT_CREATE: u32 = 1;
+const FILE_EVENT_DELETE: u32 = 2;
+const FILE_EVENT_RENAME: u32 = 3;
+const FILE_EVENT_CHANGE: u32 = 4;
+/// Not a file event: a directory descriptor being opened. Consumed by the
+/// drain loop to name the `dfd` of later `*at` calls, never forwarded.
+const FILE_EVENT_DIR_OPEN: u32 = 5;
+const FILE_EVENT_INDEX_RESET: u32 = 6;
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct KernelCounterRow {
+    kernel_seen: u64,
+    kernel_submitted: u64,
+    kernel_ring_full: u64,
+    kernel_oversized: u64,
+    kernel_map_full: u64,
+}
+
+// SAFETY: `KernelCounterRow` is repr(C) and made only of fixed-width integers with no padding, so
+// every bit pattern is valid and it can be copied to and from a BPF map as bytes.
+unsafe impl aya::Pod for KernelCounterRow {}
+
+/// Linux eBPF sensor. Implements [`Sensor`]; call `start()` from within a
+/// tokio runtime context.
+/// A loaded eBPF object that records each hook it attaches against the host
+/// it runs for.
+struct LoadedEbpf {
+    bpf: Ebpf,
+    host: Arc<crate::state::HostState>,
+    /// Per-CPU events that keep syscall tracepoints firing on every CPU; see
+    /// [`super::syscall_cpus`]. Dropped with the programs.
+    syscall_cpus: super::syscall_cpus::SyscallCpuEvents,
+}
+
+impl LoadedEbpf {
+    fn counters(&self) -> &LinuxEbpfCounters {
+        &self.host.extension::<super::LinuxHostExtension>().ebpf
+    }
+}
+
+impl std::ops::Deref for LoadedEbpf {
+    type Target = Ebpf;
+
+    fn deref(&self) -> &Ebpf {
+        &self.bpf
+    }
+}
+
+impl std::ops::DerefMut for LoadedEbpf {
+    fn deref_mut(&mut self) -> &mut Ebpf {
+        &mut self.bpf
+    }
+}
+
+pub struct EbpfSensor {
+    host: Arc<crate::state::HostState>,
+    shutdown: Arc<AtomicBool>,
+}
+
+impl EbpfSensor {
+    pub fn with_host_state(host: Arc<crate::state::HostState>) -> Self {
+        Self {
+            host,
+            shutdown: Arc::new(AtomicBool::new(false)),
+        }
+    }
+    /// The sensor's own accounting, or `None` before a successful `start`.
+    pub fn telemetry(&self) -> Option<crate::telemetry::LinuxEbpfSnapshot> {
+        self.host
+            .extension::<super::LinuxHostExtension>()
+            .ebpf
+            .snapshot()
+    }
+    pub fn new() -> Self {
+        Self {
+            host: Arc::new(crate::state::HostState::default()),
+            shutdown: Arc::new(AtomicBool::new(false)),
+        }
+    }
+}
+
+impl Default for EbpfSensor {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Sensor for EbpfSensor {
+    /// Load eBPF programs, attach tracepoints, and spawn the ring-buffer
+    /// polling task. Returns immediately; the task runs in the background.
+    fn start(&self, tx: Sender<RawEvent>) -> Result<()> {
+        // Use the embedded object by default; accept an env-var override so
+        // developers can hot-swap a freshly compiled eBPF binary without
+        // rebuilding the whole userspace crate.
+        let override_bytes: Option<Vec<u8>> = match std::env::var_os(super::EBPF_OBJECT_ENV) {
+            Some(path) => {
+                info!("loading eBPF object from override path {:?}", path);
+                Some(std::fs::read(&path).with_context(|| {
+                    format!("failed to read eBPF override object from {:?}", path)
+                })?)
+            }
+            None => {
+                anyhow::ensure!(
+                    super::EBPF_OBJECT_SOURCE != "stub",
+                    "this build embeds the eBPF stub (RUSTINEL_EBPF_STUB=1), which has no \
+                     programs; rebuild without it or set {}",
+                    super::EBPF_OBJECT_ENV
+                );
+                info!(
+                    source = super::EBPF_OBJECT_SOURCE,
+                    "loading embedded eBPF object"
+                );
+                None
+            }
+        };
+        let bytes: &[u8] = override_bytes.as_deref().unwrap_or(super::EBPF_BYTES);
+
+        validate_object_abi(bytes).context("refusing to load incompatible eBPF object")?;
+        let layouts = TracepointLayouts::probe();
+        let mut loader = EbpfLoader::new();
+        loader
+            .override_global("PROCESS_TRACEPOINT_OFFSETS", &layouts.process, true)
+            .override_global("NETWORK_TRACEPOINT_OFFSETS", &layouts.network, true)
+            .override_global("FILE_TRACEPOINT_OFFSETS", &layouts.file, true)
+            .override_global("DNS_TRACEPOINT_OFFSETS", &layouts.dns, true);
+        let mut bpf = LoadedEbpf {
+            bpf: loader
+                .load(bytes)
+                .context("eBPF object load failed; ensure the kernel is 5.8+")?,
+            host: Arc::clone(&self.host),
+            syscall_cpus: Default::default(),
+        };
+        super::syscall_cpus::raise_open_file_limit();
+
+        let task_plans = super::task_btf::TaskPlans::load();
+        for (diagnostic, reason) in &task_plans.warnings {
+            warn!(%diagnostic, %reason, "kernel process identity field disabled");
+        }
+        let mut offsets =
+            aya::maps::Array::<_, super::events::task_identity_abi::ReadPlan>::try_from(
+                bpf.map_mut("TASK_IDENTITY_OFFSETS")
+                    .context("missing task identity offsets map")?,
+            )?;
+        for (index, plan) in task_plans.plans.iter().enumerate() {
+            offsets.set(index as u32, *plan, 0)?;
+        }
+
+        let file_identity_layout = match super::task_btf::FileIdentityLayout::load() {
+            Ok(layout) => {
+                Array::<_, super::file_identity_abi::FileIdentityOffsets>::try_from(
+                    bpf.map_mut("FILE_IDENTITY_OFFSETS")
+                        .context("missing file identity offsets map")?,
+                )?
+                .set(0, layout.offsets, 0)?;
+                Some(layout)
+            }
+            Err(error) => {
+                let reason = format!("{error:#}");
+                bpf.counters()
+                    .record_hook("file_identity", "runtime_btf", false, Some(&reason));
+                warn!(%reason, "kernel file identity unavailable; file events remain enabled");
+                None
+            }
+        };
+
+        // ── Attach programs ──────────────────────────────────────────────────
+
+        attach_tracepoint(&mut bpf, "handle_exec", "sched", "sched_process_exec")?;
+        attach_tracepoint(&mut bpf, "handle_fork", "sched", "sched_process_fork")?;
+        attach_tracepoint(&mut bpf, "handle_exit", "sched", "sched_process_exit")?;
+        attach_tracepoint(&mut bpf, "handle_file_exec", "sched", "sched_process_exec")?;
+        attach_tracepoint(&mut bpf, "handle_file_exit", "sched", "sched_process_exit")?;
+        // argv is only reachable while `execve` is still running, so it is
+        // snapshotted at syscall entry and joined to the exec event above.
+        attach_tracepoint(&mut bpf, "handle_execve", "syscalls", "sys_enter_execve")?;
+        attach_tracepoint(
+            &mut bpf,
+            "handle_execveat",
+            "syscalls",
+            "sys_enter_execveat",
+        )?;
+        attach_tracepoint(&mut bpf, "handle_clone", "syscalls", "sys_enter_clone")?;
+        attach_optional_tracepoint(&mut bpf, "handle_clone3", "syscalls", "sys_enter_clone3")?;
+        attach_optional_tracepoint(
+            &mut bpf,
+            "handle_process_fork",
+            "syscalls",
+            "sys_enter_fork",
+        )?;
+        attach_optional_tracepoint(
+            &mut bpf,
+            "handle_process_vfork",
+            "syscalls",
+            "sys_enter_vfork",
+        )?;
+        if !attach_socket_tuple(&mut bpf)? {
+            attach_tracepoint(&mut bpf, "handle_connect", "syscalls", "sys_enter_connect")?;
+            attach_tracepoint(
+                &mut bpf,
+                "handle_connect_exit",
+                "syscalls",
+                "sys_exit_connect",
+            )?;
+        }
+        attach_tracepoint(&mut bpf, "handle_openat", "syscalls", "sys_enter_openat")?;
+        attach_optional_tracepoint(&mut bpf, "handle_open", "syscalls", "sys_enter_open")?;
+        attach_optional_tracepoint(&mut bpf, "handle_open_exit", "syscalls", "sys_exit_open")?;
+        attach_optional_tracepoint(&mut bpf, "handle_creat", "syscalls", "sys_enter_creat")?;
+        attach_optional_tracepoint(&mut bpf, "handle_creat_exit", "syscalls", "sys_exit_creat")?;
+        attach_tracepoint(&mut bpf, "handle_openat2", "syscalls", "sys_enter_openat2")?;
+        attach_tracepoint(
+            &mut bpf,
+            "handle_openat2_exit",
+            "syscalls",
+            "sys_exit_openat2",
+        )?;
+        attach_tracepoint(
+            &mut bpf,
+            "handle_openat_exit",
+            "syscalls",
+            "sys_exit_openat",
+        )?;
+        attach_tracepoint(
+            &mut bpf,
+            "handle_unlinkat",
+            "syscalls",
+            "sys_enter_unlinkat",
+        )?;
+        attach_tracepoint(
+            &mut bpf,
+            "handle_unlinkat_exit",
+            "syscalls",
+            "sys_exit_unlinkat",
+        )?;
+        attach_optional_tracepoint(&mut bpf, "handle_unlink", "syscalls", "sys_enter_unlink")?;
+        attach_optional_tracepoint(
+            &mut bpf,
+            "handle_unlink_exit",
+            "syscalls",
+            "sys_exit_unlink",
+        )?;
+        attach_tracepoint(
+            &mut bpf,
+            "handle_renameat",
+            "syscalls",
+            "sys_enter_renameat",
+        )?;
+        attach_tracepoint(
+            &mut bpf,
+            "handle_renameat_exit",
+            "syscalls",
+            "sys_exit_renameat",
+        )?;
+        attach_tracepoint(
+            &mut bpf,
+            "handle_renameat2",
+            "syscalls",
+            "sys_enter_renameat2",
+        )?;
+        attach_tracepoint(
+            &mut bpf,
+            "handle_renameat2_exit",
+            "syscalls",
+            "sys_exit_renameat2",
+        )?;
+        attach_optional_tracepoint(&mut bpf, "handle_rename", "syscalls", "sys_enter_rename")?;
+        attach_optional_tracepoint(
+            &mut bpf,
+            "handle_rename_exit",
+            "syscalls",
+            "sys_exit_rename",
+        )?;
+        attach_optional_tracepoint(&mut bpf, "handle_mkdir", "syscalls", "sys_enter_mkdir")?;
+        attach_optional_tracepoint(&mut bpf, "handle_mkdir_exit", "syscalls", "sys_exit_mkdir")?;
+        attach_tracepoint(&mut bpf, "handle_mkdirat", "syscalls", "sys_enter_mkdirat")?;
+        attach_tracepoint(
+            &mut bpf,
+            "handle_mkdirat_exit",
+            "syscalls",
+            "sys_exit_mkdirat",
+        )?;
+        attach_optional_tracepoint(&mut bpf, "handle_rmdir", "syscalls", "sys_enter_rmdir")?;
+        attach_optional_tracepoint(&mut bpf, "handle_rmdir_exit", "syscalls", "sys_exit_rmdir")?;
+        if let Some(layout) = &file_identity_layout {
+            attach_file_identity(&mut bpf, layout)?;
+        }
+        attach_tracepoint(&mut bpf, "handle_file_close", "syscalls", "sys_enter_close")?;
+        attach_optional_tracepoint(&mut bpf, "handle_file_dup2", "syscalls", "sys_enter_dup2")?;
+        attach_tracepoint(&mut bpf, "handle_file_dup3", "syscalls", "sys_enter_dup3")?;
+        attach_optional_tracepoint(
+            &mut bpf,
+            "handle_file_close_range",
+            "syscalls",
+            "sys_enter_close_range",
+        )?;
+        attach_tracepoint(&mut bpf, "handle_sendto", "syscalls", "sys_enter_sendto")?;
+        attach_tracepoint(&mut bpf, "handle_sendmsg", "syscalls", "sys_enter_sendmsg")?;
+        attach_tracepoint(
+            &mut bpf,
+            "handle_sendmmsg",
+            "syscalls",
+            "sys_enter_sendmmsg",
+        )?;
+        // Connected DNS sockets: `connect` marks the descriptor, after which
+        // `write` and every receive on it are captured. Receives are copied at
+        // exit, so each entry hook is useless without its exit hook.
+        attach_tracepoint(
+            &mut bpf,
+            "handle_dns_connect",
+            "syscalls",
+            "sys_enter_connect",
+        )?;
+        attach_dns_socket_io(&mut bpf);
+        for (entry, exit, syscall) in [
+            (
+                "handle_dns_recvfrom",
+                "handle_dns_recvfrom_exit",
+                "recvfrom",
+            ),
+            ("handle_dns_recvmsg", "handle_dns_recvmsg_exit", "recvmsg"),
+            (
+                "handle_dns_recvmmsg",
+                "handle_dns_recvmmsg_exit",
+                "recvmmsg",
+            ),
+        ] {
+            attach_tracepoint(&mut bpf, exit, "syscalls", &format!("sys_exit_{syscall}"))?;
+            attach_tracepoint(&mut bpf, entry, "syscalls", &format!("sys_enter_{syscall}"))?;
+        }
+
+        for (program, error) in bpf.syscall_cpus.cover_pending() {
+            // The hook stays attached; on an affected kernel it only misses
+            // syscalls made on the uncovered CPUs, so the feature is degraded.
+            let reason = format!("{error:#}");
+            let hook = format!("{program} (per-CPU)");
+            for feature in features_for_program(&program) {
+                bpf.counters()
+                    .record_hook(feature, &hook, false, Some(&reason));
+            }
+            warn!(program, %reason, "eBPF hook may miss syscalls on some CPUs");
+        }
+
+        info!("eBPF tracepoints attached");
+
+        // ── Take ring-buffer maps ────────────────────────────────────────────
+
+        {
+            let host = &self.host;
+            if task_plans.plans[super::events::task_identity_abi::START_BOOTTIME].len != 0 {
+                if let Err(error) = super::inventory::seed(&mut bpf, host) {
+                    warn!(%error, "linux_process_inventory: startup inventory unavailable");
+                }
+            } else {
+                host.record_inventory(crate::state::InventorySnapshot {
+                    error: Some("Kernel process birth time is unavailable".into()),
+                    ..Default::default()
+                });
+            }
+        }
+
+        let process_ring: RingBuf<MapData> = RingBuf::try_from(
+            bpf.take_map("PROCESS_RING")
+                .context("PROCESS_RING map not found in eBPF object")?,
+        )?;
+        let network_ring: RingBuf<MapData> = RingBuf::try_from(
+            bpf.take_map("NETWORK_RING")
+                .context("NETWORK_RING map not found in eBPF object")?,
+        )?;
+        let file_ring: RingBuf<MapData> = RingBuf::try_from(
+            bpf.take_map("FILE_RING")
+                .context("FILE_RING map not found in eBPF object")?,
+        )?;
+        let dns_ring: RingBuf<MapData> = RingBuf::try_from(
+            bpf.take_map("DNS_RING")
+                .context("DNS_RING map not found in eBPF object")?,
+        )?;
+        let kernel_counters: PerCpuArray<MapData, KernelCounterRow> = PerCpuArray::try_from(
+            bpf.take_map("LINUX_EBPF_COUNTERS")
+                .context("LINUX_EBPF_COUNTERS map not found in eBPF object")?,
+        )?;
+        bpf.counters().activate();
+
+        // ── Spawn polling task ───────────────────────────────────────────────
+
+        let shutdown = Arc::clone(&self.shutdown);
+        let host = Arc::clone(&self.host);
+
+        tokio::spawn(async move {
+            // Keep `bpf` alive here — dropping it detaches the programs.
+            let _bpf = bpf;
+
+            if let Err(e) = run_ring_poll(
+                process_ring,
+                network_ring,
+                file_ring,
+                dns_ring,
+                kernel_counters,
+                tx,
+                shutdown,
+                host,
+            )
+            .await
+            {
+                error!("eBPF ring-buffer poller exited with error: {:#}", e);
+            }
+        });
+
+        Ok(())
+    }
+
+    fn shutdown(&self) {
+        self.shutdown.store(true, Ordering::SeqCst);
+    }
+}
+
+// ── Ring-buffer polling ──────────────────────────────────────────────────────
+
+#[allow(clippy::too_many_arguments)]
+async fn run_ring_poll(
+    process_ring: RingBuf<MapData>,
+    network_ring: RingBuf<MapData>,
+    file_ring: RingBuf<MapData>,
+    dns_ring: RingBuf<MapData>,
+    kernel_counters: PerCpuArray<MapData, KernelCounterRow>,
+    tx: Sender<RawEvent>,
+    shutdown: Arc<AtomicBool>,
+    host: Arc<crate::state::HostState>,
+) -> Result<()> {
+    let mut process_fd: AsyncFd<RingBuf<MapData>> = AsyncFd::new(process_ring)?;
+    let mut network_fd: AsyncFd<RingBuf<MapData>> = AsyncFd::new(network_ring)?;
+    let mut file_fd: AsyncFd<RingBuf<MapData>> = AsyncFd::new(file_ring)?;
+    let mut dns_fd: AsyncFd<RingBuf<MapData>> = AsyncFd::new(dns_ring)?;
+    let telemetry = &host.extension::<super::LinuxHostExtension>().ebpf;
+    let mut unresolved_file_events: u64 = 0;
+    let mut counter_tick = tokio::time::interval(std::time::Duration::from_secs(1));
+    counter_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut counter_read_failed = false;
+    let mut time_converter = BootTimeConverter::capture();
+
+    loop {
+        if shutdown.load(Ordering::Relaxed) {
+            let _ = refresh_kernel_counters(&kernel_counters, telemetry);
+            info!("eBPF sensor shutting down");
+            break;
+        }
+
+        tokio::select! {
+            biased;
+
+            _ = counter_tick.tick() => {
+                time_converter.refresh();
+                match refresh_kernel_counters(&kernel_counters, telemetry) {
+                    Ok(()) => counter_read_failed = false,
+                    Err(err) if !counter_read_failed => {
+                        warn!(error = %err, "failed to read Linux eBPF kernel counters");
+                        counter_read_failed = true;
+                    }
+                    Err(_) => {}
+                }
+            }
+
+            Ok(mut guard) = process_fd.readable_mut() => {
+                let rb: &mut RingBuf<MapData> = guard.get_inner_mut();
+                drain_process_ring(rb, &tx, telemetry, time_converter);
+                guard.clear_ready();
+            }
+
+            Ok(mut guard) = network_fd.readable_mut() => {
+                // A DNS answer is submitted before the connection that uses
+                // it, but lives in another ring. Drain DNS first so the answer
+                // reaches the DNS cache before the connection is normalized.
+                drain_dns_ring(dns_fd.get_mut(), &tx, telemetry, time_converter);
+                let rb: &mut RingBuf<MapData> = guard.get_inner_mut();
+                drain_network_ring(rb, &tx, telemetry, time_converter);
+                guard.clear_ready();
+            }
+
+            Ok(mut guard) = file_fd.readable_mut() => {
+                let rb: &mut RingBuf<MapData> = guard.get_inner_mut();
+                let mut dir_fds = host
+                    .extension::<super::LinuxHostExtension>()
+                    .dir_fds
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                drain_file_ring(
+                    rb,
+                    &tx,
+                    telemetry,
+                    &mut dir_fds,
+                    &mut unresolved_file_events,
+                    &host,
+                    time_converter,
+                );
+                guard.clear_ready();
+            }
+
+            Ok(mut guard) = dns_fd.readable_mut() => {
+                let rb: &mut RingBuf<MapData> = guard.get_inner_mut();
+                drain_dns_ring(rb, &tx, telemetry, time_converter);
+                guard.clear_ready();
+            }
+
+            // Wake up periodically to check the shutdown flag even when
+            // the ring buffers are idle.
+            _ = tokio::time::sleep(std::time::Duration::from_millis(200)) => {}
+        }
+    }
+
+    Ok(())
+}
+
+fn refresh_kernel_counters(
+    counters: &PerCpuArray<MapData, KernelCounterRow>,
+    telemetry: &LinuxEbpfCounters,
+) -> Result<()> {
+    for family in LinuxEbpfFamily::ALL {
+        let values = counters
+            .get(&(family.index() as u32), 0)
+            .with_context(|| format!("failed to read {} counter row", family.as_str()))?;
+        let sample = values
+            .iter()
+            .fold(LinuxEbpfKernelSample::default(), |mut total, value| {
+                total.kernel_seen = total.kernel_seen.saturating_add(value.kernel_seen);
+                total.kernel_submitted = total
+                    .kernel_submitted
+                    .saturating_add(value.kernel_submitted);
+                total.kernel_ring_full = total
+                    .kernel_ring_full
+                    .saturating_add(value.kernel_ring_full);
+                total.kernel_oversized = total
+                    .kernel_oversized
+                    .saturating_add(value.kernel_oversized);
+                total.kernel_map_full = total.kernel_map_full.saturating_add(value.kernel_map_full);
+                total
+            });
+        telemetry.set_kernel_sample(family, sample);
+    }
+    Ok(())
+}
+
+// ── Ring-buffer drain helpers ────────────────────────────────────────────────
+
+/// A source of raw ring buffer records.
+///
+/// The drain functions read through this trait so tests can feed them recorded
+/// bytes without a loaded eBPF program.
+trait RingSource {
+    fn next_record(&mut self) -> Option<impl std::ops::Deref<Target = [u8]> + '_>;
+}
+
+impl RingSource for RingBuf<MapData> {
+    fn next_record(&mut self) -> Option<impl std::ops::Deref<Target = [u8]> + '_> {
+        self.next()
+    }
+}
+
+/// Append every record to the file named by `RUSTINEL_EBPF_RECORD`, one JSON
+/// object per line, so a live run can be turned into a test fixture.
+/// Costs one atomic load per record when unset.
+fn record_ring_bytes(ring: &str, bytes: &[u8]) {
+    use std::io::Write;
+    use std::sync::{Mutex, OnceLock};
+    static SINK: OnceLock<Option<Mutex<std::fs::File>>> = OnceLock::new();
+    let sink = SINK.get_or_init(|| {
+        let path = std::env::var_os("RUSTINEL_EBPF_RECORD")?;
+        match std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+        {
+            Ok(file) => Some(Mutex::new(file)),
+            Err(err) => {
+                warn!(error = %err, "cannot open RUSTINEL_EBPF_RECORD file");
+                None
+            }
+        }
+    });
+    if let Some(file) = sink {
+        let line = format!(
+            "{{\"ring\":\"{ring}\",\"hex\":\"{}\"}}\n",
+            hex::encode(bytes)
+        );
+        let _ = file
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .write_all(line.as_bytes());
+    }
+}
+
+fn drain_process_ring(
+    rb: &mut impl RingSource,
+    tx: &Sender<RawEvent>,
+    telemetry: &LinuxEbpfCounters,
+    time_converter: BootTimeConverter,
+) {
+    while let Some(item) = rb.next_record() {
+        telemetry.record_received(LinuxEbpfFamily::Process);
+        let bytes: &[u8] = &item;
+        record_ring_bytes("process", bytes);
+        let Some(ev) = parse_event::<ProcessEvent>(bytes) else {
+            telemetry.record_short_read(LinuxEbpfFamily::Process);
+            debug!("process ring: short read ({} bytes)", bytes.len());
+            continue;
+        };
+        telemetry.record_decoded(LinuxEbpfFamily::Process);
+        if let Some(sensor_event) = build_process_event_with_clock(&ev, time_converter) {
+            telemetry.record_emitted(LinuxEbpfFamily::Process);
+            try_send(tx, sensor_event);
+        } else {
+            telemetry.record_dropped(LinuxEbpfFamily::Process);
+        }
+    }
+}
+
+fn drain_network_ring(
+    rb: &mut impl RingSource,
+    tx: &Sender<RawEvent>,
+    telemetry: &LinuxEbpfCounters,
+    time_converter: BootTimeConverter,
+) {
+    while let Some(item) = rb.next_record() {
+        telemetry.record_received(LinuxEbpfFamily::Network);
+        let bytes: &[u8] = &item;
+        record_ring_bytes("network", bytes);
+        let Some(ev) = parse_event::<NetworkEvent>(bytes) else {
+            telemetry.record_short_read(LinuxEbpfFamily::Network);
+            debug!("network ring: short read ({} bytes)", bytes.len());
+            continue;
+        };
+        telemetry.record_decoded(LinuxEbpfFamily::Network);
+        if let Some(sensor_event) = build_network_event_with_clock(&ev, time_converter) {
+            telemetry.record_emitted(LinuxEbpfFamily::Network);
+            try_send(tx, sensor_event);
+        } else {
+            telemetry.record_dropped(LinuxEbpfFamily::Network);
+        }
+    }
+}
+
+/// Drain the file ring.
+///
+/// `unresolved` counts events dropped because their path could not be rebuilt.
+/// It lives with the poll loop rather than being recomputed per call, so the
+/// size of that blind spot stays visible in the log. See
+/// [`super::paths`] for when resolution fails.
+fn drain_file_ring(
+    rb: &mut impl RingSource,
+    tx: &Sender<RawEvent>,
+    telemetry: &LinuxEbpfCounters,
+    dir_fds: &mut DirFdIndex,
+    unresolved: &mut u64,
+    host: &crate::state::HostState,
+    time_converter: BootTimeConverter,
+) {
+    while let Some(item) = rb.next_record() {
+        telemetry.record_received(LinuxEbpfFamily::File);
+        let bytes: &[u8] = &item;
+        record_ring_bytes("file", bytes);
+        let Some(header) = parse_event::<FileEventHeader>(bytes) else {
+            telemetry.record_short_read(LinuxEbpfFamily::File);
+            debug!("file ring: short read ({} bytes)", bytes.len());
+            continue;
+        };
+        if header.kind == FILE_EVENT_INDEX_RESET {
+            let Some(ev) = parse_event::<FileIndexEvent>(bytes) else {
+                telemetry.record_short_read(LinuxEbpfFamily::File);
+                debug!("file index ring: short read ({} bytes)", bytes.len());
+                continue;
+            };
+            telemetry.record_decoded(LinuxEbpfFamily::File);
+            dir_fds.forget_process(ev.pid);
+            telemetry.record_internal(LinuxEbpfFamily::File);
+            continue;
+        }
+        let Some(ev) = parse_event::<FileEvent>(bytes) else {
+            telemetry.record_short_read(LinuxEbpfFamily::File);
+            debug!("file ring: short read ({} bytes)", bytes.len());
+            continue;
+        };
+        telemetry.record_decoded(LinuxEbpfFamily::File);
+        if ev.kind == FILE_EVENT_DIR_OPEN {
+            if !index_dir_open(&ev, dir_fds) {
+                host.record_attribution_loss();
+            }
+            telemetry.record_internal(LinuxEbpfFamily::File);
+            continue;
+        }
+        let unresolved_before = *unresolved;
+        if let Some(sensor_event) =
+            build_file_event_with_clock(&ev, dir_fds, unresolved, time_converter)
+        {
+            telemetry.record_emitted(LinuxEbpfFamily::File);
+            try_send(tx, sensor_event);
+        } else if *unresolved > unresolved_before {
+            telemetry.record_unresolved_file();
+        } else {
+            telemetry.record_dropped(LinuxEbpfFamily::File);
+        }
+    }
+}
+
+/// Record what a freshly opened directory descriptor points at.
+///
+/// `dfd` holds the descriptor the open produced and `aux_dfd` the one its own
+/// name was relative to, since `openat(dirfd, "sub", O_DIRECTORY)` is ordinary.
+/// A directory whose own path cannot be resolved is skipped rather than indexed
+/// under a guess — the next `*at` call against it then falls back to `/proc`.
+fn index_dir_open(ev: &FileEvent, dir_fds: &mut DirFdIndex) -> bool {
+    let raw = bytes_to_string(&ev.path);
+    if raw.is_empty()
+        || ev.flags & super::events::FILE_FLAG_PATH_TRUNCATED != 0
+        || ev.dfd < 0
+        || ev.dfd_token == 0
+    {
+        return false;
+    }
+    if let Some(path) =
+        resolve_indexable_dir_path(dir_fds, ev.pid, ev.aux_dfd, ev.aux_dfd_token, &raw)
+    {
+        dir_fds.insert(ev.pid, ev.dfd, ev.dfd_token, path);
+        return true;
+    }
+    false
+}
+
+fn drain_dns_ring(
+    rb: &mut impl RingSource,
+    tx: &Sender<RawEvent>,
+    telemetry: &LinuxEbpfCounters,
+    time_converter: BootTimeConverter,
+) {
+    while let Some(item) = rb.next_record() {
+        telemetry.record_received(LinuxEbpfFamily::Dns);
+        let bytes: &[u8] = &item;
+        record_ring_bytes("dns", bytes);
+        let Some(ev) = parse_event::<DnsEvent>(bytes) else {
+            telemetry.record_short_read(LinuxEbpfFamily::Dns);
+            debug!("dns ring: short read ({} bytes)", bytes.len());
+            continue;
+        };
+        telemetry.record_decoded(LinuxEbpfFamily::Dns);
+        if let Some(sensor_event) = build_dns_event_with_clock(&ev, time_converter) {
+            telemetry.record_emitted(LinuxEbpfFamily::Dns);
+            try_send(tx, sensor_event);
+        } else {
+            telemetry.record_dropped(LinuxEbpfFamily::Dns);
+        }
+    }
+}
+
+// ── Event builders ───────────────────────────────────────────────────────────
+
+/// Use only the filename carried by the exec tracepoint in the ring drain.
+/// Any path canonicalization belongs in bounded downstream enrichment.
+fn resolve_exec_image(raw_filename: &str, raw_truncated: bool) -> Option<(String, bool)> {
+    (!raw_filename.is_empty()).then(|| (raw_filename.to_string(), raw_truncated))
+}
+
+fn build_process_event_with_clock(
+    ev: &ProcessEvent,
+    time_converter: BootTimeConverter,
+) -> Option<RawEvent> {
+    match ev.kind {
+        PROCESS_EVENT_EXEC => {
+            let (image, image_truncated) =
+                resolve_exec_image(&bytes_to_string(&ev.image), ev.image_truncated != 0)?;
+
+            let event_time = time_converter.system_time(ev.event_time_ns);
+            Some(RawEvent {
+                process_name: Some(bytes_to_string(&ev.comm)).filter(|name| !name.is_empty()),
+                provenance: {
+                    let mut provenance = crate::models::Provenance::default();
+                    if ev.args_truncated != 0 && ev.kernel_command_line().is_some() {
+                        provenance.mark("CommandLine", crate::models::Fidelity::Truncated);
+                    }
+                    provenance
+                },
+                platform: Platform::Linux,
+                provider: "ebpf",
+                action: SensorAction::Start,
+                normalization: SensorNormalization {
+                    event_id: EVENT_ID_PROCESS_CREATE,
+                    action_code: 1,
+                },
+                pid: Some(ev.pid),
+                timestamp: event_time,
+                source_seq: Some(ev.source_seq),
+                process_start_key: process_start_key(ev.pid, ev.process_start_time),
+                parent_process_start_key: process_start_key(
+                    ev.parent_pid,
+                    ev.parent_process_start_time,
+                ),
+                payload: RawPayload::Process(RawProcessEvent {
+                    process_id: ev.pid,
+                    parent_process_id: (ev.parent_pid != 0).then_some(ev.parent_pid),
+                    // Kept out of the Sigma-facing field view for compatibility;
+                    // the sensor-minted lifetime remains routing metadata above.
+                    process_start_time: None,
+                    image: Some(image),
+                    command_line: ev.kernel_command_line(),
+                    parent_image: None,
+                    parent_command_line: None,
+                    current_directory: None,
+                    integrity_level: None,
+                    logon_id: None,
+                    user: ev.raw_effective_uid().map(RawUserId::Unix),
+                    original_file_name: None,
+                    product: None,
+                    description: None,
+                    company: None,
+                    file_version: None,
+                    target_image: None,
+                    platform: Box::new(RawProcessPlatform::Linux(RawLinuxProcess {
+                        real_user_id: Some(ev.uid),
+                        identity: ev.raw_linux_identity(),
+                        cgroup_id: (ev.cgroup_id != 0).then_some(ev.cgroup_id),
+                        parent_process_id_derived: ev.parent_pid_derived != 0,
+                        argv: ev.kernel_argv(),
+                        exec_syscall: ev.exec_syscall_name(),
+                        image_source: Some("execve".to_string()),
+                        image_truncated: image_truncated.then_some(true),
+                    })),
+                }),
+            })
+        }
+        PROCESS_EVENT_EXIT => Some(RawEvent {
+            process_name: None,
+            provenance: Default::default(),
+            platform: Platform::Linux,
+            provider: "ebpf",
+            action: SensorAction::Stop,
+            normalization: SensorNormalization {
+                event_id: EVENT_ID_PROCESS_TERMINATE,
+                action_code: 2,
+            },
+            pid: Some(ev.pid),
+            timestamp: time_converter.system_time(ev.event_time_ns),
+            source_seq: Some(ev.source_seq),
+            process_start_key: process_start_key(ev.pid, ev.process_start_time),
+            parent_process_start_key: None,
+            payload: RawPayload::Process(RawProcessEvent {
+                process_id: ev.pid,
+                parent_process_id: None,
+                process_start_time: None,
+                image: None,
+                command_line: None,
+                parent_image: None,
+                parent_command_line: None,
+                current_directory: None,
+                integrity_level: None,
+                logon_id: None,
+                user: ev.raw_effective_uid().map(RawUserId::Unix),
+                original_file_name: None,
+                product: None,
+                description: None,
+                company: None,
+                file_version: None,
+                target_image: None,
+                platform: Box::new(RawProcessPlatform::Linux(RawLinuxProcess {
+                    real_user_id: Some(ev.uid),
+                    identity: ev.raw_linux_identity(),
+                    cgroup_id: (ev.cgroup_id != 0).then_some(ev.cgroup_id),
+                    parent_process_id_derived: false,
+                    argv: Vec::new(),
+                    exec_syscall: None,
+                    image_source: None,
+                    image_truncated: None,
+                })),
+            }),
+        }),
+        PROCESS_EVENT_FORK => Some(RawEvent {
+            process_name: None,
+            provenance: Default::default(),
+            platform: Platform::Linux,
+            provider: "ebpf",
+            action: SensorAction::Fork,
+            normalization: SensorNormalization {
+                event_id: 0,
+                action_code: 3,
+            },
+            pid: Some(ev.pid),
+            timestamp: time_converter.system_time(ev.event_time_ns),
+            source_seq: Some(ev.source_seq),
+            process_start_key: process_start_key(ev.pid, ev.process_start_time),
+            parent_process_start_key: process_start_key(
+                ev.parent_pid,
+                ev.parent_process_start_time,
+            ),
+            payload: RawPayload::Process(RawProcessEvent {
+                process_id: ev.pid,
+                parent_process_id: (ev.parent_pid != 0).then_some(ev.parent_pid),
+                process_start_time: None,
+                image: None,
+                command_line: None,
+                parent_image: None,
+                parent_command_line: None,
+                current_directory: None,
+                integrity_level: None,
+                logon_id: None,
+                user: None,
+                original_file_name: None,
+                product: None,
+                description: None,
+                company: None,
+                file_version: None,
+                target_image: None,
+                platform: Box::new(RawProcessPlatform::Linux(RawLinuxProcess {
+                    real_user_id: None,
+                    identity: Default::default(),
+                    cgroup_id: (ev.cgroup_id != 0).then_some(ev.cgroup_id),
+                    parent_process_id_derived: ev.parent_pid_derived != 0,
+                    argv: Vec::new(),
+                    exec_syscall: None,
+                    image_source: None,
+                    image_truncated: None,
+                })),
+            }),
+        }),
+        _ => None,
+    }
+}
+
+fn build_network_event_with_clock(
+    ev: &NetworkEvent,
+    time_converter: BootTimeConverter,
+) -> Option<RawEvent> {
+    // The kernel emits only attempts that connected, so this rejects nothing
+    // in practice. It is the decode-side half of that contract: a refused or
+    // unreachable destination is an attempt, not a connection, and a rule
+    // matching "connection to suspicious IP" must not fire on one.
+    if !connect_result_is_connection(ev.ret) {
+        return None;
+    }
+    if ev.dport == 0 {
+        return None;
+    }
+
+    let destination_ip = match ev.af {
+        2 => {
+            // AF_INET
+            let dst = Ipv4Addr::new(ev.daddr[0], ev.daddr[1], ev.daddr[2], ev.daddr[3]);
+            if dst.is_unspecified() {
+                return None;
+            }
+            dst.to_string()
+        }
+        10 => {
+            // AF_INET6
+            let dst = Ipv6Addr::from(ev.daddr);
+            if dst.is_unspecified() {
+                return None;
+            }
+            dst.to_string()
+        }
+        _ => return None,
+    };
+
+    let user = linux_user_id(ev.uid);
+
+    Some(RawEvent {
+        process_name: None,
+        provenance: Default::default(),
+        platform: Platform::Linux,
+        provider: "ebpf",
+        action: SensorAction::Connect,
+        normalization: SensorNormalization {
+            event_id: EVENT_ID_NETWORK_CONNECT,
+            action_code: 0,
+        },
+        pid: Some(ev.pid),
+        timestamp: time_converter.system_time(ev.event_time_ns),
+        source_seq: Some(ev.source_seq),
+        process_start_key: process_start_key(ev.pid, ev.process_start_time),
+        parent_process_start_key: None,
+        payload: RawPayload::Network(NetworkConnectionFields {
+            destination_ip: Some(destination_ip),
+            source_ip: (ev.tuple_flags & super::socket_tuple_abi::TUPLE_MEASURED != 0).then(|| {
+                if ev.af == 2 {
+                    Ipv4Addr::new(ev.saddr[0], ev.saddr[1], ev.saddr[2], ev.saddr[3]).to_string()
+                } else {
+                    Ipv6Addr::from(ev.saddr).to_string()
+                }
+            }),
+            destination_port: Some(ev.dport.to_string()),
+            source_port: (ev.tuple_flags & super::socket_tuple_abi::TUPLE_MEASURED != 0)
+                .then(|| ev.sport.to_string()),
+            process_id: Some(ev.pid.to_string()),
+            // Enriched by the normalizer from ProcessCache if PID is known.
+            image: None,
+            user,
+            destination_hostname: None,
+            protocol: ev.transport().map(str::to_string),
+            initiated: Some(ev.tuple_flags & super::socket_tuple_abi::INBOUND == 0),
+        }),
+    })
+}
+
+fn build_file_event_with_clock(
+    ev: &FileEvent,
+    dir_fds: &DirFdIndex,
+    unresolved: &mut u64,
+    time_converter: BootTimeConverter,
+) -> Option<RawEvent> {
+    let raw_path = bytes_to_string(&ev.path);
+    if raw_path.is_empty() {
+        return None;
+    }
+
+    let action = match ev.kind {
+        FILE_EVENT_CREATE => SensorAction::Create,
+        FILE_EVENT_DELETE => SensorAction::Delete,
+        FILE_EVENT_RENAME => SensorAction::Rename,
+        FILE_EVENT_CHANGE => SensorAction::Modify,
+        _ => return None,
+    };
+    let normalization = SensorNormalization::for_file_action(action)
+        .expect("file actions are covered by the shared file normalization table");
+
+    // A relative name that cannot be tied back to its directory is worse than
+    // no event: `TargetFilename|endswith: '/passwd'` would fire on any
+    // `openat(dirfd, "passwd")` anywhere on the disk. Dropping is the same
+    // policy the Windows sensor applies to events it cannot name.
+    let Some(target_filename) = resolve_at_path(dir_fds, ev.pid, ev.dfd, ev.dfd_token, &raw_path)
+    else {
+        *unresolved += 1;
+        if *unresolved == 1 || unresolved.is_multiple_of(1000) {
+            debug!(
+                unresolved_file_events = *unresolved,
+                raw_path = %raw_path,
+                "Dropping file event whose path could not be resolved"
+            );
+        }
+        return None;
+    };
+
+    // Rename resolves its two names independently: they carry separate
+    // descriptors and `renameat(olddfd, .., newdfd, ..)` may cross directories.
+    // A source that cannot be resolved is omitted rather than guessed, which
+    // keeps the event's target usable.
+    let source_filename = (ev.kind == FILE_EVENT_RENAME)
+        .then(|| bytes_to_string(&ev.aux_path))
+        .filter(|value| !value.is_empty())
+        .and_then(|value| resolve_at_path(dir_fds, ev.pid, ev.aux_dfd, ev.aux_dfd_token, &value));
+
+    let user = linux_user_id(ev.uid);
+    let path_truncated = truncation_marker(ev.flags, source_filename.is_some()).map(str::to_string);
+
+    Some(RawEvent {
+        process_name: Some(bytes_to_string(&ev.comm)).filter(|name| !name.is_empty()),
+        provenance: {
+            let mut provenance = crate::models::Provenance::default();
+            if !raw_path.starts_with('/') {
+                provenance.mark_derived("TargetFilename");
+            }
+            if source_filename.is_some() && !bytes_to_string(&ev.aux_path).starts_with('/') {
+                provenance.mark_derived("SourceFilename");
+            }
+            provenance
+        },
+        platform: Platform::Linux,
+        provider: "ebpf",
+        action,
+        normalization,
+        pid: Some(ev.pid),
+        timestamp: time_converter.system_time(ev.event_time_ns),
+        source_seq: Some(ev.source_seq),
+        process_start_key: process_start_key(ev.pid, ev.process_start_time),
+        parent_process_start_key: None,
+        payload: RawPayload::File(FileEventFields {
+            source_filename,
+            target_filename: Some(target_filename),
+            process_id: Some(ev.pid.to_string()),
+            // `comm` is a short process name, not an executable path. Leave
+            // Image absent so identity-based normalization can fill it.
+            image: None,
+            creation_utc_time: None,
+            previous_creation_utc_time: None,
+            user,
+            file_identity: crate::utils::file_identity::from_linux_event(ev.device, ev.inode),
+            path_truncated,
+        }),
+    })
+}
+
+/// Decode a raw DNS message into a DNS event.
+///
+/// Queries carry the question; responses also carry the answers and the
+/// response code. `None` when the question does not parse, which also sheds
+/// non-DNS traffic that happened to pass the kernel's header check.
+fn build_dns_event_with_clock(
+    ev: &DnsEvent,
+    time_converter: BootTimeConverter,
+) -> Option<RawEvent> {
+    let payload_len = usize::from(ev.payload_len).min(ev.payload.len());
+    let mut payload = &ev.payload[..payload_len];
+    if ev.flags & DNS_FLAG_TCP != 0 {
+        // DNS over TCP opens with a two-byte length the kernel left in place.
+        payload = payload.get(2..)?;
+    }
+
+    let (query_name, qtype, query_results, query_status) = match ev.kind {
+        DNS_EVENT_QUERY => match crate::sensor::dns::parse_question(payload) {
+            Some((name, qtype)) => (name, Some(qtype), None, None),
+            None => (truncated_name(ev, payload)?, None, None, None),
+        },
+        DNS_EVENT_RESPONSE => match crate::sensor::dns::parse_response(payload) {
+            Some(response) => (
+                response.name,
+                Some(response.qtype),
+                crate::sensor::dns::format_query_results(&response.answers),
+                Some(response.rcode.to_string()),
+            ),
+            None => (truncated_name(ev, payload)?, None, None, None),
+        },
+        _ => return None,
+    };
+    // Only a cut message has no qtype: the question ends before it.
+    let query_truncated = qtype.is_none().then(|| "true".to_string());
+    let record_type =
+        qtype.map(|qtype| crate::sensor::dns::record_type_name(qtype).unwrap_or("OTHER"));
+
+    Some(RawEvent {
+        process_name: None,
+        provenance: Default::default(),
+        platform: Platform::Linux,
+        provider: "ebpf",
+        action: SensorAction::Query,
+        normalization: SensorNormalization {
+            event_id: EVENT_ID_DNS_QUERY,
+            action_code: 0,
+        },
+        pid: Some(ev.pid),
+        timestamp: time_converter.system_time(ev.event_time_ns),
+        source_seq: Some(ev.source_seq),
+        process_start_key: process_start_key(ev.pid, ev.process_start_time),
+        parent_process_start_key: None,
+        payload: RawPayload::Dns(DnsQueryFields {
+            query_truncated,
+            user: None,
+            query_name: Some(query_name),
+            query_results,
+            record_type: record_type.map(str::to_string),
+            query_status,
+            process_id: Some(ev.pid.to_string()),
+            image: None,
+        }),
+    })
+}
+
+/// The name from a message the kernel capped at [`DNS_PAYLOAD_CAPACITY`] bytes,
+/// when the question ran past the cap.
+///
+/// A message that was not cut, or whose cut leaves no plain labels, is not
+/// DNS worth reporting and stays dropped.
+fn truncated_name(ev: &DnsEvent, payload: &[u8]) -> Option<String> {
+    if ev.flags & DNS_FLAG_TRUNCATED == 0 {
+        return None;
+    }
+    crate::sensor::dns::parse_truncated_question(payload)
+}
+
+fn process_start_key(pid: u32, start_time: u64) -> Option<ProcessStartKey> {
+    (start_time != 0).then_some(ProcessStartKey { pid, start_time })
+}
+
+// ── Utilities ────────────────────────────────────────────────────────────────
+
+/// Queue a decoded event, accounting for a drop rather than blocking.
+///
+/// Blocking here would stall the perf-buffer poll loop and lose the events
+/// behind it in the kernel instead, so overflow is shed. The count is what
+/// makes that trade auditable — see [`crate::telemetry`].
+fn try_send(tx: &Sender<RawEvent>, event: RawEvent) {
+    // Both the full and closed cases are already counted; the reason is in the
+    // rate-limited warning the telemetry module emits.
+    let _ = crate::telemetry::try_send_sensor_event(tx, event);
+}
+
+fn linux_user_id(uid: u32) -> Option<String> {
+    (uid != u32::MAX).then(|| uid.to_string())
+}
+
+/// Try the complete tuple tier before enabling the syscall fallback. Failure
+/// detaches every partial attachment so the fallback cannot duplicate events.
+fn attach_socket_tuple(bpf: &mut LoadedEbpf) -> Result<bool> {
+    let mut loaded = Vec::new();
+    let result = (|| -> Result<()> {
+        let layout = super::task_btf::SocketLayout::load()?;
+        let btf = aya::Btf::from_sys_fs()?;
+        aya::maps::Array::<_, super::socket_tuple_abi::SocketOffsets>::try_from(
+            bpf.map_mut("SOCKET_OFFSETS")
+                .context("missing socket offsets map")?,
+        )?
+        .set(0, layout.offsets, 0)?;
+        for (name, target) in [
+            ("handle_stream_connect", "inet_stream_connect"),
+            ("handle_dgram_connect", "inet_dgram_connect"),
+            (layout.accept_program, "inet_csk_accept"),
+        ] {
+            let program: &mut FExit = bpf
+                .program_mut(name)
+                .context("missing socket program")?
+                .try_into()?;
+            program
+                .load(target, &btf)
+                .with_context(|| format!("load {target}"))?;
+            loaded.push(name);
+            program
+                .attach()
+                .with_context(|| format!("attach {target}"))?;
+        }
+        Ok(())
+    })();
+    if let Err(error) = result {
+        for name in loaded {
+            // Unloading closes every link owned by the program.
+            let program: &mut FExit = bpf
+                .program_mut(name)
+                .expect("loaded socket program")
+                .try_into()
+                .expect("socket fexit program");
+            program
+                .unload()
+                .context("cannot roll back socket tier; refusing duplicate capture")?;
+        }
+        let reason = format!("{error:#}");
+        bpf.counters()
+            .record_hook("network_tuple", "socket_fexit", false, Some(&reason));
+        warn!(%reason, "kernel socket tuple unavailable; using connect syscalls");
+        return Ok(false);
+    }
+    for name in loaded {
+        bpf.counters()
+            .record_hook("network_tuple", name, true, None);
+        bpf.counters().record_hook("network", name, true, None);
+    }
+    Ok(true)
+}
+
+/// Attach the `read`/`write` DNS hooks to `ksys_read`/`ksys_write`.
+///
+/// There is deliberately no syscall-tracepoint fallback: those two syscalls
+/// dominate every workload, and the tracepoints cost several times more per
+/// call (see `ebpf/src/dns.rs`). Without kernel BTF the hooks are reported
+/// unavailable and DNS over `read`/`write` is not captured; the socket
+/// syscalls are unaffected.
+fn attach_dns_socket_io(bpf: &mut LoadedEbpf) {
+    let btf = match aya::Btf::from_sys_fs() {
+        Ok(btf) => btf,
+        Err(error) => {
+            let reason = format!("kernel BTF unavailable: {error}");
+            for program in ["handle_dns_write", "handle_dns_read"] {
+                record_unavailable_hook(bpf.counters(), program, &reason);
+            }
+            warn!(%reason, "DNS over read/write is not captured");
+            return;
+        }
+    };
+    let write = (|| -> Result<()> {
+        let program: &mut FEntry = bpf
+            .program_mut("handle_dns_write")
+            .context("missing DNS write program")?
+            .try_into()?;
+        program
+            .load("ksys_write", &btf)
+            .context("load ksys_write")?;
+        program.attach().context("attach ksys_write")?;
+        Ok(())
+    })();
+    let read = (|| -> Result<()> {
+        let program: &mut FExit = bpf
+            .program_mut("handle_dns_read")
+            .context("missing DNS read program")?
+            .try_into()?;
+        program.load("ksys_read", &btf).context("load ksys_read")?;
+        program.attach().context("attach ksys_read")?;
+        Ok(())
+    })();
+    for (program, result) in [("handle_dns_write", write), ("handle_dns_read", read)] {
+        match result {
+            Ok(()) => bpf.counters().record_hook("dns", program, true, None),
+            Err(error) => {
+                let reason = format!("{error:#}");
+                record_unavailable_hook(bpf.counters(), program, &reason);
+                warn!(program, %reason, "eBPF hook failed to attach");
+            }
+        }
+    }
+}
+
+fn attach_optional_tracepoint(
+    bpf: &mut LoadedEbpf,
+    program: &str,
+    category: &str,
+    name: &str,
+) -> Result<()> {
+    attach_tracepoint(bpf, program, category, name)
+}
+
+fn attach_tracepoint(
+    bpf: &mut LoadedEbpf,
+    program: &str,
+    category: &str,
+    name: &str,
+) -> Result<()> {
+    if let Some(reason) = TracepointLayouts::current_unavailable_reason(program) {
+        record_unavailable_hook(bpf.counters(), program, reason);
+        warn!(program, category, name, reason, "eBPF hook is unavailable");
+        return Ok(());
+    }
+    if !tracepoint_exists(category, name) {
+        let reason = format!("tracepoint {category}/{name} is unavailable");
+        record_unavailable_hook(bpf.counters(), program, &reason);
+        warn!(program, category, name, "eBPF hook is unavailable");
+        return Ok(());
+    }
+
+    if let Err(err) = try_attach_tracepoint(bpf, program, category, name) {
+        let reason = format!("{err:#}");
+        record_unavailable_hook(bpf.counters(), program, &reason);
+        warn!(program, category, name, error = %err, "eBPF hook failed to attach");
+        return Ok(());
+    }
+    for feature in features_for_program(program) {
+        bpf.counters().record_hook(feature, program, true, None);
+    }
+    bpf.syscall_cpus.queue(program, category, name);
+    Ok(())
+}
+
+fn try_attach_tracepoint(
+    bpf: &mut LoadedEbpf,
+    program: &str,
+    category: &str,
+    name: &str,
+) -> Result<()> {
+    let prog: &mut TracePoint = bpf
+        .program_mut(program)
+        .with_context(|| format!("program '{}' not found in eBPF object", program))?
+        .try_into()
+        .with_context(|| format!("program '{}' is not a TracePoint", program))?;
+
+    prog.load()
+        .with_context(|| format!("failed to load tracepoint '{}'", program))?;
+
+    prog.attach(category, name)
+        .with_context(|| format!("failed to attach '{}' to {}/{}", program, category, name))?;
+
+    Ok(())
+}
+
+fn attach_kprobe(bpf: &mut LoadedEbpf, program: &str, function: &str) -> Result<()> {
+    if let Err(err) = try_attach_kprobe(bpf, program, function) {
+        let reason = format!("{err:#}");
+        record_unavailable_hook(bpf.counters(), program, &reason);
+        warn!(program, function, error = %err, "eBPF hook failed to attach");
+        return Ok(());
+    }
+    for feature in features_for_program(program) {
+        bpf.counters().record_hook(feature, program, true, None);
+    }
+    Ok(())
+}
+
+fn attach_file_identity(
+    bpf: &mut LoadedEbpf,
+    layout: &super::task_btf::FileIdentityLayout,
+) -> Result<()> {
+    for (program, function) in [
+        (layout.unlink_program, "vfs_unlink"),
+        (layout.rmdir_program, "vfs_rmdir"),
+        (layout.mkdir_program, "vfs_mkdir"),
+        ("handle_vfs_mkdir_identity_exit", "vfs_mkdir"),
+        ("handle_vfs_rename_identity", "vfs_rename"),
+    ] {
+        attach_kprobe(bpf, program, function)?;
+    }
+    bpf.counters()
+        .record_hook("file_identity", "open_fd", true, None);
+    Ok(())
+}
+
+fn try_attach_kprobe(bpf: &mut LoadedEbpf, program: &str, function: &str) -> Result<()> {
+    let prog: &mut KProbe = bpf
+        .program_mut(program)
+        .with_context(|| format!("program '{}' not found in eBPF object", program))?
+        .try_into()
+        .with_context(|| format!("program '{}' is not a KProbe", program))?;
+
+    prog.load()
+        .with_context(|| format!("failed to load kprobe '{}'", program))?;
+
+    prog.attach(function, 0)
+        .with_context(|| format!("failed to attach '{}' to {}", program, function))?;
+
+    Ok(())
+}
+
+fn record_unavailable_hook(counters: &LinuxEbpfCounters, program: &str, reason: &str) {
+    for feature in features_for_program(program) {
+        counters.record_hook(feature, program, false, Some(reason));
+    }
+}
+
+fn features_for_program(program: &str) -> &'static [&'static str] {
+    match program {
+        "handle_exec"
+        | "handle_fork"
+        | "handle_exit"
+        | "handle_execve"
+        | "handle_execveat"
+        | "handle_clone"
+        | "handle_clone3"
+        | "handle_process_fork"
+        | "handle_process_vfork" => &["process"],
+        "handle_connect" | "handle_connect_exit" => &["network"],
+        "handle_sendto"
+        | "handle_sendmsg"
+        | "handle_sendmmsg"
+        | "handle_dns_write"
+        | "handle_dns_connect"
+        | "handle_dns_recvfrom"
+        | "handle_dns_recvfrom_exit"
+        | "handle_dns_recvmsg"
+        | "handle_dns_recvmsg_exit"
+        | "handle_dns_recvmmsg"
+        | "handle_dns_recvmmsg_exit"
+        | "handle_dns_read" => &["dns"],
+        "handle_vfs_unlink_identity1"
+        | "handle_vfs_unlink_identity2"
+        | "handle_vfs_rmdir_identity1"
+        | "handle_vfs_rmdir_identity2"
+        | "handle_vfs_mkdir_identity1"
+        | "handle_vfs_mkdir_identity2"
+        | "handle_vfs_mkdir_identity_exit"
+        | "handle_vfs_rename_identity" => &["file_identity"],
+        _ => &["file"],
+    }
+}
+
+#[cfg(test)]
+fn build_process_event(ev: &ProcessEvent) -> Option<RawEvent> {
+    build_process_event_with_clock(ev, BootTimeConverter::capture())
+}
+
+#[cfg(test)]
+fn build_network_event(ev: &NetworkEvent) -> Option<RawEvent> {
+    build_network_event_with_clock(ev, BootTimeConverter::capture())
+}
+
+#[cfg(test)]
+fn build_file_event(
+    ev: &FileEvent,
+    dir_fds: &DirFdIndex,
+    unresolved: &mut u64,
+) -> Option<RawEvent> {
+    build_file_event_with_clock(ev, dir_fds, unresolved, BootTimeConverter::capture())
+}
+
+pub(crate) fn build_dns_event(ev: &DnsEvent) -> Option<RawEvent> {
+    build_dns_event_with_clock(ev, BootTimeConverter::capture())
+}
+
+#[cfg(test)]
+mod ring_fixture_tests;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::IocConfig;
+    use crate::engine::Engine;
+    use crate::ioc::{IocEngine, IocKind};
+    use crate::models::{CanonicalEvent, EventFields};
+    use crate::normalizer::Normalizer;
+    use crate::sensor::linux::events::{
+        ARGV_CAPACITY, DNS_PAYLOAD_CAPACITY, FILE_FLAG_AUX_PATH_TRUNCATED,
+        FILE_FLAG_PATH_TRUNCATED, FILE_PATH_LEN,
+    };
+    use crate::sensor::linux::paths::AT_FDCWD;
+    use crate::sensor::{RawProcessPlatform, RawUserId};
+    use crate::state::HostState;
+    use std::sync::Arc;
+
+    #[test]
+    fn effective_root_is_distinct_from_real_uid_and_missing_credentials() {
+        use super::super::events::task_identity_abi::*;
+        let mut raw = raw_process_event(PROCESS_EVENT_EXEC, 424242, "/usr/bin/example");
+        raw.identity.values[EUID] = 0;
+        raw.identity.valid = 1 << EUID;
+        let event = build_process_event(&raw).unwrap();
+        let normalizer = Normalizer::new(Arc::new(HostState::default()));
+        let normalized = normalizer.normalize(&event).unwrap();
+        assert_eq!(normalized.get_field("User"), Some("root"));
+        assert_eq!(normalized.get_field("RealUserId"), Some("1000"));
+        assert_eq!(normalized.get_field("EffectiveUserId"), Some("0"));
+        let recorded = serde_json::to_value(&normalized).unwrap();
+        assert_eq!(recorded["fields"]["EffectiveUserId"], "0");
+        assert!(recorded["fields"].get("MountNamespace").is_none());
+        let replay: crate::models::NormalizedEvent = serde_json::from_value(recorded).unwrap();
+        assert_eq!(replay.get_field("EffectiveUserId"), Some("0"));
+
+        raw.identity.valid = 0;
+        let absent = normalizer
+            .normalize(&build_process_event(&raw).unwrap())
+            .unwrap();
+        assert_eq!(absent.get_field("User"), None);
+        assert_eq!(absent.get_field("EffectiveUserId"), None);
+        assert_eq!(absent.get_field("RealUserId"), Some("1000"));
+        assert_eq!(linux_user_id(u32::MAX), None);
+    }
+
+    /// Build a `ProcessEvent` the way the kernel would, with no argv capture.
+    /// Tests that exercise argv override `args*` explicitly.
+    fn raw_process_event(kind: u32, pid: u32, image: &str) -> ProcessEvent {
+        ProcessEvent {
+            identity: Default::default(),
+            event_time_ns: 0,
+            source_seq: 0,
+            cgroup_id: 55,
+            process_start_time: 123_456,
+            parent_process_start_time: 111_222,
+            kind,
+            pid,
+            uid: 1000,
+            parent_pid: 41,
+            creator_tid: 43,
+            creator_tgid: 41,
+            comm: fixed("bash"),
+            image: fixed(image),
+            args_len: 0,
+            args_count: 0,
+            args_truncated: 0,
+            image_truncated: 0,
+            parent_pid_derived: 0,
+            exec_syscall: 0,
+            args: [0u8; ARGV_CAPACITY],
+        }
+    }
+
+    /// Pack argv the way `read_argv` does: NUL-separated, `args_len` bytes.
+    fn packed_argv(args: &[&str]) -> ([u8; ARGV_CAPACITY], u16, u16) {
+        let mut buf = [0u8; ARGV_CAPACITY];
+        let mut offset = 0usize;
+        for arg in args {
+            let bytes = arg.as_bytes();
+            buf[offset..offset + bytes.len()].copy_from_slice(bytes);
+            offset += bytes.len() + 1;
+        }
+        (buf, offset as u16, args.len() as u16)
+    }
+
+    fn fixed<const N: usize>(value: &str) -> [u8; N] {
+        let mut buf = [0u8; N];
+        let bytes = value.as_bytes();
+        let len = bytes.len().min(N.saturating_sub(1));
+        buf[..len].copy_from_slice(&bytes[..len]);
+        buf
+    }
+
+    /// Build a file event whose paths are absolute, i.e. one that needs no
+    /// `/proc` lookup to resolve.
+    fn file_event(kind: u32, pid: u32, path: &str, comm: &str) -> FileEvent {
+        FileEvent {
+            event_time_ns: 0,
+            source_seq: 0,
+            kind,
+            pid,
+            uid: 1000,
+            flags: 0,
+            dfd: AT_FDCWD,
+            aux_dfd: AT_FDCWD,
+            dfd_token: 0,
+            aux_dfd_token: 0,
+            inode: 0,
+            device: 0,
+            _identity_pad: 0,
+            path: fixed(path),
+            aux_path: [0u8; FILE_PATH_LEN],
+            comm: fixed(comm),
+            process_start_time: 123_456,
+        }
+    }
+
+    fn dns_query_payload(name: &str, qtype: u16) -> ([u8; DNS_PAYLOAD_CAPACITY], u16) {
+        let mut payload = [0u8; DNS_PAYLOAD_CAPACITY];
+        payload[4] = 0;
+        payload[5] = 1;
+
+        let mut pos = crate::sensor::dns::HEADER_LEN;
+        for label in name.split('.') {
+            let bytes = label.as_bytes();
+            payload[pos] = bytes.len() as u8;
+            pos += 1;
+            payload[pos..pos + bytes.len()].copy_from_slice(bytes);
+            pos += bytes.len();
+        }
+        payload[pos] = 0;
+        pos += 1;
+        payload[pos..pos + 2].copy_from_slice(&qtype.to_be_bytes());
+        pos += 2;
+        payload[pos..pos + 2].copy_from_slice(&1u16.to_be_bytes());
+        pos += 2;
+
+        (payload, pos as u16)
+    }
+
+    /// A response to an A query for `name` carrying one A record per address,
+    /// each owner name compressed back to the question.
+    fn dns_response_payload(
+        name: &str,
+        addresses: &[[u8; 4]],
+    ) -> ([u8; DNS_PAYLOAD_CAPACITY], u16) {
+        let (mut payload, len) = dns_query_payload(name, 1);
+        let mut pos = usize::from(len);
+        payload[2] = 0x81;
+        payload[3] = 0x80;
+        payload[6..8].copy_from_slice(&(addresses.len() as u16).to_be_bytes());
+        for address in addresses {
+            let record: Vec<u8> = [
+                &[0xc0, crate::sensor::dns::HEADER_LEN as u8][..],
+                &1u16.to_be_bytes()[..],
+                &1u16.to_be_bytes()[..],
+                &60u32.to_be_bytes()[..],
+                &4u16.to_be_bytes()[..],
+                &address[..],
+            ]
+            .concat();
+            payload[pos..pos + record.len()].copy_from_slice(&record);
+            pos += record.len();
+        }
+        (payload, pos as u16)
+    }
+
+    fn raw_dns_event(
+        kind: u32,
+        (payload, payload_len): ([u8; DNS_PAYLOAD_CAPACITY], u16),
+    ) -> DnsEvent {
+        DnsEvent {
+            event_time_ns: 0,
+            source_seq: 0,
+            kind,
+            pid: 4242,
+            uid: 1000,
+            fd: 5,
+            payload_len,
+            flags: 0,
+            _pad1: 0,
+            process_start_time: 123_456,
+            payload,
+        }
+    }
+
+    fn raw_dns_query(name: &str, qtype: u16) -> DnsEvent {
+        raw_dns_event(DNS_EVENT_QUERY, dns_query_payload(name, qtype))
+    }
+
+    fn test_normalizer() -> Normalizer {
+        Normalizer::new(Arc::new(HostState::default()))
+    }
+
+    fn normalized_raw_dns_query(name: &str) -> crate::models::NormalizedEvent {
+        let raw = raw_dns_query(name, 1);
+        let event = build_dns_event(&raw).expect("raw dns event should build");
+        test_normalizer()
+            .normalize(&event)
+            .expect("raw dns event should normalize")
+    }
+
+    /// Never a live pid: above every possible `/proc/sys/kernel/pid_max`.
+    const DEAD_PID: u32 = u32::MAX;
+
+    #[test]
+    fn build_process_exec_event_emits_start() {
+        let raw = raw_process_event(PROCESS_EVENT_EXEC, DEAD_PID, "/usr/bin/bash");
+
+        let event = build_process_event(&raw).expect("process exec should build");
+        assert_eq!(event.action, SensorAction::Start);
+        assert_eq!(event.normalization.event_id, EVENT_ID_PROCESS_CREATE);
+        assert_eq!(
+            event.process_start_key,
+            Some(ProcessStartKey {
+                pid: DEAD_PID,
+                start_time: 123_456,
+            })
+        );
+
+        match event.payload {
+            RawPayload::Process(fields) => {
+                assert_eq!(fields.image.as_deref(), Some("/usr/bin/bash"));
+                assert_eq!(fields.process_id, DEAD_PID);
+                assert!(matches!(*fields.platform, RawProcessPlatform::Linux(_)));
+            }
+            other => panic!("unexpected payload: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn build_process_fork_event_emits_internal_lineage_update() {
+        let raw = raw_process_event(PROCESS_EVENT_FORK, 42, "");
+
+        let event = build_process_event(&raw).expect("process fork should build");
+        assert_eq!(event.action, SensorAction::Fork);
+        assert_eq!(event.normalization.action_code, 3);
+        assert_eq!(
+            event.process_start_key,
+            Some(ProcessStartKey {
+                pid: 42,
+                start_time: 123_456,
+            })
+        );
+        assert_eq!(
+            event.parent_process_start_key,
+            Some(ProcessStartKey {
+                pid: 41,
+                start_time: 111_222,
+            })
+        );
+        match event.payload {
+            RawPayload::Process(fields) => {
+                assert_eq!(fields.parent_process_id, Some(41));
+                assert!(fields.image.is_none());
+            }
+            other => panic!("unexpected payload: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn build_process_exec_uses_fork_time_parent_identity_and_cgroup() {
+        let mut raw = raw_process_event(PROCESS_EVENT_EXEC, DEAD_PID, "/usr/bin/bash");
+        raw.identity.valid = 1 << super::super::events::task_identity_abi::EUID;
+        raw.identity.values[super::super::events::task_identity_abi::EUID] = 1000;
+
+        let event = build_process_event(&raw).expect("process exec should build");
+        assert_eq!(
+            event.parent_process_start_key,
+            Some(ProcessStartKey {
+                pid: 41,
+                start_time: 111_222,
+            })
+        );
+        match event.payload {
+            RawPayload::Process(fields) => {
+                assert_eq!(fields.parent_process_id, Some(41));
+                assert_eq!(fields.user, Some(RawUserId::Unix(1000)));
+                let RawProcessPlatform::Linux(source) = *fields.platform else {
+                    panic!("expected Linux process facts")
+                };
+                assert_eq!(source.cgroup_id, Some(55));
+                assert!(!source.parent_process_id_derived);
+            }
+            other => panic!("unexpected payload: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn process_that_predates_sensor_does_not_invent_a_parent() {
+        let mut raw = raw_process_event(PROCESS_EVENT_EXEC, DEAD_PID, "/usr/bin/bash");
+        raw.parent_pid = 0;
+        raw.parent_process_start_time = 0;
+        raw.creator_tid = 0;
+        raw.creator_tgid = 0;
+
+        let event = build_process_event(&raw).expect("process exec should build");
+        assert!(event.parent_process_start_key.is_none());
+        match event.payload {
+            RawPayload::Process(fields) => assert!(fields.parent_process_id.is_none()),
+            other => panic!("unexpected payload: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn fork_map_eviction_leaves_parent_unattributed() {
+        // An LRU miss is encoded as a zeroed relationship in the kernel event.
+        let mut raw = raw_process_event(PROCESS_EVENT_EXEC, DEAD_PID, "/usr/bin/bash");
+        raw.parent_pid = 0;
+        raw.parent_process_start_time = 0;
+        raw.creator_tid = 0;
+        raw.creator_tgid = 0;
+
+        let event = build_process_event(&raw).expect("process exec should build");
+        assert!(event.parent_process_start_key.is_none());
+        match event.payload {
+            RawPayload::Process(fields) => assert!(fields.parent_process_id.is_none()),
+            other => panic!("unexpected payload: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn clone_parent_approximation_is_marked_derived() {
+        let mut raw = raw_process_event(PROCESS_EVENT_EXEC, DEAD_PID, "/usr/bin/bash");
+        raw.parent_pid_derived = 1;
+
+        let event = build_process_event(&raw).expect("process exec should build");
+        let normalized = test_normalizer()
+            .normalize(&event)
+            .expect("process exec should normalize");
+        assert!(normalized.provenance.entries().iter().any(|entry| {
+            entry.field == "ParentProcessId" && entry.fidelity == crate::models::Fidelity::Derived
+        }));
+    }
+
+    #[test]
+    fn repeated_exec_keeps_parent_but_mints_a_new_identity() {
+        let first = raw_process_event(PROCESS_EVENT_EXEC, 42, "/usr/bin/first");
+        let mut second = raw_process_event(PROCESS_EVENT_EXEC, 42, "/usr/bin/second");
+        second.process_start_time = 654_321;
+
+        let first = build_process_event(&first).expect("first exec should build");
+        let second = build_process_event(&second).expect("second exec should build");
+        assert_ne!(first.process_start_key, second.process_start_key);
+        assert_eq!(
+            first.parent_process_start_key,
+            second.parent_process_start_key
+        );
+    }
+
+    #[test]
+    fn build_process_exec_event_keeps_relative_kernel_image() {
+        let raw = raw_process_event(PROCESS_EVENT_EXEC, std::process::id(), "./rustinel");
+
+        let event = build_process_event(&raw).expect("process exec should build");
+        match event.payload {
+            RawPayload::Process(fields) => {
+                assert_eq!(fields.image.as_deref(), Some("./rustinel"));
+                assert!(matches!(*fields.platform, RawProcessPlatform::Linux(_)));
+            }
+            other => panic!("unexpected payload: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn build_process_exec_event_uses_kernel_argv_for_a_dead_process() {
+        // The command line comes entirely from the kernel snapshot.
+        let mut raw = raw_process_event(PROCESS_EVENT_EXEC, DEAD_PID, "/bin/true");
+        let (args, args_len, args_count) = packed_argv(&["/bin/true", "--quiet"]);
+        raw.args = args;
+        raw.args_len = args_len;
+        raw.args_count = args_count;
+
+        let event = build_process_event(&raw).expect("process exec should build");
+        match event.payload {
+            RawPayload::Process(fields) => {
+                assert_eq!(fields.command_line.as_deref(), Some("/bin/true --quiet"));
+            }
+            other => panic!("unexpected payload: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn exec_keeps_argv_boundaries_and_the_entry_point_for_the_auditd_view() {
+        let mut raw = raw_process_event(PROCESS_EVENT_EXEC, DEAD_PID, "/bin/sh");
+        // An argument with a space and an empty argument each stay one entry.
+        let (args, args_len, args_count) = packed_argv(&["sh", "-c id", "", "x"]);
+        raw.args = args;
+        raw.args_len = args_len;
+        raw.args_count = args_count;
+        raw.exec_syscall = crate::sensor::linux::events::EXEC_SYSCALL_EXECVEAT;
+
+        let event = build_process_event(&raw).expect("process exec should build");
+        let RawPayload::Process(process) = event.payload else {
+            panic!("unexpected payload");
+        };
+        let RawProcessPlatform::Linux(source) = process.platform.as_ref() else {
+            panic!("expected a Linux process");
+        };
+        assert_eq!(source.argv, ["sh", "-c id", "", "x"]);
+        assert_eq!(source.exec_syscall, Some("execveat"));
+
+        let exec = process.compatibility_fields().exec.expect("exec metadata");
+        assert_eq!(
+            exec.argv.as_deref(),
+            Some(["sh", "-c id", "", "x"].map(String::from).as_slice())
+        );
+        assert_eq!(exec.exec_syscall.as_deref(), Some("execveat"));
+    }
+
+    #[test]
+    fn exec_without_a_kernel_snapshot_has_no_argv_or_entry_point() {
+        let raw = raw_process_event(PROCESS_EVENT_EXEC, DEAD_PID, "/bin/true");
+
+        let event = build_process_event(&raw).expect("process exec should build");
+        let RawPayload::Process(process) = event.payload else {
+            panic!("unexpected payload");
+        };
+        let RawProcessPlatform::Linux(source) = process.platform.as_ref() else {
+            panic!("expected a Linux process");
+        };
+        assert!(source.argv.is_empty());
+        assert_eq!(source.exec_syscall, None);
+    }
+
+    #[test]
+    fn kernel_command_line_ignores_bytes_past_args_len() {
+        let (mut args, args_len, args_count) = packed_argv(&["/bin/ls", "-la"]);
+        // Stale bytes from a previous capture must never leak into the event.
+        args[args_len as usize..args_len as usize + 5].copy_from_slice(b"stale");
+
+        let event = ProcessEvent {
+            args,
+            args_len,
+            args_count,
+            ..raw_process_event(PROCESS_EVENT_EXEC, 42, "/bin/ls")
+        };
+        assert_eq!(event.kernel_command_line().as_deref(), Some("/bin/ls -la"));
+    }
+
+    #[test]
+    fn kernel_command_line_is_none_without_a_capture() {
+        let event = raw_process_event(PROCESS_EVENT_EXEC, 42, "/bin/ls");
+        assert!(event.kernel_command_line().is_none());
+    }
+
+    #[test]
+    fn resolve_exec_image_uses_only_the_kernel_filename() {
+        assert_eq!(
+            resolve_exec_image("./malware", false),
+            Some(("./malware".to_string(), false))
+        );
+        assert_eq!(
+            resolve_exec_image("/usr/bin/bash", false),
+            Some(("/usr/bin/bash".to_string(), false))
+        );
+        assert_eq!(resolve_exec_image("", false), None);
+    }
+
+    #[test]
+    fn resolve_exec_image_marks_a_truncated_kernel_filename() {
+        assert_eq!(
+            resolve_exec_image("/very/long/prefix", true),
+            Some(("/very/long/prefix".to_string(), true))
+        );
+    }
+
+    #[test]
+    fn build_process_event_marks_an_overlong_raw_image_fallback() {
+        let image = format!("/{}", "deep/".repeat(64));
+        let mut raw = raw_process_event(PROCESS_EVENT_EXEC, u32::MAX, &image);
+        raw.image_truncated = 1;
+
+        let event = build_process_event(&raw).expect("raw image should build an event");
+        match event.payload {
+            RawPayload::Process(fields) => {
+                assert_eq!(fields.image.as_deref().map(str::len), Some(255));
+                let RawProcessPlatform::Linux(source) = *fields.platform else {
+                    panic!("expected Linux process facts")
+                };
+                assert_eq!(source.image_truncated, Some(true));
+            }
+            other => panic!("unexpected payload: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn build_process_exit_event_emits_stop() {
+        let raw = raw_process_event(PROCESS_EVENT_EXIT, 42, "");
+
+        let event = build_process_event(&raw).expect("process exit should build");
+        assert_eq!(event.action, SensorAction::Stop);
+        assert!(event.process_name.is_none());
+        assert_eq!(event.normalization.event_id, EVENT_ID_PROCESS_TERMINATE);
+        assert_eq!(
+            event.process_start_key,
+            Some(ProcessStartKey {
+                pid: 42,
+                start_time: 123_456,
+            })
+        );
+
+        match event.payload {
+            RawPayload::Process(fields) => {
+                assert_eq!(fields.process_id, 42);
+                assert!(fields.image.is_none());
+            }
+            other => panic!("unexpected payload: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn build_network_event_omits_unmeasured_source_and_protocol_guessing() {
+        let mut daddr = [0u8; 16];
+        daddr[..4].copy_from_slice(&[198, 51, 100, 10]);
+
+        let raw = NetworkEvent {
+            event_time_ns: 0,
+            source_seq: 0,
+            pid: 77,
+            uid: 1000,
+            fd: -1,
+            ret: 0,
+            dport: 443,
+            sport: 51324,
+            af: 2,
+            protocol: 0,
+            tuple_flags: 0,
+            daddr,
+            saddr: {
+                let mut source = [0u8; 16];
+                source[..4].copy_from_slice(&[10, 0, 0, 5]);
+                source
+            },
+            process_start_time: 123_456,
+        };
+
+        let mut measured = raw;
+        measured.protocol = 6;
+        measured.tuple_flags = super::super::socket_tuple_abi::TUPLE_MEASURED
+            | super::super::socket_tuple_abi::INBOUND;
+        match build_network_event(&measured).unwrap().payload {
+            RawPayload::Network(fields) => {
+                assert_eq!(fields.source_ip.as_deref(), Some("10.0.0.5"));
+                assert_eq!(fields.source_port.as_deref(), Some("51324"));
+                assert_eq!(fields.protocol.as_deref(), Some("tcp"));
+                assert_eq!(fields.initiated, Some(false));
+            }
+            _ => panic!("expected network fields"),
+        }
+
+        let event = build_network_event(&raw).expect("network event should build");
+        assert_eq!(
+            event.process_start_key,
+            Some(ProcessStartKey {
+                pid: 77,
+                start_time: 123_456,
+            })
+        );
+        match event.payload {
+            RawPayload::Network(fields) => {
+                assert_eq!(fields.destination_ip.as_deref(), Some("198.51.100.10"));
+                assert!(fields.source_ip.is_none());
+                assert!(fields.source_port.is_none());
+                assert!(fields.protocol.is_none());
+            }
+            other => panic!("unexpected payload: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn build_network_event_reports_the_kernel_ip_protocol() {
+        let mut daddr = [0u8; 16];
+        daddr[..4].copy_from_slice(&[198, 51, 100, 10]);
+
+        let mut raw = NetworkEvent {
+            event_time_ns: 0,
+            source_seq: 0,
+            pid: 77,
+            uid: 1000,
+            fd: -1,
+            ret: 0,
+            dport: 53,
+            sport: 0,
+            af: 2,
+            protocol: 17, // UDP
+            tuple_flags: 0,
+            daddr,
+            saddr: [0u8; 16],
+            process_start_time: 123_456,
+        };
+
+        let event = build_network_event(&raw).expect("udp connect should build");
+        match event.payload {
+            RawPayload::Network(fields) => assert_eq!(fields.protocol.as_deref(), Some("udp")),
+            other => panic!("unexpected payload: {:?}", other),
+        }
+
+        raw.protocol = 6; // TCP
+        let event = build_network_event(&raw).expect("tcp connect should build");
+        match event.payload {
+            RawPayload::Network(fields) => assert_eq!(fields.protocol.as_deref(), Some("tcp")),
+            other => panic!("unexpected payload: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn build_network_event_supports_ipv6_and_omits_unmeasured_source() {
+        let raw = NetworkEvent {
+            event_time_ns: 0,
+            source_seq: 0,
+            pid: 88,
+            uid: 1000,
+            fd: -1,
+            ret: 0,
+            dport: 8443,
+            sport: 5353,
+            af: 10,
+            protocol: 0,
+            tuple_flags: 0,
+            daddr: Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 0x10).octets(),
+            saddr: Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 0x20).octets(),
+            process_start_time: 123_456,
+        };
+
+        let mut measured = raw;
+        measured.tuple_flags = super::super::socket_tuple_abi::TUPLE_MEASURED;
+        match build_network_event(&measured).unwrap().payload {
+            RawPayload::Network(fields) => {
+                assert_eq!(fields.source_ip.as_deref(), Some("fe80::20"));
+                assert_eq!(fields.source_port.as_deref(), Some("5353"));
+                assert_eq!(fields.initiated, Some(true));
+            }
+            _ => panic!("expected IPv6 network fields"),
+        }
+        let event = build_network_event(&raw).expect("ipv6 network event should build");
+        match event.payload {
+            RawPayload::Network(fields) => {
+                assert_eq!(fields.destination_ip.as_deref(), Some("2001:db8::10"));
+                assert!(fields.source_ip.is_none());
+                assert_eq!(fields.destination_port.as_deref(), Some("8443"));
+                assert!(fields.source_port.is_none());
+            }
+            other => panic!("unexpected payload: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn build_network_event_drops_failed_connect_attempts() {
+        let mut daddr = [0u8; 16];
+        daddr[..4].copy_from_slice(&[198, 51, 100, 10]);
+
+        // -ECONNREFUSED, -EHOSTUNREACH, -ETIMEDOUT: an attempt was made, no
+        // connection was established.
+        for result in [-111, -113, -110] {
+            let raw = NetworkEvent {
+                event_time_ns: 0,
+                source_seq: 0,
+                pid: 77,
+                uid: 1000,
+                fd: -1,
+                ret: result,
+                dport: 443,
+                sport: 0,
+                af: 2,
+                protocol: 0,
+                tuple_flags: 0,
+                daddr,
+                saddr: [0u8; 16],
+                process_start_time: 123_456,
+            };
+
+            assert!(
+                build_network_event(&raw).is_none(),
+                "connect() returning {result} is not a connection"
+            );
+        }
+    }
+
+    #[test]
+    fn build_network_event_keeps_connects_still_in_progress() {
+        let mut daddr = [0u8; 16];
+        daddr[..4].copy_from_slice(&[198, 51, 100, 10]);
+
+        // -EINPROGRESS is how every non-blocking client starts a connection,
+        // and -EINTR leaves the kernel completing one in the background.
+        for result in [0, -115, -4] {
+            let raw = NetworkEvent {
+                event_time_ns: 0,
+                source_seq: 0,
+                pid: 77,
+                uid: 1000,
+                fd: -1,
+                ret: result,
+                dport: 443,
+                sport: 0,
+                af: 2,
+                protocol: 0,
+                tuple_flags: 0,
+                daddr,
+                saddr: [0u8; 16],
+                process_start_time: 123_456,
+            };
+
+            let event = build_network_event(&raw)
+                .unwrap_or_else(|| panic!("connect() returning {result} is a connection"));
+            match event.payload {
+                RawPayload::Network(fields) => {
+                    assert_eq!(fields.destination_ip.as_deref(), Some("198.51.100.10"));
+                    assert_eq!(fields.initiated, Some(true));
+                }
+                other => panic!("unexpected payload: {:?}", other),
+            }
+        }
+    }
+
+    #[test]
+    fn build_network_event_rejects_unspecified_destination() {
+        let raw = NetworkEvent {
+            event_time_ns: 0,
+            source_seq: 0,
+            pid: 77,
+            uid: 1000,
+            fd: -1,
+            ret: 0,
+            dport: 443,
+            sport: 0,
+            af: 2,
+            protocol: 0,
+            tuple_flags: 0,
+            daddr: [0u8; 16],
+            saddr: [0u8; 16],
+            process_start_time: 123_456,
+        };
+
+        assert!(build_network_event(&raw).is_none());
+    }
+
+    #[test]
+    fn build_file_event_does_not_report_comm_as_an_image_path() {
+        let raw = file_event(1, 55, "/tmp/test.txt", "touch");
+
+        let event =
+            build_file_event(&raw, &DirFdIndex::new(), &mut 0).expect("file event should build");
+        assert_eq!(
+            event.process_start_key,
+            Some(ProcessStartKey {
+                pid: 55,
+                start_time: 123_456,
+            })
+        );
+        assert_eq!(event.process_name.as_deref(), Some("touch"));
+        match event.payload {
+            RawPayload::File(fields) => {
+                assert!(fields.source_filename.is_none());
+                assert_eq!(fields.target_filename.as_deref(), Some("/tmp/test.txt"));
+                assert!(fields.image.is_none());
+            }
+            other => panic!("unexpected payload: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn build_file_event_preserves_kernel_object_identity() {
+        let mut raw = file_event(1, 55, "/tmp/test.txt", "touch");
+        raw.device = (8 << 20) | 17;
+        raw.inode = 42;
+
+        let event =
+            build_file_event(&raw, &DirFdIndex::new(), &mut 0).expect("file event should build");
+        match event.payload {
+            RawPayload::File(fields) => {
+                assert_eq!(
+                    fields.file_identity,
+                    Some(crate::models::FileObjectIdentity {
+                        device: libc::makedev(8, 17),
+                        inode: 42,
+                    })
+                );
+            }
+            other => panic!("unexpected payload: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn build_file_delete_event_emits_delete_action() {
+        let raw = file_event(2, 55, "/tmp/deleted.txt", "rm");
+
+        let event = build_file_event(&raw, &DirFdIndex::new(), &mut 0)
+            .expect("delete file event should build");
+        assert_eq!(event.action, SensorAction::Delete);
+        assert_eq!(
+            event.normalization,
+            SensorNormalization::for_file_action(SensorAction::Delete).unwrap()
+        );
+
+        match event.payload {
+            RawPayload::File(fields) => {
+                assert_eq!(fields.target_filename.as_deref(), Some("/tmp/deleted.txt"));
+                assert!(fields.image.is_none());
+            }
+            other => panic!("unexpected payload: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_event_struct_layout_matches_userspace_decoder() {
+        let raw = file_event(2, 7, "/tmp/delete-me", "rm");
+
+        // SAFETY: `raw` is a live, fully initialized repr(C) FileEvent, so viewing
+        // its `size_of` bytes is in bounds. The layout carries explicit padding
+        // fields, so no byte is uninitialized.
+        let bytes = unsafe {
+            std::slice::from_raw_parts(
+                (&raw as *const FileEvent).cast::<u8>(),
+                std::mem::size_of::<FileEvent>(),
+            )
+        };
+        let decoded =
+            parse_event::<FileEvent>(bytes).expect("parse_event should decode file event");
+        let built = build_file_event(&decoded, &DirFdIndex::new(), &mut 0)
+            .expect("decoded file event should build");
+
+        match built.payload {
+            RawPayload::File(fields) => {
+                let normalized = fields.clone();
+                assert_eq!(
+                    normalized.target_filename.as_deref(),
+                    Some("/tmp/delete-me")
+                );
+                let event_fields = RawPayload::File(fields).into_event_fields();
+                assert!(matches!(event_fields, EventFields::FileEvent(_)));
+            }
+            other => panic!("unexpected payload: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn build_file_rename_event_preserves_old_and_new_paths() {
+        let mut raw = file_event(3, 99, "/tmp/new.txt", "mv");
+        raw.aux_path = fixed("/tmp/old.txt");
+
+        let event = build_file_event(&raw, &DirFdIndex::new(), &mut 0)
+            .expect("rename file event should build");
+        assert_eq!(event.action, SensorAction::Rename);
+        assert_eq!(
+            event.normalization,
+            SensorNormalization::for_file_action(SensorAction::Rename).unwrap()
+        );
+
+        match event.payload {
+            RawPayload::File(fields) => {
+                assert_eq!(fields.source_filename.as_deref(), Some("/tmp/old.txt"));
+                assert_eq!(fields.target_filename.as_deref(), Some("/tmp/new.txt"));
+            }
+            other => panic!("unexpected payload: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn build_file_event_resolves_cwd_relative_paths() {
+        let cwd = std::env::current_dir().expect("cwd should be readable");
+        let mut raw = file_event(1, std::process::id(), "payload.sh", "sh");
+        raw.dfd = AT_FDCWD;
+
+        let event = build_file_event(&raw, &DirFdIndex::new(), &mut 0)
+            .expect("cwd-relative event should build");
+        match event.payload {
+            RawPayload::File(fields) => {
+                assert_eq!(
+                    fields.target_filename.as_deref(),
+                    Some(format!("{}/payload.sh", cwd.display()).as_str())
+                );
+            }
+            other => panic!("unexpected payload: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn build_file_event_resolves_descriptor_relative_paths() {
+        use std::os::fd::AsRawFd;
+
+        let dir = std::fs::File::open("/etc").expect("/etc should be openable");
+        let mut raw = file_event(2, std::process::id(), "passwd", "rm");
+        raw.dfd = dir.as_raw_fd();
+
+        let event = build_file_event(&raw, &DirFdIndex::new(), &mut 0)
+            .expect("dirfd-relative event should build");
+        match event.payload {
+            RawPayload::File(fields) => {
+                // Without the descriptor this is the bare string "passwd",
+                // which names a different file under every directory on the
+                // disk.
+                assert_eq!(fields.target_filename.as_deref(), Some("/etc/passwd"));
+            }
+            other => panic!("unexpected payload: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn a_directory_open_names_the_descriptor_for_later_events() {
+        // What the sensor actually receives: the open of the directory, then a
+        // delete against the descriptor it produced. /proc cannot answer for
+        // either here - pid 4242 does not exist - so only the index can.
+        let mut dir_fds = DirFdIndex::new();
+
+        let mut dir_open = file_event(FILE_EVENT_DIR_OPEN, 4242, "/tmp/watched", "find");
+        dir_open.dfd = 9;
+        dir_open.aux_dfd = AT_FDCWD;
+        dir_open.dfd_token = 101;
+        index_dir_open(&dir_open, &mut dir_fds);
+
+        let mut delete = file_event(FILE_EVENT_DELETE, 4242, "victim.txt", "find");
+        delete.dfd = 9;
+        delete.dfd_token = 101;
+
+        let event =
+            build_file_event(&delete, &dir_fds, &mut 0).expect("indexed dfd should resolve");
+        match event.payload {
+            RawPayload::File(fields) => {
+                assert_eq!(
+                    fields.target_filename.as_deref(),
+                    Some("/tmp/watched/victim.txt")
+                );
+            }
+            other => panic!("unexpected payload: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn a_recycled_descriptor_resolves_to_the_directory_it_now_names() {
+        // The bug the index exists for: fd 9 is reopened onto another directory,
+        // and every later event must follow the new one, not the old.
+        let mut dir_fds = DirFdIndex::new();
+
+        let mut first = file_event(FILE_EVENT_DIR_OPEN, 4242, "/tmp/first", "rm");
+        first.dfd = 9;
+        first.dfd_token = 101;
+        index_dir_open(&first, &mut dir_fds);
+
+        let mut second = file_event(FILE_EVENT_DIR_OPEN, 4242, "/tmp/second", "rm");
+        second.dfd = 9;
+        second.dfd_token = 102;
+        index_dir_open(&second, &mut dir_fds);
+
+        let mut delete = file_event(FILE_EVENT_DELETE, 4242, "victim.txt", "rm");
+        delete.dfd = 9;
+        delete.dfd_token = 102;
+
+        let event =
+            build_file_event(&delete, &dir_fds, &mut 0).expect("indexed dfd should resolve");
+        match event.payload {
+            RawPayload::File(fields) => {
+                assert_eq!(
+                    fields.target_filename.as_deref(),
+                    Some("/tmp/second/victim.txt")
+                );
+            }
+            other => panic!("unexpected payload: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn an_old_index_token_is_never_used_after_untracked_fd_reuse() {
+        let mut dir_fds = DirFdIndex::new();
+
+        let mut old_dir = file_event(FILE_EVENT_DIR_OPEN, 4242, "/tmp/old", "rm");
+        old_dir.dfd = 9;
+        old_dir.dfd_token = 101;
+        index_dir_open(&old_dir, &mut dir_fds);
+
+        // Kernel close tracking removed token 101 before a bare O_RDONLY open
+        // reused fd 9. The later event therefore carries token zero. PID 4242
+        // does not exist, so `/proc` cannot hide an accidental cache hit.
+        let mut delete = file_event(FILE_EVENT_DELETE, 4242, "victim.txt", "rm");
+        delete.dfd = 9;
+        delete.dfd_token = 0;
+
+        let mut unresolved = 0;
+        assert!(build_file_event(&delete, &dir_fds, &mut unresolved).is_none());
+        assert_eq!(unresolved, 1);
+    }
+
+    #[test]
+    fn a_truncated_directory_path_is_not_promoted_into_the_index() {
+        let mut dir_fds = DirFdIndex::new();
+
+        let mut dir_open = file_event(FILE_EVENT_DIR_OPEN, 4242, "/tmp/cut", "find");
+        dir_open.dfd = 9;
+        dir_open.dfd_token = 101;
+        dir_open.flags = FILE_FLAG_PATH_TRUNCATED;
+        index_dir_open(&dir_open, &mut dir_fds);
+
+        let mut delete = file_event(FILE_EVENT_DELETE, 4242, "victim.txt", "find");
+        delete.dfd = 9;
+        delete.dfd_token = 101;
+
+        assert!(build_file_event(&delete, &dir_fds, &mut 0).is_none());
+    }
+
+    #[test]
+    fn a_directory_opened_under_another_descriptor_is_indexed_absolutely() {
+        // `openat(dirfd, "sub", O_DIRECTORY)` is ordinary, so the directory's
+        // own name is resolved before it becomes a base for anything else.
+        let mut dir_fds = DirFdIndex::new();
+
+        let mut parent = file_event(FILE_EVENT_DIR_OPEN, 4242, "/srv/data", "tar");
+        parent.dfd = 4;
+        parent.dfd_token = 101;
+        index_dir_open(&parent, &mut dir_fds);
+
+        let mut child = file_event(FILE_EVENT_DIR_OPEN, 4242, "nested", "tar");
+        child.dfd = 5;
+        child.aux_dfd = 4;
+        child.dfd_token = 102;
+        child.aux_dfd_token = 101;
+        index_dir_open(&child, &mut dir_fds);
+
+        let mut create = file_event(FILE_EVENT_CREATE, 4242, "payload.sh", "tar");
+        create.dfd = 5;
+        create.dfd_token = 102;
+
+        let event = build_file_event(&create, &dir_fds, &mut 0).expect("nested dfd should resolve");
+        match event.payload {
+            RawPayload::File(fields) => {
+                assert_eq!(
+                    fields.target_filename.as_deref(),
+                    Some("/srv/data/nested/payload.sh")
+                );
+            }
+            other => panic!("unexpected payload: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn build_file_event_drops_and_counts_unresolvable_relative_paths() {
+        // PID 0 is never a real process, so /proc/0/cwd cannot be read.
+        let raw = file_event(1, 0, "payload.sh", "sh");
+
+        let mut unresolved = 0;
+        assert!(build_file_event(&raw, &DirFdIndex::new(), &mut unresolved).is_none());
+        assert_eq!(unresolved, 1);
+    }
+
+    #[test]
+    fn build_file_event_keeps_absolute_paths_without_touching_proc() {
+        // A dead PID must not matter when the name is already absolute.
+        let raw = file_event(1, 0, "/tmp/absolute.txt", "sh");
+
+        let mut unresolved = 0;
+        let event = build_file_event(&raw, &DirFdIndex::new(), &mut unresolved)
+            .expect("absolute event should build");
+        assert_eq!(unresolved, 0);
+        match event.payload {
+            RawPayload::File(fields) => {
+                assert_eq!(fields.target_filename.as_deref(), Some("/tmp/absolute.txt"));
+                assert!(fields.path_truncated.is_none());
+            }
+            other => panic!("unexpected payload: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn build_file_event_marks_truncated_paths() {
+        let long_path = format!("/tmp/{}", "a".repeat(FILE_PATH_LEN));
+        let mut raw = file_event(1, 55, &long_path, "dd");
+        raw.flags = FILE_FLAG_PATH_TRUNCATED;
+
+        let event = build_file_event(&raw, &DirFdIndex::new(), &mut 0)
+            .expect("truncated event should build");
+        match event.payload {
+            RawPayload::File(fields) => {
+                let target = fields.target_filename.expect("target should be present");
+                assert_eq!(target.len(), FILE_PATH_LEN - 1);
+                assert_eq!(fields.path_truncated.as_deref(), Some("target"));
+            }
+            other => panic!("unexpected payload: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn build_file_rename_event_resolves_each_side_against_its_own_descriptor() {
+        use std::os::fd::AsRawFd;
+
+        let etc = std::fs::File::open("/etc").expect("/etc should be openable");
+        let tmp = std::fs::File::open("/tmp").expect("/tmp should be openable");
+
+        let mut raw = file_event(3, std::process::id(), "shadow.bak", "mv");
+        raw.dfd = tmp.as_raw_fd();
+        raw.aux_path = fixed("shadow");
+        raw.aux_dfd = etc.as_raw_fd();
+        raw.flags = FILE_FLAG_AUX_PATH_TRUNCATED;
+
+        let event =
+            build_file_event(&raw, &DirFdIndex::new(), &mut 0).expect("rename event should build");
+        match event.payload {
+            RawPayload::File(fields) => {
+                assert_eq!(fields.source_filename.as_deref(), Some("/etc/shadow"));
+                assert_eq!(fields.target_filename.as_deref(), Some("/tmp/shadow.bak"));
+                assert_eq!(fields.path_truncated.as_deref(), Some("source"));
+            }
+            other => panic!("unexpected payload: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn build_file_rename_event_keeps_the_target_when_the_source_is_unresolvable() {
+        let mut raw = file_event(3, 0, "/tmp/new.txt", "mv");
+        raw.aux_path = fixed("old.txt");
+
+        let mut unresolved = 0;
+        let event = build_file_event(&raw, &DirFdIndex::new(), &mut unresolved)
+            .expect("rename event should build");
+        assert_eq!(unresolved, 0);
+        match event.payload {
+            RawPayload::File(fields) => {
+                // Omitted rather than emitted as the bare name "old.txt".
+                assert!(fields.source_filename.is_none());
+                assert_eq!(fields.target_filename.as_deref(), Some("/tmp/new.txt"));
+            }
+            other => panic!("unexpected payload: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn build_dns_event_maps_linux_dns_payload() {
+        let raw = raw_dns_query("example.test", 1);
+
+        let event = build_dns_event(&raw).expect("dns event should build");
+        assert_eq!(event.action, SensorAction::Query);
+        assert_eq!(event.normalization.event_id, EVENT_ID_DNS_QUERY);
+        assert_eq!(
+            event.process_start_key,
+            Some(ProcessStartKey {
+                pid: 4242,
+                start_time: 123_456,
+            })
+        );
+
+        match event.payload {
+            RawPayload::Dns(fields) => {
+                assert_eq!(fields.query_name.as_deref(), Some("example.test"));
+                assert_eq!(fields.query_results, None);
+                assert_eq!(fields.query_status, None);
+                assert_eq!(fields.record_type.as_deref(), Some("A"));
+            }
+            other => panic!("unexpected payload: {:?}", other),
+        }
+    }
+
+    fn dns_fields(event: RawEvent) -> DnsQueryFields {
+        match event.payload {
+            RawPayload::Dns(fields) => fields,
+            other => panic!("unexpected payload: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn build_dns_event_skips_the_tcp_length_prefix() {
+        let (message, len) = dns_query_payload("tcp.example.test", 28);
+        let mut raw = raw_dns_event(DNS_EVENT_QUERY, (message, len));
+        raw.payload = [0u8; DNS_PAYLOAD_CAPACITY];
+        raw.payload[..2].copy_from_slice(&len.to_be_bytes());
+        raw.payload[2..2 + usize::from(len)].copy_from_slice(&message[..usize::from(len)]);
+        raw.payload_len = len + 2;
+        raw.flags = DNS_FLAG_TCP;
+
+        let fields = dns_fields(build_dns_event(&raw).expect("tcp query should build"));
+        assert_eq!(fields.query_name.as_deref(), Some("tcp.example.test"));
+        assert_eq!(fields.record_type.as_deref(), Some("AAAA"));
+        assert_eq!(fields.query_truncated, None);
+    }
+
+    #[test]
+    fn build_dns_event_reads_the_longest_legal_name_untruncated() {
+        let label = "a".repeat(63);
+        let name = format!("{label}.{label}.{label}.{}", "b".repeat(61));
+        assert_eq!(name.len(), 253);
+
+        let fields = dns_fields(build_dns_event(&raw_dns_query(&name, 1)).expect("builds"));
+        assert_eq!(fields.query_name.as_deref(), Some(name.as_str()));
+        assert_eq!(fields.query_truncated, None);
+    }
+
+    #[test]
+    fn build_dns_event_keeps_a_name_cut_by_the_capture_limit() {
+        // Eight 63-byte labels need 520 bytes, more than the capture holds.
+        let label = "a".repeat(63);
+        let mut message = vec![0u8; crate::sensor::dns::HEADER_LEN];
+        message[5] = 1;
+        for _ in 0..8 {
+            message.push(63);
+            message.extend_from_slice(label.as_bytes());
+        }
+        message.extend_from_slice(&[0, 0, 1, 0, 1]);
+        let mut raw = raw_dns_query("placeholder.test", 1);
+        raw.payload
+            .copy_from_slice(&message[..DNS_PAYLOAD_CAPACITY]);
+        raw.payload_len = DNS_PAYLOAD_CAPACITY as u16;
+        raw.flags = DNS_FLAG_TRUNCATED;
+
+        let fields = dns_fields(build_dns_event(&raw).expect("a cut name should still report"));
+        let name = fields.query_name.expect("name");
+        assert!(
+            name.starts_with(&label) && name.len() > 400,
+            "{}",
+            name.len()
+        );
+        assert_eq!(fields.query_truncated.as_deref(), Some("true"));
+        assert_eq!(fields.record_type, None);
+    }
+
+    #[test]
+    fn build_dns_event_drops_a_cut_message_that_is_not_dns() {
+        let mut raw = raw_dns_query("example.test", 1);
+        raw.payload_len = (crate::sensor::dns::HEADER_LEN + 4) as u16;
+        raw.payload[crate::sensor::dns::HEADER_LEN] = 0xc0;
+        raw.flags = DNS_FLAG_TRUNCATED;
+        assert!(build_dns_event(&raw).is_none());
+    }
+
+    #[test]
+    fn build_dns_event_decodes_response_answers_and_status() {
+        let raw = raw_dns_event(
+            DNS_EVENT_RESPONSE,
+            dns_response_payload("example.test", &[[198, 51, 100, 10], [198, 51, 100, 11]]),
+        );
+
+        match build_dns_event(&raw)
+            .expect("response should build")
+            .payload
+        {
+            RawPayload::Dns(fields) => {
+                assert_eq!(fields.query_name.as_deref(), Some("example.test"));
+                assert_eq!(fields.record_type.as_deref(), Some("A"));
+                assert_eq!(
+                    fields.query_results.as_deref(),
+                    Some("198.51.100.10;198.51.100.11;")
+                );
+                assert_eq!(fields.query_status.as_deref(), Some("0"));
+            }
+            other => panic!("unexpected payload: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn build_dns_event_rejects_a_direction_that_does_not_match_the_message() {
+        let query = dns_query_payload("example.test", 1);
+        let response = dns_response_payload("example.test", &[[192, 0, 2, 1]]);
+        assert!(build_dns_event(&raw_dns_event(DNS_EVENT_RESPONSE, query)).is_none());
+        assert!(build_dns_event(&raw_dns_event(DNS_EVENT_QUERY, response)).is_none());
+        assert!(build_dns_event(&raw_dns_event(7, query)).is_none());
+    }
+
+    #[test]
+    fn build_dns_event_drops_a_truncated_question() {
+        let mut raw = raw_dns_query("example.test", 1);
+        raw.payload_len = (crate::sensor::dns::HEADER_LEN + 4) as u16;
+        assert!(build_dns_event(&raw).is_none());
+    }
+
+    #[test]
+    fn build_dns_event_names_unlisted_record_types_other() {
+        let raw = raw_dns_query("example.test", 65);
+        match build_dns_event(&raw).expect("query should build").payload {
+            RawPayload::Dns(fields) => assert_eq!(fields.record_type.as_deref(), Some("OTHER")),
+            other => panic!("unexpected payload: {:?}", other),
+        }
+    }
+
+    /// The acceptance path for issue #439: an answer observed on Linux names
+    /// the connection that follows it, and a domain IOC fires on that
+    /// connection rather than only on the lookup.
+    #[test]
+    fn dns_response_names_the_following_connection_for_domain_iocs() {
+        let tempdir = tempfile::tempdir().expect("create ioc tempdir");
+        let root = tempdir.path().join("ioc");
+        std::fs::create_dir_all(&root).expect("create ioc dir");
+        let hashes_path = root.join("hashes.txt");
+        let ips_path = root.join("ips.txt");
+        let domains_path = root.join("domains.txt");
+        let paths_regex_path = root.join("paths_regex.txt");
+        std::fs::write(&hashes_path, "").expect("write hashes");
+        std::fs::write(&ips_path, "").expect("write ips");
+        std::fs::write(&domains_path, "c2.example.test; beacon").expect("write domains");
+        std::fs::write(&paths_regex_path, "").expect("write path regexes");
+        let engine = IocEngine::load(&IocConfig {
+            enabled: true,
+            hashes_path,
+            ips_path,
+            domains_path,
+            paths_regex_path,
+            default_severity: "high".to_string(),
+            max_file_size_mb: 16,
+            hash_allowlist_paths: Vec::new(),
+        });
+
+        let host = Arc::new(HostState::default());
+        let normalizer = Normalizer::new(Arc::clone(&host));
+        let response = raw_dns_event(
+            DNS_EVENT_RESPONSE,
+            dns_response_payload("C2.example.test", &[[203, 0, 113, 9]]),
+        );
+        normalizer
+            .normalize(&build_dns_event(&response).unwrap())
+            .expect("response should normalize");
+        assert_eq!(host.dns.count(), 1);
+
+        let mut daddr = [0u8; 16];
+        daddr[..4].copy_from_slice(&[203, 0, 113, 9]);
+        let connection = NetworkEvent {
+            event_time_ns: 0,
+            source_seq: 0,
+            pid: 4242,
+            uid: 1000,
+            fd: -1,
+            ret: 0,
+            dport: 443,
+            sport: 40000,
+            af: 2,
+            protocol: 6,
+            tuple_flags: super::super::socket_tuple_abi::TUPLE_MEASURED,
+            daddr,
+            saddr: [0u8; 16],
+            process_start_time: 123_456,
+        };
+        let event = normalizer
+            .normalize(&build_network_event(&connection).unwrap())
+            .expect("connection should normalize");
+        assert_eq!(
+            event.get_field("DestinationHostname"),
+            Some("C2.example.test")
+        );
+
+        let event = CanonicalEvent::from_normalized(event);
+        let matches = engine.check_event(&event);
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].kind, IocKind::Domain);
+        assert_eq!(matches[0].observed, "c2.example.test");
+    }
+
+    #[test]
+    fn raw_dns_payload_query_name_matches_real_sigma_dns_rule() {
+        let tempdir = tempfile::tempdir().expect("create sigma tempdir");
+        let rules_dir = tempdir.path().join("sigma");
+        std::fs::create_dir_all(&rules_dir).expect("create sigma rules dir");
+        std::fs::write(
+            rules_dir.join("dns.yml"),
+            r#"title: Raw Linux DNS QueryName
+logsource:
+  product: linux
+  category: dns_query
+detection:
+  selection:
+    QueryName|endswith: ".example.test"
+    RecordType: "A"
+  condition: selection
+level: high
+"#,
+        )
+        .expect("write sigma rule");
+
+        let mut engine = Engine::new_for_platform(Platform::Linux);
+        engine.load_rules(&rules_dir).expect("load sigma rule");
+        assert_eq!(engine.stats().failed_rules, Vec::<(String, String)>::new());
+
+        let event = normalized_raw_dns_query("sub.example.test");
+        assert_eq!(event.get_field("QueryName"), Some("sub.example.test"));
+        assert_eq!(event.get_field("query"), Some("sub.example.test"));
+        assert_eq!(event.get_field("RecordType"), Some("A"));
+
+        let alert = engine
+            .check_event(&event)
+            .into_iter()
+            .next()
+            .expect("dns Sigma rule should match raw eBPF QueryName");
+        assert_eq!(alert.rule_name, "Raw Linux DNS QueryName");
+    }
+
+    #[test]
+    fn descriptor_relative_file_event_matches_a_path_sigma_rule() {
+        use std::os::fd::AsRawFd;
+
+        let tempdir = tempfile::tempdir().expect("create sigma tempdir");
+        let rules_dir = tempdir.path().join("sigma");
+        std::fs::create_dir_all(&rules_dir).expect("create sigma rules dir");
+        std::fs::write(
+            rules_dir.join("file.yml"),
+            r#"title: Raw Linux Sensitive File Write
+logsource:
+  product: linux
+  category: file_event
+detection:
+  selection:
+    TargetFilename|endswith: "/etc/passwd"
+  condition: selection
+level: high
+"#,
+        )
+        .expect("write sigma rule");
+
+        let mut engine = Engine::new_for_platform(Platform::Linux);
+        engine.load_rules(&rules_dir).expect("load sigma rule");
+        assert_eq!(engine.stats().failed_rules, Vec::<(String, String)>::new());
+
+        // The kernel hands the sensor the bare name "passwd" plus a descriptor.
+        // Before resolution that string matched no path rule at all.
+        let dir = std::fs::File::open("/etc").expect("/etc should be openable");
+        let mut raw = file_event(FILE_EVENT_CREATE, std::process::id(), "passwd", "sh");
+        raw.dfd = dir.as_raw_fd();
+
+        let sensor_event =
+            build_file_event(&raw, &DirFdIndex::new(), &mut 0).expect("file event should build");
+        let event = test_normalizer()
+            .normalize(&sensor_event)
+            .expect("file event should normalize");
+        assert_eq!(event.get_field("TargetFilename"), Some("/etc/passwd"));
+
+        let alert = engine
+            .check_event(&event)
+            .into_iter()
+            .next()
+            .expect("file Sigma rule should match the resolved path");
+        assert_eq!(alert.rule_name, "Raw Linux Sensitive File Write");
+    }
+
+    #[test]
+    fn descriptor_relative_file_event_matches_a_path_regex_ioc() {
+        use std::os::fd::AsRawFd;
+
+        let tempdir = tempfile::tempdir().expect("create ioc tempdir");
+        let root = tempdir.path().join("ioc");
+        std::fs::create_dir_all(&root).expect("create ioc dir");
+        let hashes_path = root.join("hashes.txt");
+        let ips_path = root.join("ips.txt");
+        let domains_path = root.join("domains.txt");
+        let paths_regex_path = root.join("paths_regex.txt");
+        std::fs::write(&hashes_path, "").expect("write hashes");
+        std::fs::write(&ips_path, "").expect("write ips");
+        std::fs::write(&domains_path, "").expect("write domains");
+        std::fs::write(&paths_regex_path, "^/etc/passwd$; sensitive file")
+            .expect("write path regexes");
+
+        let engine = IocEngine::load(&IocConfig {
+            enabled: true,
+            hashes_path,
+            ips_path,
+            domains_path,
+            paths_regex_path,
+            default_severity: "high".to_string(),
+            max_file_size_mb: 16,
+            hash_allowlist_paths: Vec::new(),
+        });
+
+        let dir = std::fs::File::open("/etc").expect("/etc should be openable");
+        let mut raw = file_event(FILE_EVENT_CREATE, std::process::id(), "passwd", "sh");
+        raw.dfd = dir.as_raw_fd();
+
+        let sensor_event =
+            build_file_event(&raw, &DirFdIndex::new(), &mut 0).expect("file event should build");
+        let event = CanonicalEvent::from_normalized(
+            test_normalizer()
+                .normalize(&sensor_event)
+                .expect("file event should normalize"),
+        );
+
+        let matches = engine.check_event(&event);
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].observed, "/etc/passwd");
+    }
+
+    #[test]
+    fn raw_dns_payload_query_name_matches_domain_ioc() {
+        let tempdir = tempfile::tempdir().expect("create ioc tempdir");
+        let root = tempdir.path().join("ioc");
+        std::fs::create_dir_all(&root).expect("create ioc dir");
+        let hashes_path = root.join("hashes.txt");
+        let ips_path = root.join("ips.txt");
+        let domains_path = root.join("domains.txt");
+        let paths_regex_path = root.join("paths_regex.txt");
+        std::fs::write(&hashes_path, "").expect("write hashes");
+        std::fs::write(&ips_path, "").expect("write ips");
+        std::fs::write(&domains_path, ".example.test; raw dns suffix").expect("write domains");
+        std::fs::write(&paths_regex_path, "").expect("write path regexes");
+
+        let engine = IocEngine::load(&IocConfig {
+            enabled: true,
+            hashes_path,
+            ips_path,
+            domains_path,
+            paths_regex_path,
+            default_severity: "high".to_string(),
+            max_file_size_mb: 16,
+            hash_allowlist_paths: Vec::new(),
+        });
+        let event = CanonicalEvent::from_normalized(normalized_raw_dns_query("sub.example.test"));
+
+        let matches = engine.check_event(&event);
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].kind, IocKind::Domain);
+        assert_eq!(matches[0].observed, "sub.example.test");
+
+        let alert = engine.build_alert_for_match(&matches[0], &event);
+        assert_eq!(alert.rule_name, "ioc:domain:.example.test");
+    }
+
+    #[test]
+    fn build_dns_event_drops_a_payload_that_is_not_dns() {
+        let raw = raw_dns_event(DNS_EVENT_QUERY, ([0u8; DNS_PAYLOAD_CAPACITY], 64));
+        assert!(build_dns_event(&raw).is_none());
+    }
+}

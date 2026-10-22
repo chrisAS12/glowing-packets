@@ -1,0 +1,593 @@
+pub mod reference;
+
+#[derive(clap::Parser)]
+#[command(name = "rustinel")]
+#[command(version)]
+#[command(about = "High-Performance Rust EDR", long_about = None)]
+pub struct Cli {
+    #[command(subcommand)]
+    pub command: Option<Commands>,
+    /// Configuration file to load. Overrides RUSTINEL_CONFIG and every discovered config.toml
+    #[arg(long, global = true, value_name = "PATH")]
+    pub config: Option<std::path::PathBuf>,
+    /// Log level for this run
+    #[arg(
+        long,
+        global = true,
+        value_name = "LEVEL",
+        value_parser = ["error", "warn", "info", "debug", "trace"]
+    )]
+    pub log_level: Option<String>,
+}
+
+impl Cli {
+    pub fn parse_args() -> Self {
+        <Self as clap::Parser>::parse()
+    }
+}
+
+#[derive(clap::Subcommand)]
+pub enum Commands {
+    /// Update the binary from the latest GitHub Release
+    ///
+    /// Downloads the archive for this OS and architecture, verifies its SHA-256
+    /// checksum, and replaces the running executable. Configuration, rules,
+    /// logs, and captures are kept. Restart Rustinel afterwards: a running
+    /// service is not restarted for you.
+    Update,
+    /// Install Rustinel into the managed platform layout
+    ///
+    /// Writes the managed configuration, installs a rules pack, copies this
+    /// executable (the whole signed Rustinel.app on macOS), makes it available
+    /// as the `rustinel` command, registers the native service, starts it, and
+    /// runs the doctor checks. An existing configuration is kept unless
+    /// `--force` is given.
+    Setup {
+        /// Rules pack to install. Interactive runs prompt when omitted; other runs use essential
+        #[arg(long, value_enum, value_name = "PACK")]
+        pack: Option<SetupPack>,
+        /// Accept defaults and do not prompt
+        #[arg(long)]
+        yes: bool,
+        /// Register the service but do not start it; an already-running service is left running
+        #[arg(long)]
+        no_start: bool,
+        /// Replace existing managed configuration
+        #[arg(long)]
+        force: bool,
+        /// Rules catalog index URL
+        #[arg(long, value_name = "URL", default_value = crate::rules::DEFAULT_CATALOG_URL)]
+        catalog_url: String,
+    },
+    /// Run in the foreground with console output
+    Run {
+        /// Compatibility alias; console output is enabled by default
+        #[arg(long, conflicts_with = "no_console")]
+        console: bool,
+        /// Disable console output
+        #[arg(long)]
+        no_console: bool,
+    },
+    /// Record endpoint behavior to a replayable file without evaluating detections
+    ///
+    /// Capture is passive: start it first, then run the sample, script, or test
+    /// you want to record, and press Ctrl-C when the session is complete.
+    Capture {
+        /// Recording path.
+        /// Defaults to <capture.directory>/rustinel-capture-<UTC timestamp>.ndjson.
+        /// Refuses to start if the recording or its manifest already exists.
+        #[arg(long, value_name = "PATH")]
+        output: Option<std::path::PathBuf>,
+    },
+    /// Evaluate a recording against the detectors, offline
+    ///
+    /// Replay needs no sensors, no privileges, and no particular platform: a
+    /// recording made on one endpoint can be replayed anywhere, as often as the
+    /// rules being developed against it change.
+    Replay {
+        /// Recording to replay, as written by `rustinel capture`.
+        /// Its manifest sidecar must sit next to it.
+        #[arg(value_name = "RECORDING")]
+        recording: std::path::PathBuf,
+        /// Write ECS NDJSON alerts here instead of a console alert list.
+        /// Refuses an existing file, and the recording itself.
+        #[arg(long, value_name = "PATH")]
+        output: Option<std::path::PathBuf>,
+    },
+    /// Check configuration, paths, and runtime prerequisites
+    ///
+    /// Read-only; it does not start the agent. Exits 0 when every check
+    /// passes, 1 when at least one check warns, and 2 when at least one fails.
+    Doctor {
+        /// Emit structured JSON output
+        #[arg(long)]
+        json: bool,
+    },
+    /// Inspect Sigma rule compatibility
+    Sigma {
+        #[command(subcommand)]
+        action: SigmaAction,
+    },
+    /// Manage the native service (SCM on Windows, systemd on Linux, launchd on macOS)
+    Service {
+        #[command(subcommand)]
+        action: ServiceAction,
+    },
+    /// Discover, install, and update released rules packs
+    Rules {
+        #[command(subcommand)]
+        action: RulesAction,
+    },
+}
+
+#[derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SetupPack {
+    Essential,
+    Advanced,
+}
+
+#[derive(clap::Subcommand, Clone)]
+pub enum SigmaAction {
+    /// Explain which Sigma documents can fire on a platform
+    ///
+    /// Exits 0 when every document can fire, 1 when coverage is degraded or
+    /// unavailable, and 2 when a document cannot be parsed or compiled.
+    Doctor {
+        /// Emit the stable, versioned JSON report
+        #[arg(long)]
+        json: bool,
+        /// Platform whose collectors and field availability should be checked
+        #[arg(long, value_enum)]
+        platform: Option<SigmaPlatform>,
+        /// Sigma rules directory; defaults to scanner.sigma_rules_path
+        #[arg(long, value_name = "PATH")]
+        rules: Option<std::path::PathBuf>,
+    },
+}
+
+#[derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SigmaPlatform {
+    Windows,
+    Linux,
+    Macos,
+}
+
+impl SigmaPlatform {
+    pub fn sensor_platform(self) -> crate::vocab::Platform {
+        match self {
+            Self::Windows => crate::vocab::Platform::Windows,
+            Self::Linux => crate::vocab::Platform::Linux,
+            Self::Macos => crate::vocab::Platform::MacOS,
+        }
+    }
+}
+
+impl SetupPack {
+    pub fn level(self) -> &'static str {
+        match self {
+            Self::Essential => "essential",
+            Self::Advanced => "advanced",
+        }
+    }
+}
+
+#[derive(clap::Subcommand, Copy, Clone)]
+pub enum ServiceAction {
+    /// Register the native service. The managed binary and configuration must already exist
+    Install,
+    /// Unregister the native service. Configuration, rules, and logs are kept
+    Uninstall,
+    /// Start the service
+    Start,
+    /// Stop the service
+    Stop,
+    /// Stop and start the service
+    Restart,
+    /// Print not-installed, stopped, starting, running, failed, or unknown
+    Status,
+}
+
+#[derive(clap::Subcommand, Clone)]
+pub enum RulesAction {
+    /// List rules packs available for this platform
+    List {
+        /// Rules catalog index URL
+        #[arg(long, value_name = "URL", default_value = crate::rules::DEFAULT_CATALOG_URL)]
+        catalog_url: String,
+        /// Rules root directory, containing current, staging, and state.json
+        #[arg(long, value_name = "PATH")]
+        rules_dir: Option<std::path::PathBuf>,
+    },
+    /// Update the active pack to the newest compatible release
+    ///
+    /// Installs only a strictly newer version compatible with this platform and
+    /// Rustinel version. Restart Rustinel afterwards: a whole-pack replacement
+    /// is not hot reloaded. Local edits under `rules/current` are replaced.
+    Update {
+        /// Rules catalog index URL. Default: the URL recorded at install, else the official catalog
+        #[arg(long, value_name = "URL")]
+        catalog_url: Option<String>,
+        /// Rules root directory, containing current, staging, and state.json
+        #[arg(long, value_name = "PATH")]
+        rules_dir: Option<std::path::PathBuf>,
+    },
+    /// Install a rules pack and make it active
+    ///
+    /// Downloads the pack, verifies its SHA-256 checksum, validates it, then
+    /// atomically replaces `rules/current`. A failure keeps the previous pack.
+    Install {
+        /// Pack ID from `rustinel rules list`
+        pack: String,
+        /// Rules catalog index URL
+        #[arg(long, value_name = "URL", default_value = crate::rules::DEFAULT_CATALOG_URL)]
+        catalog_url: String,
+        /// Rules root directory, containing current, staging, and state.json
+        #[arg(long, value_name = "PATH")]
+        rules_dir: Option<std::path::PathBuf>,
+    },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser;
+
+    #[test]
+    fn rules_update_parses_options() {
+        let cli = Cli::try_parse_from([
+            "rustinel",
+            "rules",
+            "update",
+            "--rules-dir",
+            "custom-rules",
+            "--catalog-url",
+            "https://github.com/example/rules/releases/download/v1/index.json",
+        ])
+        .expect("rules update should parse");
+        match cli.command {
+            Some(Commands::Rules {
+                action:
+                    RulesAction::Update {
+                        rules_dir,
+                        catalog_url,
+                    },
+            }) => {
+                assert_eq!(rules_dir, Some(std::path::PathBuf::from("custom-rules")));
+                assert!(catalog_url.unwrap().ends_with("/v1/index.json"));
+            }
+            _ => panic!("expected rules update command"),
+        }
+    }
+
+    #[test]
+    fn run_defaults_to_console_output() {
+        let cli = Cli::try_parse_from(["rustinel", "run"]).expect("valid CLI");
+
+        match cli.command {
+            Some(Commands::Run {
+                console,
+                no_console,
+                ..
+            }) => {
+                assert!(!console);
+                assert!(!no_console);
+            }
+            _ => panic!("expected run command"),
+        }
+    }
+
+    #[test]
+    fn run_accepts_compat_console_alias() {
+        let cli = Cli::try_parse_from(["rustinel", "run", "--console"]).expect("valid CLI");
+
+        match cli.command {
+            Some(Commands::Run {
+                console,
+                no_console,
+                ..
+            }) => {
+                assert!(console);
+                assert!(!no_console);
+            }
+            _ => panic!("expected run command"),
+        }
+    }
+
+    #[test]
+    fn run_accepts_no_console() {
+        let cli = Cli::try_parse_from(["rustinel", "run", "--no-console"]).expect("valid CLI");
+
+        match cli.command {
+            Some(Commands::Run {
+                console,
+                no_console,
+                ..
+            }) => {
+                assert!(!console);
+                assert!(no_console);
+            }
+            _ => panic!("expected run command"),
+        }
+    }
+
+    #[test]
+    fn run_rejects_console_and_no_console_together() {
+        let err = match Cli::try_parse_from(["rustinel", "run", "--console", "--no-console"]) {
+            Ok(_) => panic!("conflicting flags should fail"),
+            Err(err) => err,
+        };
+
+        assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
+    }
+
+    #[test]
+    fn global_log_level_accepts_documented_values() {
+        for level in ["error", "warn", "info", "debug", "trace"] {
+            let cli = Cli::try_parse_from(["rustinel", "--log-level", level, "doctor"])
+                .expect("documented log level should parse");
+            assert_eq!(cli.log_level.as_deref(), Some(level));
+        }
+    }
+
+    #[test]
+    fn global_log_level_rejects_unknown_values() {
+        let err = match Cli::try_parse_from(["rustinel", "--log-level", "bogus", "doctor"]) {
+            Ok(_) => panic!("unknown log level should fail"),
+            Err(err) => err,
+        };
+
+        assert_eq!(err.kind(), clap::error::ErrorKind::InvalidValue);
+    }
+
+    #[test]
+    fn global_config_flag_is_accepted_before_subcommand() {
+        let cli = Cli::try_parse_from(["rustinel", "--config", "/tmp/rustinel.toml", "run"])
+            .expect("config path should parse");
+        assert_eq!(
+            cli.config,
+            Some(std::path::PathBuf::from("/tmp/rustinel.toml"))
+        );
+    }
+
+    #[test]
+    fn global_config_flag_is_accepted_after_subcommand() {
+        let cli = Cli::try_parse_from(["rustinel", "run", "--config", "/tmp/rustinel.toml"])
+            .expect("config path should parse");
+        assert_eq!(
+            cli.config,
+            Some(std::path::PathBuf::from("/tmp/rustinel.toml"))
+        );
+    }
+
+    #[test]
+    fn setup_accepts_managed_install_flags() {
+        let cli = Cli::try_parse_from([
+            "rustinel",
+            "setup",
+            "--pack",
+            "advanced",
+            "--yes",
+            "--no-start",
+            "--force",
+        ])
+        .expect("setup should parse");
+
+        match cli.command {
+            Some(Commands::Setup {
+                pack,
+                yes,
+                no_start,
+                force,
+                catalog_url,
+            }) => {
+                assert_eq!(pack, Some(SetupPack::Advanced));
+                assert!(yes);
+                assert!(no_start);
+                assert!(force);
+                assert!(catalog_url.ends_with("/index.json"));
+            }
+            _ => panic!("expected setup command"),
+        }
+    }
+
+    #[test]
+    fn capture_defaults_to_a_generated_output_path() {
+        let cli = Cli::try_parse_from(["rustinel", "capture"]).expect("capture should parse");
+
+        match cli.command {
+            Some(Commands::Capture { output }) => assert_eq!(output, None),
+            _ => panic!("expected capture command"),
+        }
+    }
+
+    #[test]
+    fn capture_accepts_an_explicit_output_path() {
+        let cli =
+            Cli::try_parse_from(["rustinel", "capture", "--output", "/tmp/lab/run-42.ndjson"])
+                .expect("capture should parse");
+
+        match cli.command {
+            Some(Commands::Capture { output }) => {
+                assert_eq!(
+                    output,
+                    Some(std::path::PathBuf::from("/tmp/lab/run-42.ndjson"))
+                );
+            }
+            _ => panic!("expected capture command"),
+        }
+    }
+
+    #[test]
+    fn capture_accepts_the_global_config_flag() {
+        let cli = Cli::try_parse_from(["rustinel", "capture", "--config", "/tmp/rustinel.toml"])
+            .expect("capture should parse");
+
+        assert_eq!(
+            cli.config,
+            Some(std::path::PathBuf::from("/tmp/rustinel.toml"))
+        );
+        assert!(matches!(cli.command, Some(Commands::Capture { .. })));
+    }
+
+    #[test]
+    fn replay_requires_a_recording() {
+        let err = match Cli::try_parse_from(["rustinel", "replay"]) {
+            Ok(_) => panic!("replay without a recording should fail"),
+            Err(err) => err,
+        };
+
+        assert_eq!(
+            err.kind(),
+            clap::error::ErrorKind::MissingRequiredArgument,
+            "the recording is the whole input to a replay"
+        );
+    }
+
+    #[test]
+    fn replay_defaults_to_console_output() {
+        let cli = Cli::try_parse_from(["rustinel", "replay", "/tmp/lab/run-42.ndjson"])
+            .expect("replay should parse");
+
+        match cli.command {
+            Some(Commands::Replay { recording, output }) => {
+                assert_eq!(
+                    recording,
+                    std::path::PathBuf::from("/tmp/lab/run-42.ndjson")
+                );
+                assert_eq!(output, None);
+            }
+            _ => panic!("expected replay command"),
+        }
+    }
+
+    #[test]
+    fn replay_accepts_an_ecs_output_path_and_a_config_override() {
+        let cli = Cli::try_parse_from([
+            "rustinel",
+            "replay",
+            "/tmp/lab/run-42.ndjson",
+            "--output",
+            "/tmp/lab/run-42.alerts.ndjson",
+            "--config",
+            "/tmp/candidate.toml",
+        ])
+        .expect("replay should parse");
+
+        assert_eq!(
+            cli.config,
+            Some(std::path::PathBuf::from("/tmp/candidate.toml"))
+        );
+        match cli.command {
+            Some(Commands::Replay { output, .. }) => {
+                assert_eq!(
+                    output,
+                    Some(std::path::PathBuf::from("/tmp/lab/run-42.alerts.ndjson"))
+                );
+            }
+            _ => panic!("expected replay command"),
+        }
+    }
+
+    #[test]
+    fn doctor_accepts_json_flag() {
+        let cli = Cli::try_parse_from(["rustinel", "doctor", "--json"]).expect("valid CLI");
+
+        match cli.command {
+            Some(Commands::Doctor { json }) => assert!(json),
+            _ => panic!("expected doctor command"),
+        }
+    }
+
+    #[test]
+    fn sigma_doctor_accepts_platform_json_and_rules_path() {
+        let cli = Cli::try_parse_from([
+            "rustinel",
+            "sigma",
+            "doctor",
+            "--platform",
+            "windows",
+            "--rules",
+            "/tmp/sigma",
+            "--json",
+        ])
+        .expect("valid Sigma doctor command");
+
+        match cli.command {
+            Some(Commands::Sigma {
+                action:
+                    SigmaAction::Doctor {
+                        json,
+                        platform,
+                        rules,
+                    },
+            }) => {
+                assert!(json);
+                assert_eq!(platform, Some(SigmaPlatform::Windows));
+                assert_eq!(rules, Some(std::path::PathBuf::from("/tmp/sigma")));
+            }
+            _ => panic!("expected Sigma doctor command"),
+        }
+    }
+
+    #[test]
+    fn service_accepts_restart() {
+        let cli =
+            Cli::try_parse_from(["rustinel", "service", "restart"]).expect("restart should parse");
+
+        match cli.command {
+            Some(Commands::Service { action }) => {
+                assert!(matches!(action, ServiceAction::Restart));
+            }
+            _ => panic!("expected service command"),
+        }
+    }
+
+    #[test]
+    fn service_accepts_status() {
+        let cli =
+            Cli::try_parse_from(["rustinel", "service", "status"]).expect("status should parse");
+
+        match cli.command {
+            Some(Commands::Service { action }) => {
+                assert!(matches!(action, ServiceAction::Status));
+            }
+            _ => panic!("expected service command"),
+        }
+    }
+
+    #[test]
+    fn rules_list_accepts_catalog_url() {
+        let cli = Cli::try_parse_from([
+            "rustinel",
+            "rules",
+            "list",
+            "--catalog-url",
+            "https://github.com/Karib0u/rustinel-rules/releases/download/v0.2.0/index.json",
+        ])
+        .expect("rules list should parse");
+
+        match cli.command {
+            Some(Commands::Rules {
+                action: RulesAction::List { catalog_url, .. },
+            }) => {
+                assert!(catalog_url.ends_with("/index.json"));
+            }
+            _ => panic!("expected rules list command"),
+        }
+    }
+
+    #[test]
+    fn rules_install_requires_pack() {
+        let cli = Cli::try_parse_from(["rustinel", "rules", "install", "linux-essential"])
+            .expect("rules install should parse");
+
+        match cli.command {
+            Some(Commands::Rules {
+                action: RulesAction::Install { pack, .. },
+            }) => {
+                assert_eq!(pack, "linux-essential");
+            }
+            _ => panic!("expected rules install command"),
+        }
+    }
+}

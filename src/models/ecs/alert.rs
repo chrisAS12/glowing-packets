@@ -1,0 +1,860 @@
+use super::helpers::{basename, parse_u64};
+use super::user::apply_user_fields;
+use crate::models::{MatchDetails, ProcessContext, Provenance, YaraScanSource};
+use serde::Serialize;
+use std::collections::BTreeMap;
+
+#[derive(Serialize)]
+pub struct DnsAnswer {
+    #[serde(rename = "data")]
+    pub data: String,
+}
+
+/// ECS-compliant alert structure for SIEM ingestion
+#[derive(Serialize)]
+pub struct EcsAlert {
+    /// Event timestamp in ISO 8601 format
+    #[serde(rename = "@timestamp")]
+    pub timestamp: String,
+
+    /// Native ordering token from the event source, when available.
+    #[serde(rename = "event.sequence", skip_serializing_if = "Option::is_none")]
+    pub event_source_seq: Option<u64>,
+
+    /// Order in which the sensor pipeline canonicalized this event.
+    #[serde(rename = "edr.event.ingest_seq")]
+    pub event_ingest_seq: u64,
+
+    /// Known fidelity limitations on populated event fields.
+    #[serde(
+        rename = "edr.event.provenance",
+        skip_serializing_if = "Provenance::is_empty"
+    )]
+    pub event_provenance: Provenance,
+    #[serde(
+        rename = "edr.process.windows_metadata",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub windows_process_metadata: Option<Box<crate::models::WindowsProcessMetadata>>,
+
+    /// ECS schema version
+    #[serde(rename = "ecs.version")]
+    pub ecs_version: String,
+
+    /// Aggregated repeat count (only present on rollup alerts emitted at window close)
+    #[serde(rename = "event.count", skip_serializing_if = "Option::is_none")]
+    pub event_count: Option<u64>,
+
+    /// Event kind (always "alert" for detections)
+    #[serde(rename = "event.kind")]
+    pub event_kind: String,
+
+    /// Event category for classification
+    #[serde(rename = "event.category", skip_serializing_if = "Vec::is_empty")]
+    pub event_category: Vec<String>,
+
+    /// Event type (subcategory)
+    #[serde(rename = "event.type", skip_serializing_if = "Vec::is_empty")]
+    pub event_type: Vec<String>,
+
+    /// Event action
+    #[serde(rename = "event.action", skip_serializing_if = "Option::is_none")]
+    pub event_action: Option<String>,
+
+    /// Event code (e.g. Windows Event ID / Sysmon Event ID)
+    #[serde(rename = "event.code", skip_serializing_if = "Option::is_none")]
+    pub event_code: Option<String>,
+
+    /// Event severity (numeric)
+    #[serde(rename = "event.severity", skip_serializing_if = "Option::is_none")]
+    pub event_severity: Option<u8>,
+
+    /// ECS module (integration name)
+    #[serde(rename = "event.module")]
+    pub event_module: String,
+
+    /// ECS dataset within the module
+    #[serde(rename = "event.dataset")]
+    pub event_dataset: String,
+
+    /// Source that generated the event
+    #[serde(rename = "event.provider")]
+    pub event_provider: String,
+
+    /// Host OS type for the sensor that produced the event.
+    #[serde(rename = "host.os.type")]
+    pub host_os_type: String,
+
+    /// Host OS family for the sensor that produced the event.
+    #[serde(rename = "host.os.family")]
+    pub host_os_family: String,
+
+    /// Detection rule name
+    #[serde(rename = "rule.name")]
+    pub rule_name: String,
+
+    /// Detection rule description / IOC comment
+    #[serde(rename = "rule.description", skip_serializing_if = "Option::is_none")]
+    pub rule_description: Option<String>,
+
+    /// Detection rule ID
+    #[serde(rename = "rule.id", skip_serializing_if = "Option::is_none")]
+    pub rule_id: Option<String>,
+
+    /// Sigma rule author. ECS models authors as a multi-value field.
+    #[serde(rename = "rule.author", skip_serializing_if = "Option::is_none")]
+    pub rule_author: Option<Vec<String>>,
+
+    /// References supplied by the Sigma rule author.
+    #[serde(rename = "rule.reference", skip_serializing_if = "Vec::is_empty")]
+    pub rule_reference: Vec<String>,
+
+    /// Original Sigma tags, including ATT&CK classifications.
+    #[serde(rename = "tags", skip_serializing_if = "Vec::is_empty")]
+    pub tags: Vec<String>,
+
+    /// Detection severity (informational, low, medium, high, critical)
+    #[serde(rename = "edr.rule.severity")]
+    pub edr_rule_severity: String,
+
+    /// Detection engine (Sigma, Yara, Ioc)
+    #[serde(rename = "edr.rule.engine")]
+    pub edr_rule_engine: String,
+
+    /// Original Sigma level before normalization to Rustinel severity.
+    #[serde(rename = "edr.sigma.level", skip_serializing_if = "Option::is_none")]
+    pub edr_sigma_level: Option<String>,
+
+    /// Sigma rule lifecycle status.
+    #[serde(rename = "edr.sigma.status", skip_serializing_if = "Option::is_none")]
+    pub edr_sigma_status: Option<String>,
+
+    /// Present only when a rule exceeded fixed metadata size limits.
+    #[serde(
+        rename = "edr.sigma.metadata_truncated",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub edr_sigma_metadata_truncated: Option<bool>,
+
+    #[serde(rename = "threat.framework", skip_serializing_if = "Option::is_none")]
+    pub threat_framework: Option<String>,
+    #[serde(rename = "threat.tactic.id", skip_serializing_if = "Vec::is_empty")]
+    pub threat_tactic_id: Vec<String>,
+    #[serde(rename = "threat.tactic.name", skip_serializing_if = "Vec::is_empty")]
+    pub threat_tactic_name: Vec<String>,
+    #[serde(
+        rename = "threat.tactic.reference",
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    pub threat_tactic_reference: Vec<String>,
+    #[serde(rename = "threat.technique.id", skip_serializing_if = "Vec::is_empty")]
+    pub threat_technique_id: Vec<String>,
+    #[serde(
+        rename = "threat.technique.reference",
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    pub threat_technique_reference: Vec<String>,
+    #[serde(
+        rename = "threat.technique.subtechnique.id",
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    pub threat_subtechnique_id: Vec<String>,
+    #[serde(
+        rename = "threat.technique.subtechnique.reference",
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    pub threat_subtechnique_reference: Vec<String>,
+
+    /// Artifact inspected for a YARA detection. This remains present regardless
+    /// of match-debug verbosity and does not replace the originating provider.
+    #[serde(
+        rename = "edr.yara.scan_source",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub edr_yara_scan_source: Option<YaraScanSource>,
+
+    // ========================================================================
+    // Process Fields
+    // ========================================================================
+    #[serde(rename = "process.executable", skip_serializing_if = "Option::is_none")]
+    pub process_executable: Option<String>,
+
+    /// Linux source used to populate `process.executable`.
+    #[serde(
+        rename = "edr.process.image_source",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub edr_process_image_source: Option<String>,
+    /// True when `process.executable` is missing its captured suffix.
+    #[serde(
+        rename = "edr.process.image_truncated",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub edr_process_image_truncated: Option<bool>,
+
+    /// Kernel cgroup identifier measured for a Linux process exec.
+    #[serde(
+        rename = "edr.process.cgroup_id",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub edr_process_cgroup_id: Option<String>,
+    /// Cgroup v2 path resolved from `edr.process.cgroup_id`. Present with no
+    /// `container.id` for a host process.
+    #[serde(
+        rename = "edr.process.cgroup_path",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub edr_process_cgroup_path: Option<String>,
+
+    // ========================================================================
+    // Container Fields
+    // ========================================================================
+    #[serde(rename = "container.id", skip_serializing_if = "Option::is_none")]
+    pub container_id: Option<String>,
+    #[serde(rename = "container.runtime", skip_serializing_if = "Option::is_none")]
+    pub container_runtime: Option<String>,
+
+    #[serde(
+        rename = "edr.process.real_user_id",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub edr_process_real_user_id: Option<String>,
+    #[serde(
+        rename = "edr.process.real_group_id",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub edr_process_real_group_id: Option<String>,
+    #[serde(
+        rename = "edr.process.effective_user_id",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub edr_process_effective_user_id: Option<String>,
+    #[serde(
+        rename = "edr.process.effective_group_id",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub edr_process_effective_group_id: Option<String>,
+    #[serde(
+        rename = "edr.process.mount_namespace",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub edr_process_mount_namespace: Option<String>,
+    #[serde(
+        rename = "edr.process.pid_namespace",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub edr_process_pid_namespace: Option<String>,
+    #[serde(
+        rename = "edr.process.network_namespace",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub edr_process_network_namespace: Option<String>,
+    #[serde(
+        rename = "edr.process.session_id",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub edr_process_session_id: Option<String>,
+    #[serde(
+        rename = "edr.process.controlling_tty",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub edr_process_controlling_tty: Option<String>,
+    #[serde(
+        rename = "edr.process.kernel_start_boottime",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub edr_process_kernel_start_boottime: Option<u64>,
+
+    #[serde(rename = "process.name", skip_serializing_if = "Option::is_none")]
+    pub process_name: Option<String>,
+
+    #[serde(
+        rename = "process.command_line",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub process_command_line: Option<String>,
+
+    #[serde(rename = "process.pid", skip_serializing_if = "Option::is_none")]
+    pub process_pid: Option<u64>,
+
+    #[serde(
+        rename = "process.parent.executable",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub process_parent_executable: Option<String>,
+
+    #[serde(
+        rename = "process.parent.name",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub process_parent_name: Option<String>,
+
+    #[serde(
+        rename = "process.parent.command_line",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub process_parent_command_line: Option<String>,
+
+    #[serde(rename = "process.parent.pid", skip_serializing_if = "Option::is_none")]
+    pub process_parent_pid: Option<u64>,
+
+    #[serde(
+        rename = "process.working_directory",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub process_working_directory: Option<String>,
+
+    #[serde(
+        rename = "edr.process.integrity_level",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub edr_process_integrity_level: Option<String>,
+
+    #[serde(
+        rename = "process.pe.original_file_name",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub process_original_file_name: Option<String>,
+
+    #[serde(rename = "process.pe.product", skip_serializing_if = "Option::is_none")]
+    pub process_product: Option<String>,
+
+    #[serde(
+        rename = "process.pe.description",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub process_description: Option<String>,
+
+    #[serde(rename = "process.pe.company", skip_serializing_if = "Option::is_none")]
+    pub process_company: Option<String>,
+
+    #[serde(
+        rename = "process.pe.file_version",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub process_file_version: Option<String>,
+
+    #[serde(rename = "process.hash.md5", skip_serializing_if = "Option::is_none")]
+    pub process_hash_md5: Option<String>,
+
+    #[serde(rename = "process.hash.sha1", skip_serializing_if = "Option::is_none")]
+    pub process_hash_sha1: Option<String>,
+
+    #[serde(
+        rename = "process.hash.sha256",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub process_hash_sha256: Option<String>,
+
+    #[serde(rename = "process.pe.imphash", skip_serializing_if = "Option::is_none")]
+    pub process_pe_imphash: Option<String>,
+
+    #[serde(rename = "user.name", skip_serializing_if = "Option::is_none")]
+    pub user_name: Option<String>,
+
+    #[serde(rename = "user.id", skip_serializing_if = "Option::is_none")]
+    pub user_id: Option<String>,
+
+    #[serde(rename = "user.domain", skip_serializing_if = "Option::is_none")]
+    pub user_domain: Option<String>,
+
+    #[serde(rename = "winlog.logon.id", skip_serializing_if = "Option::is_none")]
+    pub winlog_logon_id: Option<String>,
+
+    #[serde(rename = "winlog.logon.guid", skip_serializing_if = "Option::is_none")]
+    pub winlog_logon_guid: Option<String>,
+
+    // ========================================================================
+    // Network Fields
+    // ========================================================================
+    #[serde(rename = "destination.ip", skip_serializing_if = "Option::is_none")]
+    pub destination_ip: Option<String>,
+
+    #[serde(rename = "destination.port", skip_serializing_if = "Option::is_none")]
+    pub destination_port: Option<u16>,
+
+    #[serde(rename = "source.ip", skip_serializing_if = "Option::is_none")]
+    pub source_ip: Option<String>,
+
+    #[serde(rename = "source.port", skip_serializing_if = "Option::is_none")]
+    pub source_port: Option<u16>,
+
+    #[serde(rename = "destination.domain", skip_serializing_if = "Option::is_none")]
+    pub destination_domain: Option<String>,
+
+    #[serde(rename = "network.transport", skip_serializing_if = "Option::is_none")]
+    pub network_transport: Option<String>,
+
+    #[serde(rename = "network.type", skip_serializing_if = "Option::is_none")]
+    pub network_type: Option<String>,
+
+    #[serde(rename = "network.protocol", skip_serializing_if = "Option::is_none")]
+    pub network_protocol: Option<String>,
+
+    #[serde(rename = "network.direction", skip_serializing_if = "Option::is_none")]
+    pub network_direction: Option<String>,
+
+    // ========================================================================
+    // File Fields
+    // ========================================================================
+    #[serde(rename = "file.path", skip_serializing_if = "Option::is_none")]
+    pub file_path: Option<String>,
+
+    #[serde(rename = "file.name", skip_serializing_if = "Option::is_none")]
+    pub file_name: Option<String>,
+
+    #[serde(rename = "file.extension", skip_serializing_if = "Option::is_none")]
+    pub file_extension: Option<String>,
+
+    #[serde(rename = "file.created", skip_serializing_if = "Option::is_none")]
+    pub file_created: Option<String>,
+
+    #[serde(
+        rename = "edr.file.previous_created",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub edr_file_previous_created: Option<String>,
+
+    /// Which of this event's paths the sensor had to cut short: `target`,
+    /// `source`, or `source,target`. Absent when `file.path` is complete.
+    #[serde(
+        rename = "edr.file.path_truncated",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub edr_file_path_truncated: Option<String>,
+
+    /// `true` when the sensor captured only the start of the DNS message, so
+    /// `dns.question.name` ends where the capture did.
+    #[serde(
+        rename = "edr.dns.query_truncated",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub edr_dns_query_truncated: Option<String>,
+
+    #[serde(
+        rename = "file.pe.original_file_name",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub file_original_file_name: Option<String>,
+
+    #[serde(rename = "file.pe.product", skip_serializing_if = "Option::is_none")]
+    pub file_product: Option<String>,
+
+    #[serde(
+        rename = "file.pe.description",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub file_description: Option<String>,
+
+    #[serde(rename = "file.pe.company", skip_serializing_if = "Option::is_none")]
+    pub file_company: Option<String>,
+
+    #[serde(
+        rename = "file.pe.file_version",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub file_file_version: Option<String>,
+
+    #[serde(
+        rename = "file.code_signature.exists",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub file_code_signature_exists: Option<bool>,
+
+    #[serde(
+        rename = "file.code_signature.subject_name",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub file_code_signature_subject_name: Option<String>,
+
+    #[serde(
+        rename = "file.code_signature.status",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub file_code_signature_status: Option<String>,
+
+    #[serde(
+        rename = "file.code_signature.valid",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub file_code_signature_valid: Option<bool>,
+
+    // ========================================================================
+    // DLL Fields
+    // ========================================================================
+    #[serde(rename = "dll.name", skip_serializing_if = "Option::is_none")]
+    pub dll_name: Option<String>,
+
+    #[serde(rename = "dll.path", skip_serializing_if = "Option::is_none")]
+    pub dll_path: Option<String>,
+
+    #[serde(rename = "dll.hash.md5", skip_serializing_if = "Option::is_none")]
+    pub dll_hash_md5: Option<String>,
+
+    #[serde(rename = "dll.hash.sha1", skip_serializing_if = "Option::is_none")]
+    pub dll_hash_sha1: Option<String>,
+
+    #[serde(rename = "dll.hash.sha256", skip_serializing_if = "Option::is_none")]
+    pub dll_hash_sha256: Option<String>,
+
+    #[serde(rename = "dll.pe.imphash", skip_serializing_if = "Option::is_none")]
+    pub dll_pe_imphash: Option<String>,
+
+    // ========================================================================
+    // Registry Fields
+    // ========================================================================
+    #[serde(rename = "registry.path", skip_serializing_if = "Option::is_none")]
+    pub registry_path: Option<String>,
+
+    #[serde(rename = "registry.hive", skip_serializing_if = "Option::is_none")]
+    pub registry_hive: Option<String>,
+
+    #[serde(rename = "registry.key", skip_serializing_if = "Option::is_none")]
+    pub registry_key: Option<String>,
+
+    #[serde(rename = "registry.value", skip_serializing_if = "Option::is_none")]
+    pub registry_value: Option<String>,
+
+    #[serde(
+        rename = "registry.data.strings",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub registry_data_strings: Option<Vec<String>>,
+
+    #[serde(
+        rename = "edr.registry.event_type",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub edr_registry_event_type: Option<String>,
+
+    #[serde(
+        rename = "edr.registry.new_name",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub edr_registry_new_name: Option<String>,
+
+    // ========================================================================
+    // DNS Fields
+    // ========================================================================
+    #[serde(rename = "dns.question.name", skip_serializing_if = "Option::is_none")]
+    pub dns_query: Option<String>,
+
+    #[serde(rename = "dns.answers", skip_serializing_if = "Option::is_none")]
+    pub dns_answers: Option<Vec<DnsAnswer>>,
+
+    #[serde(rename = "dns.response_code", skip_serializing_if = "Option::is_none")]
+    pub dns_response_code: Option<String>,
+
+    #[serde(rename = "dns.resolved_ip", skip_serializing_if = "Option::is_none")]
+    pub dns_resolved_ip: Option<Vec<String>>,
+
+    // ========================================================================
+    // Service Persistence Fields
+    // ========================================================================
+    #[serde(rename = "service.name", skip_serializing_if = "Option::is_none")]
+    pub service_name: Option<String>,
+
+    #[serde(
+        rename = "edr.service.executable",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub edr_service_executable: Option<String>,
+
+    #[serde(rename = "edr.service.type", skip_serializing_if = "Option::is_none")]
+    pub edr_service_type: Option<String>,
+
+    #[serde(
+        rename = "edr.service.start_type",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub edr_service_start_type: Option<String>,
+
+    #[serde(
+        rename = "edr.service.account_name",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub edr_service_account_name: Option<String>,
+
+    /// Windows Event Log provider that wrote the record, as Sigma's
+    /// `Provider_Name` reads it. `event.provider` names the Rustinel sensor
+    /// instead, so an analyst reading a service alert cannot recover this from
+    /// the rest of the document.
+    #[serde(
+        rename = "edr.event_log.provider_name",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub edr_event_log_provider_name: Option<String>,
+
+    // ========================================================================
+    // Task Scheduler Persistence Fields
+    // ========================================================================
+    #[serde(rename = "edr.task.name", skip_serializing_if = "Option::is_none")]
+    pub edr_task_name: Option<String>,
+
+    #[serde(rename = "edr.task.content", skip_serializing_if = "Option::is_none")]
+    pub edr_task_content: Option<String>,
+
+    #[serde(rename = "edr.task.user_name", skip_serializing_if = "Option::is_none")]
+    pub edr_task_user_name: Option<String>,
+
+    // ========================================================================
+    // PowerShell Fields
+    // ========================================================================
+    #[serde(
+        rename = "edr.powershell.script_block_text",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub edr_powershell_script_block_text: Option<String>,
+
+    #[serde(
+        rename = "edr.powershell.script_block_id",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub edr_powershell_script_block_id: Option<String>,
+
+    #[serde(
+        rename = "edr.powershell.message_number",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub edr_powershell_message_number: Option<String>,
+
+    #[serde(
+        rename = "edr.powershell.message_total",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub edr_powershell_message_total: Option<String>,
+
+    #[serde(
+        rename = "edr.powershell.context_info",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub edr_powershell_context_info: Option<String>,
+
+    #[serde(
+        rename = "edr.powershell.payload",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub edr_powershell_payload: Option<String>,
+
+    #[serde(
+        rename = "edr.powershell.data",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub edr_powershell_data: Option<String>,
+
+    // ========================================================================
+    // WMI Fields
+    // ========================================================================
+    #[serde(rename = "edr.wmi.operation", skip_serializing_if = "Option::is_none")]
+    pub edr_wmi_operation: Option<String>,
+
+    #[serde(rename = "edr.wmi.query", skip_serializing_if = "Option::is_none")]
+    pub edr_wmi_query: Option<String>,
+
+    #[serde(rename = "edr.wmi.namespace", skip_serializing_if = "Option::is_none")]
+    pub edr_wmi_namespace: Option<String>,
+
+    #[serde(rename = "edr.wmi.event_type", skip_serializing_if = "Option::is_none")]
+    pub edr_wmi_event_type: Option<String>,
+
+    // ========================================================================
+    // Process Target Fields
+    // ========================================================================
+    #[serde(
+        rename = "edr.process.target_image",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub edr_process_target_image: Option<String>,
+
+    // ========================================================================
+    // Windows Security Channel Fields
+    // ========================================================================
+    /// The decoded Security audit record, under its own Windows field names.
+    ///
+    /// The channel's event families have almost no fields in common, so the
+    /// ones that map onto ECS are lifted into the standard fields above and the
+    /// whole record is carried here as well. Nested rather than flattened so a
+    /// Windows field name can never collide with an ECS one.
+    #[serde(rename = "edr.security", skip_serializing_if = "Option::is_none")]
+    pub edr_security: Option<BTreeMap<String, String>>,
+
+    // ========================================================================
+    // Related Fields
+    // ========================================================================
+    #[serde(rename = "related.ip", skip_serializing_if = "Option::is_none")]
+    pub related_ip: Option<Vec<String>>,
+
+    #[serde(rename = "related.user", skip_serializing_if = "Option::is_none")]
+    pub related_user: Option<Vec<String>>,
+
+    // ========================================================================
+    // Debug Match Details
+    // ========================================================================
+    #[serde(rename = "edr.match", skip_serializing_if = "Option::is_none")]
+    pub edr_match: Option<MatchDetails>,
+
+    // ========================================================================
+    // Replay Provenance
+    // ========================================================================
+    /// Present only on alerts produced by `rustinel replay`. Its absence is what
+    /// makes an alert a live detection, so this must never be set by the live
+    /// pipeline.
+    #[serde(rename = "edr.replay", skip_serializing_if = "Option::is_none")]
+    pub edr_replay: Option<ReplayProvenance>,
+
+    /// Present only on `agent::loss::*` alerts, which describe the agent
+    /// rather than a detection.
+    #[serde(flatten, skip_serializing_if = "Option::is_none")]
+    pub edr_agent_loss: Option<AgentLoss>,
+
+    /// Present only on `agent::tamper::*` alerts, which describe the agent
+    /// rather than a detection.
+    #[serde(flatten, skip_serializing_if = "Option::is_none")]
+    pub edr_agent_tamper: Option<AgentTamper>,
+
+    /// Present only on `agent::lifecycle::*` alerts.
+    #[serde(flatten, skip_serializing_if = "Option::is_none")]
+    pub edr_agent_lifecycle: Option<AgentLifecycle>,
+}
+
+/// What an agent tamper alert observed.
+#[derive(Serialize)]
+pub struct AgentTamper {
+    /// Alert kind, the last segment of `rule.name`: `etw_provider_modified`.
+    #[serde(skip)]
+    pub kind: &'static str,
+    /// What changed: `provider_disabled`, `keywords_changed`, `level_changed`,
+    /// or `kernel_flags_changed`.
+    #[serde(rename = "edr.agent.tamper.change")]
+    pub change: &'static str,
+    /// The trace session the provider belongs to.
+    #[serde(rename = "edr.agent.tamper.session")]
+    pub session: &'static str,
+    /// Provider name.
+    #[serde(rename = "edr.agent.tamper.provider")]
+    pub provider: &'static str,
+    #[serde(rename = "edr.agent.tamper.provider_guid")]
+    pub provider_guid: String,
+    /// What the agent configured, for example `level 4, keywords 0x1301`.
+    #[serde(rename = "edr.agent.tamper.expected")]
+    pub expected: String,
+    /// What the session reports now. `not enabled` when the provider is off.
+    #[serde(rename = "edr.agent.tamper.observed")]
+    pub observed: String,
+    /// Plain-language summary, repeated in `rule.description`.
+    #[serde(skip)]
+    pub detail: String,
+}
+
+/// Which lifecycle transition an alert reports.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LifecycleKind {
+    Stopping,
+    UncleanShutdown,
+}
+
+/// What a lifecycle alert reports.
+#[derive(Serialize)]
+pub struct AgentLifecycle {
+    #[serde(skip)]
+    pub kind: LifecycleKind,
+    /// Why the agent is stopping: `signal`, `service_stop`, or `sensor_failure`.
+    /// For `unclean_shutdown` it is `no_clean_stop_marker`.
+    #[serde(rename = "edr.agent.lifecycle.reason")]
+    pub reason: &'static str,
+    /// RFC 3339 time of the previous run's last telemetry snapshot, when one
+    /// was found. Only set on `unclean_shutdown`.
+    #[serde(
+        rename = "edr.agent.lifecycle.last_snapshot_at",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub last_snapshot_at: Option<String>,
+}
+
+/// What a sensor loss alert measured.
+#[derive(Serialize)]
+pub struct AgentLoss {
+    /// The stage that lost events: a bounded pipeline queue such as
+    /// `sensor_events`, or a kernel-side source such as `etw_session` or
+    /// `ebpf_ring`.
+    #[serde(rename = "edr.agent.loss.channel")]
+    pub channel: &'static str,
+    /// What was lost at that stage: a sensor event category as named in
+    /// `telemetry.json`, or the eBPF ring or collector that lost it.
+    #[serde(rename = "edr.agent.loss.category")]
+    pub category: String,
+    /// Events of that category lost inside the window.
+    #[serde(rename = "edr.agent.loss.dropped")]
+    pub dropped: u64,
+    /// Seconds the count covers. It is the configured window, except on the
+    /// final alert at shutdown, which covers the remainder.
+    #[serde(rename = "edr.agent.loss.window_secs")]
+    pub window_secs: u64,
+}
+
+/// Where a replayed alert came from.
+///
+/// Every value is read from the recording's manifest, so replaying the same
+/// recording twice produces byte-identical provenance.
+#[derive(Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct ReplayProvenance {
+    /// File name of the recording payload that was replayed.
+    pub recording: String,
+    /// Platform whose sensors produced the recorded events.
+    pub platform: String,
+    /// RFC 3339 timestamp of when the recording was started.
+    pub recorded_at: String,
+}
+
+impl EcsAlert {
+    pub(super) fn apply_process_context(ecs: &mut EcsAlert, context: &ProcessContext) {
+        if ecs.process_executable.is_none() {
+            ecs.process_executable = context.image.clone();
+        }
+        if ecs.process_command_line.is_none() {
+            ecs.process_command_line = context.command_line.clone();
+        }
+        if ecs.process_pid.is_none() {
+            ecs.process_pid = parse_u64(&context.process_id);
+        }
+        if ecs.process_parent_executable.is_none() {
+            ecs.process_parent_executable = context.parent_image.clone();
+        }
+        if ecs.process_parent_command_line.is_none() {
+            ecs.process_parent_command_line = context.parent_command_line.clone();
+        }
+        if ecs.process_parent_pid.is_none() {
+            ecs.process_parent_pid = parse_u64(&context.parent_process_id);
+        }
+        if ecs.process_working_directory.is_none() {
+            ecs.process_working_directory = context.current_directory.clone();
+        }
+        if ecs.edr_process_integrity_level.is_none() {
+            ecs.edr_process_integrity_level = context.integrity_level.clone();
+        }
+        if ecs.process_original_file_name.is_none() {
+            ecs.process_original_file_name = context.original_file_name.clone();
+        }
+        if ecs.process_product.is_none() {
+            ecs.process_product = context.product.clone();
+        }
+        if ecs.process_description.is_none() {
+            ecs.process_description = context.description.clone();
+        }
+        if ecs.process_company.is_none() {
+            ecs.process_company = context.company.clone();
+        }
+        if ecs.process_file_version.is_none() {
+            ecs.process_file_version = context.file_version.clone();
+        }
+        apply_user_fields(ecs, context.user.as_deref());
+
+        if ecs.process_name.is_none() {
+            ecs.process_name = ecs.process_executable.as_deref().and_then(basename);
+        }
+
+        if ecs.process_parent_name.is_none() {
+            ecs.process_parent_name = ecs.process_parent_executable.as_deref().and_then(basename);
+        }
+    }
+}

@@ -1,0 +1,298 @@
+# Development
+
+## Toolchain
+
+| Target | Needs |
+| --- | --- |
+| All platforms | Rust 1.98 or later (the repository pins Rust 1.98.1) |
+| Windows | Visual Studio Build Tools |
+| macOS | Xcode Command Line Tools |
+| Linux eBPF object | nightly Rust, `rust-src`, and `bpf-linker` |
+
+## Build and run
+
+```bash
+cargo build
+cargo build --release
+```
+
+Run the agent with the privileges it needs:
+
+=== "Linux and macOS"
+
+    ```bash
+    sudo cargo run -- run
+    ```
+
+=== "Windows"
+
+    From an elevated PowerShell:
+
+    ```powershell
+    cargo run -- run
+    ```
+
+On macOS, live Endpoint Security events also need a signed bundle, see [macOS](#macos).
+Building and testing do not.
+
+The release profile sets `panic = "abort"`; development builds and tests unwind, including `cargo test --release`.
+See [Sensor callback failures](operations.md#sensor-callback-failures) for the operator-visible behavior and [Callback panic audit](architecture.md#callback-panic-audit) for the code invariants.
+
+## Linux eBPF object
+
+The kernel and userspace event types are declared once, in the `ebpf-common` crate that both `ebpf/` and the agent depend on.
+Change a `repr(C)` event or layout there, and both sides rebuild against it.
+
+`build.rs` picks the embedded object in this order:
+
+1. `RUSTINEL_EBPF_STUB=1` embeds a stub with no programs.
+   The sensor refuses to start with it, and the build prints a warning.
+2. `RUSTINEL_EBPF_PREBUILT=1` embeds `ebpf/rustinel-ebpf.o` whatever its age, and fails if the file is missing.
+   Setting both variables is an error.
+3. Otherwise `ebpf/rustinel-ebpf.o` is embedded only when it is not older than `ebpf/`, `ebpf-common/`, and their manifests.
+   An older copy is ignored with a build warning, and the object is compiled from source with nightly.
+
+The file is ignored by Git, and a stale copy is never embedded unnoticed.
+The agent logs the chosen source (`prebuilt`, `source`, or `stub`) when it loads the embedded object.
+Changing either variable re-runs the build script.
+
+To compile the object yourself, for example with a pinned nightly:
+
+```bash
+rustup toolchain install nightly
+rustup component add rust-src --toolchain nightly
+cargo install bpf-linker
+
+cd ebpf
+cargo +nightly build --release --bin rustinel-ebpf
+cp target/bpfel-unknown-none/release/rustinel-ebpf rustinel-ebpf.o
+```
+
+To try a new object without rebuilding the agent:
+
+```bash
+sudo env RUSTINEL_EBPF_OBJECT=$PWD/ebpf/rustinel-ebpf.o ./target/release/rustinel run
+```
+
+For `cargo check`, `clippy`, or unit tests without the nightly toolchain, set `RUSTINEL_EBPF_STUB=1`.
+The resulting binary cannot collect telemetry.
+
+### eBPF load smoke test
+
+Compilation alone does not run the kernel verifier.
+After building the eBPF object and release agent as above, run the same load, attachment, event-family, and demo-alert checks used by CI:
+
+```bash
+cargo build --locked --release
+sudo python3 tests/ebpf_load_smoke.py \
+  --binary target/release/rustinel \
+  --ebpf-object ebpf/rustinel-ebpf.o \
+  --rules-dir rules/sigma \
+  --artifacts-dir target/ebpf-load-smoke
+sudo python3 tests/native_capture_contract.py \
+  --binary "$PWD/target/release/rustinel"
+```
+
+The smoke test requires root, `curl`, network access, and a Linux 5.8 or newer kernel with BTF.
+It verifies that the supplied object is embedded in the binary before starting the agent.
+CI runs the commands on both the current GitHub runner kernel and Linux 5.10; use a VM when reproducing the 5.10 leg locally.
+
+## macOS
+
+Endpoint Security needs a bundle signed with the `com.apple.developer.endpoint-security.client` entitlement.
+Build one with your Developer ID and an Endpoint Security provisioning profile:
+
+```bash
+cargo build --release
+scripts/macos/package-app.sh \
+  --binary target/release/rustinel \
+  --output target/release/Rustinel.app \
+  --profile "$HOME/Downloads/rustinel.provisionprofile" \
+  --identity "Developer ID Application: Example (TEAMID)"
+```
+
+Grant the bundle Full Disk Access, then run `sudo ./target/release/Rustinel.app/Contents/MacOS/rustinel run`.
+
+`scripts/macos/test-bpf-lifecycle.sh` builds and signs the bundle, then checks interface reconcile, restart, and removal with a live test and a `feth` interface; it needs root and a Terminal with Full Disk Access.
+
+On a SIP-disabled test Mac, `--adhoc` replaces `--profile` and `--identity`.
+Never use it on a normal Mac.
+
+Release signing in CI reads `MACOS_SIGN_IDENTITY`, `MACOS_CERT_P12_BASE64`, `MACOS_CERT_PASSWORD`, `MACOS_PROVISIONING_PROFILE_BASE64`, `MACOS_NOTARY_APPLE_ID`, `MACOS_NOTARY_TEAM_ID`, and `MACOS_NOTARY_PASSWORD`.
+
+## Release signing keys
+
+Release checksum files and the rules catalog are signed with the Minisign key configured as `RELEASE_MINISIGN_KEY` in both release repositories.
+Its public half is `release-minisign.pub`, embedded in the binary, and `rustinel update` also pins the Apple Developer Team ID of the macOS app.
+
+- **Rotating the Minisign key:** update the embedded public key and both repository secrets together before publishing another release.
+  Installed binaries trust only the old key, so first publish a transition release that trusts both keys, or require a manual install after rotation.
+- **Changing the Apple signing team:** update the pinned Team ID in the updater and the macOS release validation in the same change, then publish a release signed by the existing Minisign key so installed clients can authenticate it.
+
+## Tests
+
+```bash
+cargo test --locked
+cargo fmt --all
+cargo clippy --locked --all-targets -- -D clippy::all
+```
+
+The normal suite uses synthetic events and needs no privileges.
+
+### Live tests
+
+Ignored by default.
+Run them on a disposable machine:
+
+| Test | Command | Needs |
+| --- | --- | --- |
+| Memory scanning | `cargo build --locked --example memory_target && cargo test --locked --test yara_memory -- --include-ignored` | Administrator, or root with process-memory access |
+| Active response | `cargo test --locked --test active_response -- --include-ignored` | Same |
+| Windows process user | `cargo test --locked --test windows_process_user -- --ignored --nocapture` | Administrator |
+| Windows service recovery | `cargo test --locked --lib platform::windows::tests::configures_recovery_on_created_and_existing_services -- --ignored` | Administrator, creates and deletes a temporary SCM service |
+| Linux process identity | `cargo test --test linux_task_identity live_task_identity_matches_proc -- --ignored` | root, `RUSTINEL_EBPF_OBJECT` set |
+| Linux eBPF memory scanning | `cargo build --example memory_target && cargo test --test linux_task_identity live_ebpf_process_reaches_yara_memory_scan -- --ignored` | root, process-memory access, `RUSTINEL_EBPF_OBJECT` set |
+| Linux socket fields | `cargo test --test linux_socket_tuple live_tuple_and_connection_churn -- --ignored` | root, `RUSTINEL_EBPF_OBJECT` set, a non-loopback interface |
+| macOS collector loss | `sudo python3 scripts/macos/test-collector-loss.py <agent pid> <telemetry.json>` | A signed agent running as root. Suspends it for 10 seconds |
+
+Linux kernel-dependent changes should be checked on several kernels, for example 5.10, 5.15, 6.1, and 6.8.
+Tests that hide BTF must run in a VM or a private mount namespace, never on a shared host.
+
+### Windows ETW decoder fixtures
+
+The Windows ETW decoders read a record through the `EtwHeader` and `EtwProperties` traits in `src/sensor/windows/etw/props.rs`.
+The sensor implements them for ferrisetw, and the tests implement them for records saved as JSON under `tests/fixtures/etw`.
+`src/sensor/windows/etw/fixture_tests.rs` feeds each fixture through the same routing and `decode_*` functions the live sensor uses, so `cargo test` on Windows covers them without a session.
+The fixtures are plain JSON, but the tests that read them only compile on Windows.
+
+Each fixture file has a `provenance` block (Windows build, date, host, and what the scenario did) and a list of `records` in arrival order.
+Keep related records together and in order: the Kernel-File and Kernel-Registry decoders join pathless events to earlier naming events.
+
+To record a new one on a disposable Windows machine, as Administrator:
+
+1. Set `RUSTINEL_ETW_RECORD` to an output file and start `rustinel capture`.
+   The recorder saves the header and every property the decoders read, one JSON object per line.
+   It writes nothing until a file named `<output>.on` exists, so create that file just before the activity and delete it right after.
+   `RUSTINEL_ETW_RECORD_MAX` (default 5000) caps the record count.
+2. Run the activity, then stop `rustinel capture` and remove any leftover `rustinel-etw-*` session with `logman stop <name> -ets`.
+3. Pick the records the scenario needs.
+   A file or registry write names its target only by kernel object, so keep the earlier `CreateKey`/`OpenKey` or file-create record for the same object.
+4. Wrap them as `{"provenance": {...}, "records": [...]}`, save the file, and add a test in `fixture_tests.rs` that asserts the canonical fields.
+
+Recordings contain command lines, paths, and user names from the machine.
+Read them before committing, and delete or replace anything that identifies a real person.
+
+### Linux ring buffer fixtures
+
+The `drain_process_ring`, `drain_network_ring`, `drain_file_ring`, and `drain_dns_ring` functions in `src/sensor/linux/ebpf.rs` read records through the `RingSource` trait.
+The sensor implements it for the aya ring buffer, and the tests implement it for records saved as hex under `tests/fixtures/linux_ring`.
+`src/sensor/linux/ebpf/ring_fixture_tests.rs` feeds each fixture through the real drain functions, so `cargo test` on Linux covers decoding, the telemetry counters, and the file directory index without root or a loaded program.
+
+Each fixture file has a `provenance` block (kernel, date, host, and what the scenario did) and a list of `{"ring", "hex"}` records in arrival order.
+Keep a file's records in order: the file drain joins relative paths to earlier directory opens.
+The checked-in fixtures were recorded on lab-ubuntu (kernel 7.0.0-38) and cut by hand where a provenance note says so.
+
+To record a new one on a disposable Linux machine, as root:
+
+1. Set `RUSTINEL_EBPF_RECORD` to an output file and start the agent.
+   Every record any of the four drains reads is appended as one `{"ring":"process","hex":"..."}` line, before it is decoded, so short reads are kept.
+2. Run the activity, then stop the agent.
+3. Pick the lines the scenario needs and wrap them as `{"provenance": {...}, "records": [...]}`.
+4. Save the file and add a test in `ring_fixture_tests.rs` that asserts the canonical fields and the counters.
+
+Recordings contain command lines, paths, and user names from the machine.
+Read them before committing, and delete or replace anything that identifies a real person.
+Fixed-size path buffers also carry stale bytes after the terminating NUL, which can be a path the kernel handled earlier, so inspect the whole record (`strings` on the decoded hex) and zero what does not belong.
+
+### macOS Endpoint Security fixtures
+
+The macOS decoders read a message through the `EsMessage` trait in `src/sensor/macos/esf/view.rs`.
+The sensor implements it for the live Endpoint Security `Message`, and the tests implement it for `EsRecord`, loaded from JSON under `tests/fixtures/esf`.
+`src/sensor/macos/esf/fixture_tests.rs` feeds each fixture through the same `build_sensor_event` the live handler calls, so `cargo test` on a Mac covers every `build_*_event` without a client, root, or the entitlement.
+
+Each fixture file has a `provenance` block (macOS build, architecture, date, and what the scenario did) and a list of `records` in arrival order.
+Keep related records together and in order: exec parent links resolve against earlier execs in the same file.
+
+To record new ones on a Mac with a Developer ID profile and a terminal that has Full Disk Access:
+
+```bash
+scripts/macos/record-esf-fixtures.sh
+```
+
+The script builds and signs the agent, starts it with `RUSTINEL_ESF_RECORD` set, runs the workloads under `/private/tmp/rustinel-esf-fixture`, and writes `tests/fixtures/esf/process_lifecycle.json` and `file_lifecycle.json`.
+To record by hand, run a signed agent with `RUSTINEL_ESF_RECORD=<file>`.
+It writes nothing until a file named `<file>.on` exists, so create that file just before the activity and delete it right after.
+`RUSTINEL_ESF_RECORD_MAX` (default 5000) caps the record count.
+Pick the records the scenario needs, wrap them as `{"provenance": {...}, "records": [...]}`, and add a test in `fixture_tests.rs`.
+
+Recordings contain command lines, paths, and uids from the machine.
+Read them before committing, and delete or replace anything that identifies a real person.
+
+### SigmaHQ compatibility gate
+
+CI loads every rule from the SigmaHQ commit pinned in `compatibility/sigmahq-baseline.json` and fails on parser errors or when the per-platform load counts drift from the baseline.
+To run it locally, check out that commit and run:
+
+```bash
+RUSTINEL_EBPF_STUB=1 RUSTINEL_SIGMA_CORPUS_DIR=/path/to/sigma \
+  cargo test --locked --test sigma_corpus_compatibility -- --include-ignored
+```
+
+### Replay fixture
+
+`tests/fixtures/replay/` holds a Windows recording and the rules it must trigger.
+`tests/replay_fixture.rs` replays it on every platform.
+To regenerate it on a Windows lab machine:
+
+1. `rustinel capture --output windows-powershell.ndjson`
+2. Run `windows-powershell-fixture.ps1`, then press Ctrl-C.
+3. Check the manifest says `"status": "complete"`.
+4. Copy both files into `tests/fixtures/replay/`.
+   Never edit a recording by hand: its checksum is verified.
+5. Run `cargo test --test replay_fixture`.
+
+### Detection gates
+
+CI runs the [rustinel-rules](https://github.com/Karib0u/rustinel-rules) atomic suite against Linux and Windows builds: it performs safe actions and checks each produces its alert.
+Release tags run it against every release artifact.
+The Linux and Windows checks are required on pull requests; a missing alert or an engine startup failure blocks merging.
+The JSON report contains failed trigger output, and CI uploads it with the engine output and logs even when the suite fails.
+Signed macOS atomics run on pushes to `main` and for release artifacts.
+
+Both [CI](https://github.com/Karib0u/rustinel/blob/main/.github/workflows/ci.yml) and [release](https://github.com/Karib0u/rustinel/blob/main/.github/workflows/release.yml) read one reviewed commit from `.github/atomic-rules-ref`, taken from the rules repository's `main` branch.
+To update it deliberately:
+
+1. Choose a reviewed `rustinel-rules` commit that is reachable from `main`.
+2. Set the full commit SHA in `.github/atomic-rules-ref`.
+3. Run a pull request with the complete Linux and Windows atomic suite, review its reports and logs, and merge only when both required checks pass.
+   The next signed macOS `main` run validates the same pin; do not move the pin past a failing macOS run.
+4. Before a release, confirm its artifact atomic matrix also passes with that exact SHA.
+   Intel macOS remains an explicitly optional release leg.
+
+## Documentation
+
+The docs use [Zensical](https://zensical.org/):
+
+```bash
+pip install zensical
+zensical serve
+```
+
+Parts of the reference are generated from code.
+After changing CLI flags, config options, or `FIELD_AVAILABILITY`, run:
+
+```bash
+cargo run --bin generate-docs
+```
+
+Tests fail when a generated section is out of date.
+Writing rules are in [CONTRIBUTING.md](https://github.com/Karib0u/rustinel/blob/main/CONTRIBUTING.md#writing-documentation).
+
+## Logging levels
+
+| Level | For |
+| --- | --- |
+| `trace` | High-volume internals |
+| `debug` | Troubleshooting detail. Nothing that fires on most events |
+| `info` | Lifecycle and detections |
+| `warn`, `error` | Degraded behavior and failures |

@@ -1,0 +1,468 @@
+//! Opening and verifying a behavioral recording.
+//!
+//! Replay reads a recording written by `rustinel capture` on any host, so it
+//! cannot assume the file is intact or that this build understands it. Every
+//! recording is checked before a single event is evaluated: the manifest must
+//! describe this payload, use a schema version this build knows, report a clean
+//! capture session, and match the payload's checksum. A recording that fails any
+//! of those is rejected with the reason, never partially replayed.
+
+use std::fs::File;
+use std::io::{BufRead, BufReader, Read};
+use std::path::{Path, PathBuf};
+
+use anyhow::{bail, Context};
+use sha2::{Digest, Sha256};
+
+use crate::capture::{manifest_path_for, CaptureManifest, CaptureStatus, CAPTURE_SCHEMA_VERSION};
+use crate::models::{CanonicalEvent, NormalizedEvent};
+
+/// Bytes read per checksum pass over the payload.
+const CHECKSUM_CHUNK_BYTES: usize = 64 * 1024;
+
+/// A verified recording, ready to replay.
+#[derive(Debug)]
+pub struct Recording {
+    payload_path: PathBuf,
+    manifest_path: PathBuf,
+    manifest: CaptureManifest,
+}
+
+impl Recording {
+    /// Open the recording at `payload_path` and verify it end to end.
+    pub fn open(payload_path: &Path) -> anyhow::Result<Self> {
+        if !payload_path.exists() {
+            bail!("recording not found: {}", payload_path.display());
+        }
+
+        let manifest_path = manifest_path_for(payload_path);
+        if !manifest_path.exists() {
+            bail!(
+                "recording {} has no manifest at {}; a recording is the payload and its manifest \
+                 sidecar, so copy both",
+                payload_path.display(),
+                manifest_path.display()
+            );
+        }
+
+        let body = std::fs::read_to_string(&manifest_path)
+            .with_context(|| format!("failed to read manifest {}", manifest_path.display()))?;
+        let manifest: CaptureManifest = serde_json::from_str(&body)
+            .with_context(|| format!("failed to parse manifest {}", manifest_path.display()))?;
+
+        verify(payload_path, &manifest_path, &manifest)?;
+
+        Ok(Self {
+            payload_path: payload_path.to_path_buf(),
+            manifest_path,
+            manifest,
+        })
+    }
+
+    pub fn payload_path(&self) -> &Path {
+        &self.payload_path
+    }
+
+    pub fn manifest_path(&self) -> &Path {
+        &self.manifest_path
+    }
+
+    pub fn manifest(&self) -> &CaptureManifest {
+        &self.manifest
+    }
+
+    /// Stream the recorded events in the order they were captured.
+    ///
+    /// The payload is not loaded into memory: a recording of a long session can
+    /// be much larger than the host has RAM for.
+    pub fn events(&self) -> anyhow::Result<RecordedEvents> {
+        let file = File::open(&self.payload_path)
+            .with_context(|| format!("failed to open recording {}", self.payload_path.display()))?;
+        Ok(RecordedEvents {
+            lines: BufReader::new(file).lines(),
+            payload_path: self.payload_path.clone(),
+            line_number: 0,
+            previous_ingest_seq: 0,
+        })
+    }
+}
+
+/// Iterator over the canonical events in a recording payload.
+pub struct RecordedEvents {
+    lines: std::io::Lines<BufReader<File>>,
+    payload_path: PathBuf,
+    line_number: u64,
+    previous_ingest_seq: u64,
+}
+
+impl Iterator for RecordedEvents {
+    type Item = anyhow::Result<CanonicalEvent>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            let line = match self.lines.next()? {
+                Ok(line) => line,
+                Err(err) => {
+                    return Some(Err(anyhow::Error::new(err)
+                        .context(format!("failed to read {}", self.payload_path.display()))))
+                }
+            };
+            self.line_number += 1;
+
+            if line.trim().is_empty() {
+                continue;
+            }
+
+            // The checksum already proved the payload is byte-for-byte what
+            // capture wrote, so a line that will not parse is a real defect
+            // rather than a damaged file. Name the line so it can be found.
+            let event: NormalizedEvent = match serde_json::from_str(&line).with_context(|| {
+                format!(
+                    "failed to parse event on line {} of {}",
+                    self.line_number,
+                    self.payload_path.display()
+                )
+            }) {
+                Ok(event) => event,
+                Err(err) => return Some(Err(err)),
+            };
+
+            if event.ingest_seq <= self.previous_ingest_seq {
+                return Some(Err(anyhow::anyhow!(
+                    "event on line {} of {} has ingest_seq {}, which does not follow {}",
+                    self.line_number,
+                    self.payload_path.display(),
+                    event.ingest_seq,
+                    self.previous_ingest_seq
+                )));
+            }
+            self.previous_ingest_seq = event.ingest_seq;
+            return Some(Ok(CanonicalEvent::from_normalized(event)));
+        }
+    }
+}
+
+fn verify(
+    payload_path: &Path,
+    manifest_path: &Path,
+    manifest: &CaptureManifest,
+) -> anyhow::Result<()> {
+    if manifest.schema_version != CAPTURE_SCHEMA_VERSION {
+        bail!(
+            "recording {} uses capture schema version {}, and this build of Rustinel \
+             (v{}) understands version {}; replay it with a Rustinel version that \
+             matches the recording",
+            payload_path.display(),
+            manifest.schema_version,
+            env!("CARGO_PKG_VERSION"),
+            CAPTURE_SCHEMA_VERSION
+        );
+    }
+
+    let payload_name = payload_path
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    if manifest.payload != payload_name {
+        bail!(
+            "manifest {} describes the recording '{}', not '{}'; the payload and its manifest \
+             have been separated or renamed",
+            manifest_path.display(),
+            manifest.payload,
+            payload_name
+        );
+    }
+
+    if manifest.status != CaptureStatus::Complete {
+        if manifest.events.lost == 0 && manifest.events.source_lost == 0 {
+            bail!(
+                "recording {} is incomplete: the capture session was interrupted before a \
+                 complete recording could be finalized, so replaying it could report detections \
+                 over a partial stream",
+                payload_path.display()
+            );
+        }
+
+        bail!(
+            "recording {} is incomplete: capture lost {} of {} received events and {} events at \
+             the source, so replaying it would report detections over a stream with holes in it",
+            payload_path.display(),
+            manifest.events.lost,
+            manifest.events.received,
+            manifest.events.source_lost
+        );
+    }
+
+    let Some(expected) = manifest.payload_sha256.as_deref() else {
+        bail!(
+            "recording {} was finalized without a checksum and cannot be verified",
+            payload_path.display()
+        );
+    };
+
+    let actual = checksum(payload_path)?;
+    if actual != expected {
+        bail!(
+            "recording {} does not match its manifest checksum (expected {}, found {}); it has \
+             been modified or truncated since capture, or copied through something that \
+             rewrote its line endings — move recordings as binary files",
+            payload_path.display(),
+            expected,
+            actual
+        );
+    }
+
+    Ok(())
+}
+
+fn checksum(payload_path: &Path) -> anyhow::Result<String> {
+    let mut file = File::open(payload_path)
+        .with_context(|| format!("failed to open recording {}", payload_path.display()))?;
+    let mut hasher = Sha256::new();
+    let mut buffer = vec![0u8; CHECKSUM_CHUNK_BYTES];
+
+    loop {
+        let read = file
+            .read(&mut buffer)
+            .with_context(|| format!("failed to read recording {}", payload_path.display()))?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+
+    Ok(hex::encode(hasher.finalize()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::capture::{CaptureEventCounts, CaptureRecorder};
+    use crate::models::{EventCategory, EventFields, NormalizedEvent, ProcessCreationFields};
+    use crate::vocab::Platform;
+
+    fn process_event(pid: &str) -> NormalizedEvent {
+        NormalizedEvent {
+            timestamp: "2026-08-16T10:00:00Z".to_string(),
+            source_seq: None,
+            ingest_seq: pid.parse().expect("test pid is numeric"),
+            platform: Platform::Windows,
+            provider: "etw".to_string(),
+            category: EventCategory::Process,
+            event_id: 1,
+            event_id_string: "1".to_string(),
+            opcode: 1,
+            fields: EventFields::ProcessCreation(ProcessCreationFields {
+                hashes: None,
+                imphash: None,
+                container: Default::default(),
+                linux_identity: Default::default(),
+                cgroup_id: None,
+                exec: Default::default(),
+                parent_process_id_derived: false,
+                windows: Default::default(),
+                image: Some(r"C:\Windows\System32\cmd.exe".to_string()),
+                image_source: None,
+                image_truncated: None,
+                original_file_name: None,
+                product: None,
+                description: None,
+                company: None,
+                file_version: None,
+                target_image: None,
+                command_line: Some("cmd.exe /c whoami".to_string()),
+                process_id: Some(pid.to_string()),
+                process_start_time: None,
+                parent_process_id: None,
+                parent_image: None,
+                parent_command_line: None,
+                parent_user: None,
+                current_directory: None,
+                integrity_level: None,
+                logon_id: None,
+                user: None,
+            }),
+            process_name: None,
+            provenance: Default::default(),
+            process_context: None,
+        }
+    }
+
+    /// Write a complete two-event recording and return its payload path.
+    async fn complete_recording(directory: &Path) -> PathBuf {
+        let payload = directory.join("session.ndjson");
+        let recorder =
+            CaptureRecorder::start(payload.clone(), Platform::Windows).expect("capture starts");
+        let sink = recorder.sink();
+        let mut first = process_event("100");
+        first.provenance.mark_derived("Image");
+        first.process_name = Some("native-name".into());
+        for fidelity in [
+            crate::models::Fidelity::BestEffort,
+            crate::models::Fidelity::Truncated,
+            crate::models::Fidelity::Stale,
+        ] {
+            first.provenance.mark("Image", fidelity);
+        }
+        sink.record(&CanonicalEvent::from_normalized(first));
+        sink.record(&CanonicalEvent::from_normalized(process_event("200")));
+        drop(sink);
+        recorder.finish().await.expect("capture finalizes");
+        payload
+    }
+
+    fn rewrite_manifest(payload: &Path, edit: impl FnOnce(&mut CaptureManifest)) {
+        let path = manifest_path_for(payload);
+        let mut manifest: CaptureManifest =
+            serde_json::from_str(&std::fs::read_to_string(&path).expect("manifest exists"))
+                .expect("manifest parses");
+        edit(&mut manifest);
+        std::fs::write(
+            &path,
+            serde_json::to_string_pretty(&manifest).expect("manifest serializes"),
+        )
+        .expect("manifest rewritten");
+    }
+
+    #[tokio::test]
+    async fn a_complete_recording_replays_its_events_in_order() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let payload = complete_recording(temp.path()).await;
+
+        let recording = Recording::open(&payload).expect("recording opens");
+        let events: Vec<CanonicalEvent> = recording
+            .events()
+            .expect("payload opens")
+            .collect::<anyhow::Result<Vec<_>>>()
+            .expect("events parse");
+
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].normalized().get_field("ProcessId"), Some("100"));
+        assert_eq!(events[1].normalized().get_field("ProcessId"), Some("200"));
+        assert_eq!(events[0].provenance().entries()[0].field, "Image");
+        assert_eq!(
+            events[0].provenance().entries()[0].fidelity,
+            crate::models::Fidelity::Derived
+        );
+        assert_eq!(
+            events[0].normalized().process_name.as_deref(),
+            Some("native-name")
+        );
+        assert_eq!(events[0].provenance().entries().len(), 4);
+        assert!(events[0]
+            .provenance()
+            .has("Image", crate::models::Fidelity::Truncated));
+        assert!(events[0]
+            .provenance()
+            .has("Image", crate::models::Fidelity::Stale));
+        assert_eq!(recording.manifest().platform, Platform::Windows);
+    }
+
+    #[tokio::test]
+    async fn one_thousand_same_second_events_replay_in_ingest_order() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let payload = temp.path().join("burst.ndjson");
+        let recorder =
+            CaptureRecorder::start(payload.clone(), Platform::Windows).expect("capture starts");
+        let sink = recorder.sink();
+        for ingest_seq in 1..=1_000 {
+            sink.record(&CanonicalEvent::from_normalized(process_event(
+                &ingest_seq.to_string(),
+            )));
+        }
+        drop(sink);
+        recorder.finish().await.expect("capture finalizes");
+
+        let recording = Recording::open(&payload).expect("recording opens");
+        let ingest_order: Vec<u64> = recording
+            .events()
+            .expect("payload opens")
+            .map(|event| event.map(|event| event.normalized().ingest_seq))
+            .collect::<anyhow::Result<_>>()
+            .expect("events parse");
+
+        assert_eq!(ingest_order, (1..=1_000).collect::<Vec<_>>());
+    }
+
+    #[tokio::test]
+    async fn an_incomplete_recording_is_rejected() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let payload = complete_recording(temp.path()).await;
+        rewrite_manifest(&payload, |manifest| {
+            manifest.status = CaptureStatus::Incomplete;
+            manifest.events = CaptureEventCounts {
+                received: 3,
+                written: 2,
+                lost: 1,
+                source_lost: 0,
+            };
+        });
+
+        let err = Recording::open(&payload).expect_err("incomplete recordings are rejected");
+        assert!(err.to_string().contains("lost 1 of 3"), "{err}");
+        assert!(!err.to_string().contains("interrupted"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn an_interrupted_recording_does_not_claim_events_were_lost() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let payload = complete_recording(temp.path()).await;
+        rewrite_manifest(&payload, |manifest| {
+            manifest.status = CaptureStatus::Incomplete;
+            manifest.events = CaptureEventCounts {
+                received: 0,
+                written: 0,
+                lost: 0,
+                source_lost: 0,
+            };
+        });
+
+        let err = Recording::open(&payload).expect_err("interrupted recordings are rejected");
+        assert!(err.to_string().contains("interrupted"), "{err}");
+        assert!(!err.to_string().contains("lost 0 of 0"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn a_modified_payload_fails_the_checksum() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let payload = complete_recording(temp.path()).await;
+        let mut body = std::fs::read_to_string(&payload).expect("payload exists");
+        body = body.replace("whoami", "whoareyou");
+        std::fs::write(&payload, body).expect("payload rewritten");
+
+        let err = Recording::open(&payload).expect_err("a modified recording is rejected");
+        assert!(err.to_string().contains("checksum"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn an_unsupported_schema_version_is_rejected() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let payload = complete_recording(temp.path()).await;
+        rewrite_manifest(&payload, |manifest| {
+            manifest.schema_version = CAPTURE_SCHEMA_VERSION + 1;
+        });
+
+        let err = Recording::open(&payload).expect_err("unknown schema versions are rejected");
+        assert!(err.to_string().contains("schema version"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn a_missing_manifest_is_reported_with_the_path_it_looked_for() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let payload = complete_recording(temp.path()).await;
+        std::fs::remove_file(manifest_path_for(&payload)).expect("manifest removed");
+
+        let err =
+            Recording::open(&payload).expect_err("a recording without a manifest is rejected");
+        assert!(err.to_string().contains("session.manifest.json"), "{err}");
+    }
+
+    #[test]
+    fn a_missing_recording_is_reported_by_path() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let missing = temp.path().join("absent.ndjson");
+
+        let err = Recording::open(&missing).expect_err("a missing recording is rejected");
+        assert!(err.to_string().contains("absent.ndjson"), "{err}");
+    }
+}

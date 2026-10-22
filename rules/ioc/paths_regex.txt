@@ -1,0 +1,4 @@
+# IOC Type: Path Regex
+# Format: VALUE;COMMENT
+# Example: ^C:\\Users\\Public\\.*\.exe$;Suspicious drop path
+# Note: Regex is case-insensitive.

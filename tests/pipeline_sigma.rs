@@ -1,0 +1,895 @@
+#[cfg(test)]
+mod common;
+
+use common::{
+    assert_ecs_field_eq, assert_ecs_field_present, assert_normalized_field_eq, dns_query_event,
+    ecs_json, file_create_event, file_delete_event, file_rename_event, image_for,
+    network_connect_event, powershell_classic_start_event, powershell_module_event,
+    process_start_event, provider_for, renamed_test_file_path, service_installation_event,
+    test_file_path, SigmaFixture, TestNormalizer, TEST_DESTINATION_IP, TEST_DESTINATION_PORT,
+    TEST_PID, TEST_PS_CLASSIC_DATA, TEST_PS_MODULE_CONTEXT, TEST_PS_MODULE_PAYLOAD,
+    TEST_SERVICE_IMAGE_PATH, TEST_SERVICE_NAME, TEST_SERVICE_PROVIDER, TEST_SOURCE_IP, TEST_USER,
+};
+use rustinel::{
+    engine::Engine,
+    models::{DetectionEngine, EventCategory, EventFields, SecurityAuditFields, WmiEventFields},
+    sensor::{Platform, RawEvent, RawPayload, SensorAction, SensorNormalization},
+};
+
+#[test]
+fn defender_exclusion_change_reaches_sigma_and_ecs() {
+    let fixture = SigmaFixture::new();
+    fixture.write_rule(
+        "defender_exclusion.yml",
+        r#"title: Test Defender Exclusion
+logsource:
+  product: windows
+  service: windefend
+detection:
+  selection:
+    EventID: 5007
+    NewValue|contains: Exclusions
+    Provider_Name: Microsoft-Windows-Windows Defender
+  condition: selection
+level: high
+"#,
+    );
+    let mut fields = SecurityAuditFields::default();
+    fields.insert("Provider_Name", "Microsoft-Windows-Windows Defender");
+    fields.insert("Old Value", "-");
+    fields.insert(
+        "New Value",
+        r"HKLM\SOFTWARE\Microsoft\Windows Defender\Exclusions\Paths\C:\Tools = 0x0",
+    );
+    fields.insert(
+        "NewValue",
+        r"HKLM\SOFTWARE\Microsoft\Windows Defender\Exclusions\Paths\C:\Tools = 0x0",
+    );
+    let raw = RawEvent {
+        process_name: None,
+        provenance: Default::default(),
+        platform: Platform::Windows,
+        provider: "windows_event_log",
+        action: SensorAction::Modify,
+        normalization: SensorNormalization {
+            event_id: 5007,
+            action_code: 0,
+        },
+        pid: None,
+        timestamp: std::time::SystemTime::now(),
+        source_seq: Some(1),
+        process_start_key: None,
+        parent_process_start_key: None,
+        payload: RawPayload::Defender(fields),
+    };
+    let normalized = TestNormalizer::new().normalizer.normalize(&raw).unwrap();
+    assert_eq!(normalized.category, EventCategory::Defender);
+    assert_normalized_field_eq(
+        &normalized,
+        "Channel",
+        "Microsoft-Windows-Windows Defender/Operational",
+    );
+    let alert = load_engine(Platform::Windows, &fixture)
+        .check_event(&normalized)
+        .into_iter()
+        .next()
+        .expect("Defender Sigma rule should match");
+    assert_sigma_alert(&alert, "Test Defender Exclusion");
+    assert_ecs_field_eq(&ecs_json(&alert), "event.dataset", "edr.windefend");
+}
+
+fn defender_detection(event_id: u16, threat: &str, path: &str) -> RawEvent {
+    let mut fields = SecurityAuditFields::default();
+    fields.insert("Provider_Name", "Microsoft-Windows-Windows Defender");
+    fields.insert("Threat Name", threat);
+    fields.insert("ThreatName", threat);
+    fields.insert("Signature", threat);
+    fields.insert("Path", path);
+    if let Some(file) = path
+        .split(';')
+        .map(str::trim)
+        .find_map(|resource| resource.strip_prefix("file:_"))
+    {
+        fields.insert("Filename", file);
+    }
+    RawEvent {
+        process_name: None,
+        provenance: Default::default(),
+        platform: Platform::Windows,
+        provider: "windows_event_log",
+        action: SensorAction::Create,
+        normalization: SensorNormalization {
+            event_id,
+            action_code: 0,
+        },
+        pid: None,
+        timestamp: std::time::SystemTime::now(),
+        source_seq: Some(1),
+        process_start_key: None,
+        parent_process_start_key: None,
+        payload: RawPayload::Defender(fields),
+    }
+}
+
+#[test]
+fn product_less_antivirus_rules_match_defender_detections() {
+    let fixture = SigmaFixture::new();
+    fixture.write_rule(
+        "av_hacktool.yml",
+        r#"title: Antivirus Hacktool Signature
+logsource:
+  category: antivirus
+detection:
+  selection:
+    Signature|contains:
+      - 'HackTool'
+      - 'Mimikatz'
+  condition: selection
+level: high
+"#,
+    );
+    fixture.write_rule(
+        "av_path.yml",
+        r#"title: Antivirus Relevant File Path
+logsource:
+  category: antivirus
+detection:
+  selection:
+    Filename|contains: 'mimikatz.exe'
+  condition: selection
+level: high
+"#,
+    );
+    let harness = TestNormalizer::new();
+    let engine = load_engine(Platform::Windows, &fixture);
+    // The default match mode reports the best rule per event, so each rule
+    // is isolated by an event the other cannot match.
+    for event_id in [1116, 1117] {
+        for (threat, path, expected) in [
+            (
+                "HackTool:Win32/Mimikatz.D",
+                r"file:_C:\Users\a\x.bin",
+                "Antivirus Hacktool Signature",
+            ),
+            (
+                "Trojan:Win32/Other",
+                r"process:_pid:4; file:_C:\Tools\mimikatz.exe",
+                "Antivirus Relevant File Path",
+            ),
+        ] {
+            let normalized = harness
+                .normalizer
+                .normalize(&defender_detection(event_id, threat, path))
+                .unwrap();
+            let names: Vec<_> = engine
+                .check_event(&normalized)
+                .into_iter()
+                .map(|alert| alert.rule_name)
+                .collect();
+            assert_eq!(names, [expected], "event {event_id} {threat}");
+        }
+    }
+
+    // Other Defender events are not detections.
+    let other = harness
+        .normalizer
+        .normalize(&defender_detection(1121, "HackTool:Win32/Mimikatz.D", "x"))
+        .unwrap();
+    assert!(engine.check_event(&other).is_empty());
+}
+
+fn load_engine(platform: Platform, fixture: &SigmaFixture) -> Engine {
+    let mut engine = Engine::new_for_platform(platform);
+    engine
+        .load_rules(fixture.rules_dir())
+        .expect("sigma rules should load");
+    assert_eq!(engine.stats().failed_rules, Vec::<(String, String)>::new());
+    assert!(
+        engine.stats().total_rules > 0,
+        "expected at least one Sigma rule to load"
+    );
+    engine
+}
+
+fn assert_sigma_alert(alert: &rustinel::models::Alert, expected_rule: &str) {
+    assert_eq!(alert.engine, DetectionEngine::Sigma);
+    assert_eq!(alert.rule_name, expected_rule);
+}
+
+#[test]
+fn sigma_process_detection_pipeline_maps_to_ecs_for_windows_and_linux() {
+    for platform in [Platform::Windows, Platform::Linux, Platform::MacOS] {
+        let fixture = SigmaFixture::new();
+        fixture.write_process_rule(platform);
+        let engine = load_engine(platform, &fixture);
+        let harness = TestNormalizer::new();
+
+        let normalized = harness
+            .normalizer
+            .normalize(&process_start_event(platform))
+            .expect("process start should normalize");
+
+        assert_eq!(normalized.platform, platform);
+        assert_eq!(normalized.provider, provider_for(platform));
+        assert_eq!(normalized.category, EventCategory::Process);
+        assert_normalized_field_eq(&normalized, "Image", image_for(platform));
+        assert!(normalized
+            .get_field("CommandLine")
+            .expect("command line")
+            .contains("example.test"));
+        assert_normalized_field_eq(&normalized, "ProcessId", &TEST_PID.to_string());
+        assert_normalized_field_eq(&normalized, "User", TEST_USER);
+
+        let alert = engine
+            .check_event(&normalized)
+            .into_iter()
+            .next()
+            .expect("process Sigma rule should match");
+        assert_sigma_alert(&alert, "Test Process Curl");
+
+        let ecs = ecs_json(&alert);
+        assert_ecs_field_eq(&ecs, "event.dataset", "edr.process");
+        assert_ecs_field_eq(&ecs, "rule.name", "Test Process Curl");
+        assert_ecs_field_eq(&ecs, "edr.rule.engine", "Sigma");
+        assert_ecs_field_eq(&ecs, "process.executable", image_for(platform));
+        assert_ecs_field_eq(&ecs, "process.pid", TEST_PID);
+    }
+}
+
+#[test]
+fn windows_process_user_contains_rule_matches_replayed_shape() {
+    let fixture = SigmaFixture::new();
+    fixture.write_rule(
+        "process_user.yml",
+        r#"title: Test Windows Process User
+logsource:
+  product: windows
+  category: process_creation
+detection:
+  selection:
+    User|contains: "alice"
+  condition: selection
+level: high
+"#,
+    );
+    let engine = load_engine(Platform::Windows, &fixture);
+    let normalized = TestNormalizer::new()
+        .normalizer
+        .normalize(&process_start_event(Platform::Windows))
+        .expect("process start should normalize");
+
+    assert_normalized_field_eq(&normalized, "User", TEST_USER);
+    let alert = engine
+        .check_event(&normalized)
+        .into_iter()
+        .next()
+        .expect("User|contains should match the replay-compatible process event");
+    assert_sigma_alert(&alert, "Test Windows Process User");
+}
+
+#[test]
+fn sigma_integrity_level_detection_pipeline_matches_sysmon_spelling() {
+    let fixture = SigmaFixture::new();
+    fixture.write_rule(
+        "integrity_level.yml",
+        r#"title: Test System Integrity
+logsource:
+  product: windows
+  category: process_creation
+detection:
+  selection:
+    IntegrityLevel: System
+  condition: selection
+level: high
+"#,
+    );
+    let engine = load_engine(Platform::Windows, &fixture);
+    let harness = TestNormalizer::new();
+
+    let mut event = process_start_event(Platform::Windows);
+    match &mut event.payload {
+        RawPayload::Process(fields) => {
+            fields.integrity_level = Some("System".to_string());
+        }
+        other => panic!("unexpected payload: {other:?}"),
+    }
+
+    let normalized = harness
+        .normalizer
+        .normalize(&event)
+        .expect("process start should normalize");
+    assert_normalized_field_eq(&normalized, "IntegrityLevel", "System");
+    assert_eq!(normalized.get_field("LogonId"), None);
+    assert_eq!(normalized.get_field("LogonGuid"), None);
+
+    let alert = engine
+        .check_event(&normalized)
+        .into_iter()
+        .next()
+        .expect("integrity level Sigma rule should match");
+    assert_sigma_alert(&alert, "Test System Integrity");
+
+    let ecs = ecs_json(&alert);
+    assert_ecs_field_eq(&ecs, "edr.process.integrity_level", "System");
+}
+
+#[test]
+fn sigma_ps_module_detection_pipeline_maps_to_ecs() {
+    // Event 4103 shares the PowerShell provider with the script block event,
+    // so the thing worth proving is that it lands on `ps_module` with its own
+    // two fields rather than being read back as a `ps_script` event.
+    let fixture = SigmaFixture::new();
+    fixture.write_ps_module_rule();
+    let engine = load_engine(Platform::Windows, &fixture);
+    let harness = TestNormalizer::new();
+
+    let normalized = harness
+        .normalizer
+        .normalize(&powershell_module_event())
+        .expect("module logging event should normalize");
+
+    assert_eq!(normalized.category, EventCategory::PowerShellModule);
+    assert_eq!(normalized.event_id, 4103);
+    assert!(matches!(
+        normalized.fields,
+        EventFields::PowerShellModule(_)
+    ));
+    assert_normalized_field_eq(&normalized, "ContextInfo", TEST_PS_MODULE_CONTEXT);
+    assert_normalized_field_eq(&normalized, "Payload", TEST_PS_MODULE_PAYLOAD);
+
+    let alert = engine
+        .check_event(&normalized)
+        .into_iter()
+        .next()
+        .expect("ps_module Sigma rule should match");
+    assert_sigma_alert(&alert, "Test PowerShell Module Download");
+
+    let ecs = ecs_json(&alert);
+    assert_ecs_field_eq(&ecs, "event.dataset", "edr.powershell_module");
+    assert_ecs_field_eq(&ecs, "event.action", "powershell-module");
+    assert_ecs_field_eq(&ecs, "edr.powershell.context_info", TEST_PS_MODULE_CONTEXT);
+    assert_ecs_field_eq(&ecs, "edr.powershell.payload", TEST_PS_MODULE_PAYLOAD);
+    assert_ecs_field_eq(&ecs, "process.pid", TEST_PID);
+}
+
+#[test]
+fn sigma_ps_script_event_4104_keeps_existing_behavior() {
+    let fixture = SigmaFixture::new();
+    fixture.write_rule(
+        "ps_script.yml",
+        r#"title: Test PowerShell Script Block
+logsource:
+  product: windows
+  category: ps_script
+detection:
+  selection:
+    ScriptBlockText|contains: "Get-Process"
+  condition: selection
+level: medium
+"#,
+    );
+    let engine = load_engine(Platform::Windows, &fixture);
+    let harness = TestNormalizer::new();
+
+    let normalized = harness
+        .normalizer
+        .normalize(&common::powershell_script_event())
+        .expect("script-block event should normalize");
+
+    assert_eq!(normalized.category, EventCategory::Scripting);
+    assert_eq!(normalized.event_id, 4104);
+    assert_normalized_field_eq(&normalized, "ScriptBlockText", "Get-Process");
+
+    let alert = engine
+        .check_event(&normalized)
+        .into_iter()
+        .next()
+        .expect("ps_script Sigma rule should still match");
+    assert_sigma_alert(&alert, "Test PowerShell Script Block");
+
+    let ecs = ecs_json(&alert);
+    assert_ecs_field_eq(&ecs, "event.dataset", "edr.scripting");
+    assert_ecs_field_eq(&ecs, "event.action", "powershell-script");
+}
+
+#[test]
+fn sigma_ps_classic_start_event_400_matches_data() {
+    let fixture = SigmaFixture::new();
+    fixture.write_ps_classic_start_rule();
+    let engine = load_engine(Platform::Windows, &fixture);
+    assert_eq!(engine.stats().total_rules, 1);
+    assert_eq!(engine.stats().inactive_collector_rules, 0);
+
+    let normalized = TestNormalizer::new()
+        .normalizer
+        .normalize(&powershell_classic_start_event())
+        .expect("classic PowerShell start should normalize");
+
+    assert_eq!(normalized.category, EventCategory::PowerShellClassicStart);
+    assert_eq!(normalized.event_id, 400);
+    assert_eq!(normalized.provider, "windows_event_log");
+    assert!(matches!(
+        normalized.fields,
+        EventFields::PowerShellClassicStart(_)
+    ));
+    assert_normalized_field_eq(&normalized, "Channel", "Windows PowerShell");
+    assert_normalized_field_eq(&normalized, "Data", TEST_PS_CLASSIC_DATA);
+
+    let alert = engine
+        .check_event(&normalized)
+        .into_iter()
+        .next()
+        .expect("ps_classic_start Sigma rule should match");
+    assert_sigma_alert(&alert, "Test PowerShell Downgrade");
+
+    let ecs = ecs_json(&alert);
+    assert_ecs_field_eq(&ecs, "event.dataset", "edr.powershell_classic_start");
+    assert_ecs_field_eq(&ecs, "event.action", "powershell-classic-start");
+    assert_ecs_field_eq(&ecs, "edr.powershell.data", TEST_PS_CLASSIC_DATA);
+
+    let service_fixture = SigmaFixture::new();
+    service_fixture.write_rule(
+        "powershell_classic_service.yml",
+        r#"title: Test PowerShell Classic Service Route
+logsource:
+  product: windows
+  service: powershell-classic
+detection:
+  selection:
+    Data|contains: "HostName=ConsoleHost"
+  condition: selection
+level: medium
+"#,
+    );
+    let service_engine = load_engine(Platform::Windows, &service_fixture);
+    assert_eq!(service_engine.stats().inactive_collector_rules, 0);
+    let service_alert = service_engine
+        .check_event(&normalized)
+        .into_iter()
+        .next()
+        .expect("powershell-classic service rule should match");
+    assert_sigma_alert(&service_alert, "Test PowerShell Classic Service Route");
+}
+
+#[test]
+fn wmi_binding_5861_routes_to_service_without_sysmon_aliases() {
+    let service_rules = SigmaFixture::new();
+    service_rules.write_rule(
+        "wmi_binding.yml",
+        r#"title: WMI Binding Consumer Command
+logsource:
+  product: windows
+  service: wmi
+detection:
+  selection:
+    EventID: 5861
+    ConsumerClass: CommandLineEventConsumer
+    Destination|contains: 'cmd.exe /c exit 0'
+  condition: selection
+level: high
+"#,
+    );
+    let raw = RawEvent {
+        process_name: None,
+        provenance: Default::default(),
+        platform: Platform::Windows,
+        provider: "etw",
+        action: SensorAction::Execute,
+        normalization: SensorNormalization {
+            event_id: 5861,
+            action_code: 0,
+        },
+        pid: None,
+        timestamp: std::time::SystemTime::now(),
+        source_seq: Some(1),
+        process_start_key: None,
+        parent_process_start_key: None,
+        payload: RawPayload::Wmi(WmiEventFields {
+            event_namespace: Some("//./root/subscription".into()),
+            filter_name: Some("RustinelWmiFixture".into()),
+            consumer_class: Some("CommandLineEventConsumer".into()),
+            consumer_name: Some("RustinelWmiFixture".into()),
+            consumer_text: Some("CommandLineTemplate = \"cmd.exe /c exit 0\";".into()),
+            destination: Some("CommandLineTemplate = \"cmd.exe /c exit 0\";".into()),
+            possible_cause: Some("Binding EventFilter: ... Perm. Consumer: CommandLineTemplate = \"cmd.exe /c exit 0\";".into()),
+            ..Default::default()
+        }),
+    };
+    let normalized = TestNormalizer::new().normalizer.normalize(&raw).unwrap();
+    assert_normalized_field_eq(
+        &normalized,
+        "Channel",
+        "Microsoft-Windows-WMI-Activity/Operational",
+    );
+    assert_normalized_field_eq(&normalized, "ConsumerName", "RustinelWmiFixture");
+    assert_eq!(normalized.get_field("EventID"), Some("5861"));
+    assert_sigma_alert(
+        &load_engine(Platform::Windows, &service_rules)
+            .check_event(&normalized)
+            .into_iter()
+            .next()
+            .expect("service: wmi rule should match 5861"),
+        "WMI Binding Consumer Command",
+    );
+
+    let sysmon_rules = SigmaFixture::new();
+    sysmon_rules.write_rule(
+        "sysmon_wmi.yml",
+        r#"title: Sysmon WMI Subscription IDs
+logsource:
+  product: windows
+  category: wmi_event
+detection:
+  selection:
+    EventID:
+      - 19
+      - 20
+      - 21
+  condition: selection
+level: high
+"#,
+    );
+    assert!(load_engine(Platform::Windows, &sysmon_rules)
+        .check_event(&normalized)
+        .is_empty());
+}
+
+#[test]
+fn sigma_dns_client_rule_matches_native_event_3008_and_sysmon_alias_22() {
+    // Regression fixture from SigmaHQ's
+    // rules/windows/builtin/dns_client/win_dns_client_mal_cobaltstrike.yml.
+    let fixture = SigmaFixture::new();
+    fixture.write_rule(
+        "win_dns_client_mal_cobaltstrike.yml",
+        r#"title: Suspicious Cobalt Strike DNS Beaconing - DNS Client
+id: 0d18728b-f5bf-4381-9dcf-915539fff6c2
+logsource:
+  product: windows
+  service: dns-client
+detection:
+  selection_eid:
+    EventID: 3008
+  selection_query_1:
+    QueryName|startswith:
+      - 'aaa.stage.'
+      - 'post.1'
+  selection_query_2:
+    QueryName|contains: '.stage.123456.'
+  condition: selection_eid and 1 of selection_query_*
+level: critical
+"#,
+    );
+    let native_engine = load_engine(Platform::Windows, &fixture);
+    let harness = TestNormalizer::new();
+    let mut event = dns_query_event(Platform::Windows);
+    event.normalization.event_id = 3008;
+    match &mut event.payload {
+        RawPayload::Dns(fields) => {
+            fields.query_name = Some("aaa.stage.example.test".to_string());
+        }
+        other => panic!("unexpected payload: {other:?}"),
+    }
+
+    let normalized = harness
+        .normalizer
+        .normalize(&event)
+        .expect("DNS Client query should normalize");
+    assert_eq!(normalized.event_id, 3008);
+    assert_eq!(normalized.get_field("EventID"), Some("3008"));
+    assert_sigma_alert(
+        &native_engine
+            .check_event(&normalized)
+            .into_iter()
+            .next()
+            .expect("SigmaHQ DNS Client rule should match native event 3008"),
+        "Suspicious Cobalt Strike DNS Beaconing - DNS Client",
+    );
+
+    let sysmon_fixture = SigmaFixture::new();
+    sysmon_fixture.write_rule(
+        "dns_query_sysmon.yml",
+        r#"title: Sysmon DNS Query Compatibility
+logsource:
+  product: windows
+  category: dns_query
+detection:
+  selection:
+    EventID: 22
+    QueryName|startswith: 'aaa.stage.'
+  condition: selection
+level: high
+"#,
+    );
+    let sysmon_engine = load_engine(Platform::Windows, &sysmon_fixture);
+    assert_sigma_alert(
+        &sysmon_engine
+            .check_event(&normalized)
+            .into_iter()
+            .next()
+            .expect("category dns_query rule should still match Sysmon event 22"),
+        "Sysmon DNS Query Compatibility",
+    );
+}
+
+#[test]
+fn product_less_dns_category_rule_matches_on_every_platform() {
+    // Shape of SigmaHQ's rules/network/dns/net_dns_susp_telegram_api.yml.
+    for platform in [Platform::Windows, Platform::Linux, Platform::MacOS] {
+        let fixture = SigmaFixture::new();
+        fixture.write_rule(
+            "net_dns_telegram.yml",
+            r#"title: Telegram Bot API Request
+logsource:
+  category: dns
+detection:
+  selection:
+    query: 'api.telegram.org'
+  condition: selection
+level: medium
+"#,
+        );
+        let engine = load_engine(platform, &fixture);
+        let harness = TestNormalizer::new();
+        let mut event = dns_query_event(platform);
+        match &mut event.payload {
+            RawPayload::Dns(fields) => fields.query_name = Some("api.telegram.org".to_string()),
+            other => panic!("unexpected payload: {other:?}"),
+        }
+        let normalized = harness
+            .normalizer
+            .normalize(&event)
+            .expect("DNS query should normalize");
+        assert_sigma_alert(
+            &engine
+                .check_event(&normalized)
+                .into_iter()
+                .next()
+                .unwrap_or_else(|| panic!("category dns rule should match on {platform:?}")),
+            "Telegram Bot API Request",
+        );
+    }
+}
+
+#[test]
+fn sigma_network_detection_pipeline_enriches_repeats_and_maps_to_ecs() {
+    for platform in [Platform::Windows, Platform::Linux, Platform::MacOS] {
+        let fixture = SigmaFixture::new();
+        fixture.write_network_rule(platform);
+        let engine = load_engine(platform, &fixture);
+        let harness = TestNormalizer::new();
+
+        harness
+            .normalizer
+            .normalize(&process_start_event(platform))
+            .expect("process start should prime process cache");
+
+        let first = harness
+            .normalizer
+            .normalize(&network_connect_event(platform))
+            .expect("first network connection should be emitted");
+        assert_normalized_field_eq(&first, "Image", image_for(platform));
+        assert_normalized_field_eq(&first, "DestinationIp", TEST_DESTINATION_IP);
+        assert_normalized_field_eq(
+            &first,
+            "DestinationPort",
+            &TEST_DESTINATION_PORT.to_string(),
+        );
+        assert_normalized_field_eq(&first, "SourceIp", TEST_SOURCE_IP);
+        assert_normalized_field_eq(&first, "Protocol", "tcp");
+
+        let repeated = harness
+            .normalizer
+            .normalize(&network_connect_event(platform))
+            .expect("repeated connection should remain available to detection");
+        let repeated_alert = engine
+            .check_event(&repeated)
+            .into_iter()
+            .next()
+            .expect("repeated network connection should match Sigma");
+        assert_sigma_alert(&repeated_alert, "Test Network Destination");
+
+        let alert = engine
+            .check_event(&first)
+            .into_iter()
+            .next()
+            .expect("network Sigma rule should match");
+        assert_sigma_alert(&alert, "Test Network Destination");
+
+        let ecs = ecs_json(&alert);
+        assert_ecs_field_eq(&ecs, "event.dataset", "edr.network");
+        assert_ecs_field_eq(&ecs, "destination.ip", TEST_DESTINATION_IP);
+        assert_ecs_field_eq(&ecs, "destination.port", TEST_DESTINATION_PORT);
+        assert_ecs_field_eq(&ecs, "source.ip", TEST_SOURCE_IP);
+        assert_ecs_field_eq(&ecs, "network.transport", "tcp");
+        assert_ecs_field_eq(&ecs, "process.executable", image_for(platform));
+    }
+}
+
+#[test]
+fn sigma_network_rule_loaded_after_first_connection_matches_repeat() {
+    let fixture = SigmaFixture::new();
+    let harness = TestNormalizer::new();
+
+    harness
+        .normalizer
+        .normalize(&process_start_event(Platform::Linux))
+        .expect("process start should prime process cache");
+    harness
+        .normalizer
+        .normalize(&network_connect_event(Platform::Linux))
+        .expect("first network connection should normalize");
+
+    fixture.write_network_rule(Platform::Linux);
+    let engine = load_engine(Platform::Linux, &fixture);
+    let repeated = harness
+        .normalizer
+        .normalize(&network_connect_event(Platform::Linux))
+        .expect("repeated network connection should normalize");
+
+    let alert = engine
+        .check_event(&repeated)
+        .into_iter()
+        .next()
+        .expect("a rule loaded after the first connection should match the repeat");
+    assert_sigma_alert(&alert, "Test Network Destination");
+}
+
+#[test]
+fn sigma_file_detection_pipeline_maps_create_delete_rename_and_ecs() {
+    for platform in [Platform::Windows, Platform::Linux, Platform::MacOS] {
+        let fixture = SigmaFixture::new();
+        let product = match platform {
+            Platform::Windows => "windows",
+            Platform::Linux => "linux",
+            Platform::MacOS => "macos",
+        };
+        fixture.write_rule(
+            "file_create.yml",
+            &format!(
+                r#"title: Test File Create
+logsource:
+  product: {product}
+  category: file_create
+detection:
+  selection:
+    TargetFilename|endswith: "rustinel-fixture.txt"
+    Image|contains: "curl"
+  condition: selection
+level: low
+"#
+            ),
+        );
+        let rename_fields = if platform == Platform::Windows {
+            r#"    TargetFilename|endswith: "rustinel-renamed.txt"
+    Image|contains: "curl""#
+        } else {
+            r#"    SourceFilename|endswith: "rustinel-fixture.txt"
+    TargetFilename|endswith: "rustinel-renamed.txt"
+    Image|contains: "curl""#
+        };
+        fixture.write_rule(
+            "file_rename.yml",
+            &format!(
+                r#"title: Test File Rename
+logsource:
+  product: {product}
+  category: file_rename
+detection:
+  selection:
+{rename_fields}
+  condition: selection
+level: low
+"#
+            ),
+        );
+
+        let engine = load_engine(platform, &fixture);
+        let harness = TestNormalizer::new();
+        harness
+            .normalizer
+            .normalize(&process_start_event(platform))
+            .expect("process start should prime process cache");
+
+        let create = harness
+            .normalizer
+            .normalize(&file_create_event(platform))
+            .expect("file create should normalize");
+        assert_eq!(create.event_id, 11);
+        assert_normalized_field_eq(&create, "TargetFilename", test_file_path(platform));
+        assert_normalized_field_eq(&create, "Image", image_for(platform));
+
+        let delete = harness
+            .normalizer
+            .normalize(&file_delete_event(platform))
+            .expect("file delete should normalize");
+        assert_eq!(delete.event_id, 23);
+        assert_normalized_field_eq(&delete, "TargetFilename", test_file_path(platform));
+
+        let rename = harness
+            .normalizer
+            .normalize(&file_rename_event(platform))
+            .expect("file rename should normalize");
+        if platform == Platform::Windows {
+            assert_eq!(rename.get_field("SourceFilename"), None);
+        } else {
+            assert_normalized_field_eq(&rename, "SourceFilename", test_file_path(platform));
+        }
+        assert_normalized_field_eq(&rename, "TargetFilename", renamed_test_file_path(platform));
+        assert_normalized_field_eq(&rename, "Image", image_for(platform));
+
+        let create_alert = engine
+            .check_event(&create)
+            .into_iter()
+            .next()
+            .expect("file create Sigma rule should match");
+        assert_sigma_alert(&create_alert, "Test File Create");
+
+        let rename_alert = engine
+            .check_event(&rename)
+            .into_iter()
+            .next()
+            .expect("file rename Sigma rule should match");
+        assert_sigma_alert(&rename_alert, "Test File Rename");
+
+        match &rename_alert.event.fields {
+            EventFields::FileEvent(fields) => {
+                let expected_source =
+                    (platform != Platform::Windows).then(|| test_file_path(platform));
+                assert_eq!(fields.source_filename.as_deref(), expected_source);
+                assert_eq!(
+                    fields.target_filename.as_deref(),
+                    Some(renamed_test_file_path(platform))
+                );
+            }
+            other => panic!("unexpected event fields: {other:?}"),
+        }
+
+        let ecs = ecs_json(&create_alert);
+        assert_ecs_field_eq(&ecs, "event.dataset", "edr.file");
+        assert_ecs_field_eq(&ecs, "file.path", test_file_path(platform));
+        assert_ecs_field_present(&ecs, "file.name");
+        assert_ecs_field_eq(&ecs, "file.extension", "txt");
+        assert_ecs_field_eq(&ecs, "process.executable", image_for(platform));
+    }
+}
+
+/// A `service: system` rule cannot fire without `Provider_Name`, and 35 of the
+/// SigmaHQ rules in that logsource read the executable as `ImagePath` rather
+/// than `ServiceFileName`. Both travel on the same 7045 event, and neither
+/// displaces `NormalizedEvent::provider`, which keeps naming the sensor.
+#[test]
+fn sigma_service_detection_pipeline_matches_provider_name_and_image_path() {
+    let fixture = SigmaFixture::new();
+    fixture.write_service_rule();
+    let engine = load_engine(Platform::Windows, &fixture);
+    let harness = TestNormalizer::new();
+
+    let normalized = harness
+        .normalizer
+        .normalize(&service_installation_event())
+        .expect("service installation should normalize");
+
+    assert_eq!(normalized.category, EventCategory::Service);
+    assert_eq!(
+        normalized.provider, "windows_event_log",
+        "the sensor provider must survive the new Windows provider field"
+    );
+    assert_normalized_field_eq(&normalized, "Provider_Name", TEST_SERVICE_PROVIDER);
+    assert_normalized_field_eq(&normalized, "ServiceName", TEST_SERVICE_NAME);
+    assert_normalized_field_eq(&normalized, "ImagePath", TEST_SERVICE_IMAGE_PATH);
+    assert_normalized_field_eq(&normalized, "ServiceFileName", TEST_SERVICE_IMAGE_PATH);
+
+    let alert = engine
+        .check_event(&normalized)
+        .into_iter()
+        .next()
+        .expect("service Sigma rule should match");
+    assert_sigma_alert(&alert, "Test Service Installation");
+
+    let ecs = ecs_json(&alert);
+    assert_ecs_field_eq(&ecs, "event.dataset", "edr.service");
+    assert_ecs_field_eq(&ecs, "event.provider", "windows_event_log");
+    assert_ecs_field_eq(&ecs, "edr.event_log.provider_name", TEST_SERVICE_PROVIDER);
+    assert_ecs_field_eq(&ecs, "service.name", TEST_SERVICE_NAME);
+    assert_ecs_field_eq(&ecs, "edr.service.executable", TEST_SERVICE_IMAGE_PATH);
+}

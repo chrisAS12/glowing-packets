@@ -1,0 +1,776 @@
+//! ECS contract and alert enrichment integration tests.
+
+#[cfg(test)]
+mod common;
+
+use common::{
+    assert_ecs_field_eq, dns_query_event, ecs_json, file_create_event, network_connect_event,
+    process_start_event, TestNormalizer, TEST_DESTINATION_IP, TEST_DOMAIN, TEST_PID, TEST_USER,
+};
+use rustinel::models::{
+    Alert, AlertSeverity, DetectionEngine, DnsQueryFields, EventCategory, EventFields,
+    FileEventFields, ImageLoadFields, NetworkConnectionFields, NormalizedEvent,
+    PowerShellModuleFields, PowerShellScriptFields, ProcessCreationFields, RegistryEventFields,
+    SecurityAuditFields, ServiceCreationFields, TaskCreationFields, WmiEventFields,
+};
+use rustinel::sensor::{Platform, ProcessStartKey, RawPayload};
+use serde_json::json;
+
+fn security_audit_fields(pairs: &[(&str, &str)]) -> SecurityAuditFields {
+    let mut fields = SecurityAuditFields::default();
+    for (name, value) in pairs {
+        fields.insert(name, value);
+    }
+    fields
+}
+
+fn alert(category: EventCategory, event_id: u16, opcode: u8, fields: EventFields) -> Alert {
+    Alert {
+        severity: AlertSeverity::High,
+        rule_name: format!("{category:?} Test"),
+        rule_description: None,
+        rule_id: None,
+        sigma_metadata: None,
+        engine: DetectionEngine::Sigma,
+        event: NormalizedEvent {
+            timestamp: "2026-01-01T00:00:00Z".to_string(),
+            source_seq: None,
+            ingest_seq: 0,
+            platform: Platform::Windows,
+            provider: "test".to_string(),
+            category,
+            event_id,
+            event_id_string: event_id.to_string(),
+            opcode,
+            fields,
+            process_name: None,
+            provenance: Default::default(),
+            process_context: None,
+        },
+        match_details: None,
+    }
+}
+
+#[test]
+fn linux_process_image_source_survives_normalization_and_maps_to_ecs() {
+    for source in ["proc", "execve"] {
+        let fixture = TestNormalizer::new();
+        let mut event = process_start_event(Platform::Linux);
+        let RawPayload::Process(fields) = &mut event.payload else {
+            panic!("expected process payload");
+        };
+        let rustinel::sensor::RawProcessPlatform::Linux(platform) = fields.platform.as_mut() else {
+            panic!("expected Linux process facts");
+        };
+        platform.image_source = Some(source.to_string());
+
+        let normalized = fixture
+            .normalizer
+            .normalize(&event)
+            .expect("normalize Linux process start");
+        assert_eq!(normalized.get_field("ImageSource"), Some(source));
+
+        let mut alert = alert(EventCategory::Process, 1, 1, normalized.fields);
+        alert.event.platform = Platform::Linux;
+        alert.event.provider = "ebpf".to_string();
+        let json = ecs_json(&alert);
+        assert_ecs_field_eq(&json, "edr.process.image_source", source);
+    }
+}
+
+#[test]
+fn process_context_enriches_non_process_alerts_without_overwriting_event_fields() {
+    let fixture = TestNormalizer::new();
+    let start = process_start_event(Platform::Windows);
+    let normalized_start = fixture
+        .normalizer
+        .normalize(&start)
+        .expect("normalize process start");
+    assert_eq!(normalized_start.category, EventCategory::Process);
+
+    let mut file = fixture
+        .normalizer
+        .normalize(&file_create_event(Platform::Windows))
+        .expect("normalize file event");
+    fixture.normalizer.enrich_process_context(
+        &mut file,
+        Some(ProcessStartKey {
+            pid: TEST_PID,
+            start_time: common::TEST_PROCESS_START_TIME,
+        }),
+    );
+
+    let mut alert = alert(EventCategory::File, 11, 64, file.fields);
+    alert.event.process_context = file.process_context;
+    let json = ecs_json(&alert);
+
+    assert_ecs_field_eq(&json, "process.executable", r"C:\Windows\System32\curl.exe");
+    assert_ecs_field_eq(
+        &json,
+        "process.command_line",
+        format!(r"C:\Windows\System32\curl.exe https://{TEST_DOMAIN}"),
+    );
+    assert_ecs_field_eq(&json, "process.pid", TEST_PID);
+    assert_ecs_field_eq(
+        &json,
+        "process.parent.executable",
+        r"C:\Windows\explorer.exe",
+    );
+    assert_ecs_field_eq(&json, "process.parent.command_line", "parent-shell");
+    assert_ecs_field_eq(&json, "process.parent.pid", 1000);
+    assert!(
+        json.get("process.working_directory").is_none(),
+        "Windows process starts do not provide a working directory"
+    );
+    assert_ecs_field_eq(&json, "user.name", TEST_USER);
+    assert_ecs_field_eq(
+        &json,
+        "file.path",
+        r"C:\Users\alice\AppData\Local\Temp\rustinel-fixture.txt",
+    );
+}
+
+#[test]
+fn ecs_category_coverage_maps_event_contract_fields() {
+    let cases = vec![
+        (
+            alert(
+                EventCategory::Process,
+                1,
+                1,
+                EventFields::ProcessCreation(ProcessCreationFields {
+                    hashes: None,
+                    imphash: None,
+                    container: Default::default(),
+                    linux_identity: Default::default(),
+                    cgroup_id: None,
+                    exec: Default::default(),
+                    parent_process_id_derived: false,
+                    windows: Default::default(),
+                    image: Some(r"C:\Windows\System32\cmd.exe".to_string()),
+                    image_source: None,
+                    image_truncated: None,
+                    command_line: Some("cmd.exe /c whoami".to_string()),
+                    process_id: Some("111".to_string()),
+                    process_start_time: None,
+                    parent_process_id: None,
+                    parent_image: None,
+                    parent_command_line: None,
+                    parent_user: None,
+                    current_directory: None,
+                    integrity_level: None,
+                    logon_id: None,
+                    user: Some("ACME\\alice".to_string()),
+                    original_file_name: None,
+                    product: None,
+                    description: None,
+                    company: None,
+                    file_version: None,
+                    target_image: None,
+                }),
+            ),
+            "edr.process",
+            json!(["process"]),
+            json!(["start"]),
+            "process-start",
+            "process.executable",
+        ),
+        (
+            alert(
+                EventCategory::Network,
+                3,
+                12,
+                EventFields::NetworkConnection(NetworkConnectionFields {
+                    destination_ip: Some("198.51.100.10".to_string()),
+                    source_ip: Some("10.0.0.5".to_string()),
+                    destination_port: Some("443".to_string()),
+                    source_port: Some("51324".to_string()),
+                    process_id: Some("111".to_string()),
+                    image: Some(r"C:\Windows\System32\curl.exe".to_string()),
+                    user: Some("alice".to_string()),
+                    destination_hostname: Some("example.test".to_string()),
+                    protocol: Some("tcp".to_string()),
+                    initiated: Some(true),
+                }),
+            ),
+            "edr.network",
+            json!(["network"]),
+            json!(["connection"]),
+            "network-connection",
+            "destination.ip",
+        ),
+        (
+            alert(
+                EventCategory::File,
+                11,
+                64,
+                EventFields::FileEvent(FileEventFields {
+                    source_filename: None,
+                    target_filename: Some(r"C:\Temp\payload.dll".to_string()),
+                    process_id: Some("111".to_string()),
+                    image: Some(r"C:\Windows\System32\cmd.exe".to_string()),
+                    creation_utc_time: Some("2026-01-01T00:00:00Z".to_string()),
+                    previous_creation_utc_time: None,
+                    user: Some("alice".to_string()),
+                    file_identity: None,
+                    path_truncated: None,
+                }),
+            ),
+            "edr.file",
+            json!(["file"]),
+            json!(["creation"]),
+            "file-create",
+            "file.path",
+        ),
+        (
+            alert(
+                EventCategory::Registry,
+                13,
+                39,
+                EventFields::RegistryEvent(RegistryEventFields {
+                    target_object: Some(r"HKLM\Software\Test\Value".to_string()),
+                    details: Some("DWORD (0x00000001)".to_string()),
+                    process_id: Some("111".to_string()),
+                    image: Some(r"C:\Windows\System32\reg.exe".to_string()),
+                    event_type: Some("SetValue".to_string()),
+                    user: Some("alice".to_string()),
+                    new_name: None,
+                }),
+            ),
+            "edr.registry",
+            json!(["registry"]),
+            json!(["change"]),
+            "SetValue",
+            "registry.path",
+        ),
+        (
+            alert(
+                EventCategory::Dns,
+                22,
+                0,
+                EventFields::DnsQuery(DnsQueryFields {
+                    query_truncated: None,
+                    user: None,
+                    query_name: Some("example.test".to_string()),
+                    query_results: Some("198.51.100.10 198.51.100.10".to_string()),
+                    record_type: Some("A".to_string()),
+                    query_status: Some("NOERROR".to_string()),
+                    process_id: Some("111".to_string()),
+                    image: Some(r"C:\Windows\System32\curl.exe".to_string()),
+                }),
+            ),
+            "edr.dns",
+            json!(["network"]),
+            json!(["protocol"]),
+            "dns-query",
+            "dns.question.name",
+        ),
+        (
+            alert(
+                EventCategory::ImageLoad,
+                7,
+                10,
+                EventFields::ImageLoad(ImageLoadFields {
+                    hashes: None,
+                    imphash: None,
+                    image_loaded: Some(r"C:\Temp\payload.dll".to_string()),
+                    process_id: Some("111".to_string()),
+                    image: Some(r"C:\Windows\System32\rundll32.exe".to_string()),
+                    original_file_name: Some("payload.dll".to_string()),
+                    product: None,
+                    description: None,
+                    company: None,
+                    file_version: None,
+                    signed: Some("false".to_string()),
+                    signature: None,
+                    signature_status: None,
+                    user: Some("alice".to_string()),
+                }),
+            ),
+            "edr.library",
+            json!(["library"]),
+            json!(["start"]),
+            "image-load",
+            "dll.path",
+        ),
+        (
+            alert(
+                EventCategory::Scripting,
+                4104,
+                0,
+                EventFields::PowerShellScript(PowerShellScriptFields {
+                    script_block_text: Some("Invoke-Expression".to_string()),
+                    script_block_id: Some("block-1".to_string()),
+                    message_number: Some("2".to_string()),
+                    message_total: Some("3".to_string()),
+                    path: Some(r"C:\Temp\a.ps1".to_string()),
+                    process_id: Some("111".to_string()),
+                    image: Some(
+                        r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe".to_string(),
+                    ),
+                    user: Some("alice".to_string()),
+                }),
+            ),
+            "edr.scripting",
+            json!(["process"]),
+            json!(["info"]),
+            "powershell-script",
+            "edr.powershell.script_block_text",
+        ),
+        (
+            alert(
+                EventCategory::PowerShellModule,
+                4103,
+                0,
+                EventFields::PowerShellModule(PowerShellModuleFields {
+                    context_info: Some("Host Application = powershell.exe".to_string()),
+                    payload: Some("CommandInvocation(New-Object)".to_string()),
+                    process_id: Some("111".to_string()),
+                    image: Some(
+                        r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe".to_string(),
+                    ),
+                    user: Some("alice".to_string()),
+                }),
+            ),
+            "edr.powershell_module",
+            json!(["process"]),
+            json!(["info"]),
+            "powershell-module",
+            "edr.powershell.context_info",
+        ),
+        (
+            alert(
+                EventCategory::Wmi,
+                5857,
+                0,
+                EventFields::WmiEvent(WmiEventFields {
+                    operation: Some("WmiMethod".to_string()),
+                    user: Some("alice".to_string()),
+                    query: Some("SELECT * FROM Win32_Process".to_string()),
+                    process_id: Some("111".to_string()),
+                    image: Some(r"C:\Windows\System32\wmic.exe".to_string()),
+                    event_namespace: Some("root\\cimv2".to_string()),
+                    event_type: Some("Consumer".to_string()),
+                    destination_hostname: Some("host1".to_string()),
+                    ..Default::default()
+                }),
+            ),
+            "edr.wmi",
+            json!(["api"]),
+            json!(["info"]),
+            "WmiMethod",
+            "edr.wmi.query",
+        ),
+        (
+            alert(
+                EventCategory::Service,
+                7045,
+                0,
+                EventFields::ServiceCreation(ServiceCreationFields {
+                    provider_name: Some("Service Control Manager".to_string()),
+                    service_name: Some("Updater".to_string()),
+                    service_file_name: Some(r"C:\Temp\updater.exe".to_string()),
+                    service_type: Some("own".to_string()),
+                    start_type: Some("auto".to_string()),
+                    account_name: Some("LocalSystem".to_string()),
+                    user: Some("alice".to_string()),
+                    process_id: Some("111".to_string()),
+                    image: Some(r"C:\Windows\System32\services.exe".to_string()),
+                }),
+            ),
+            "edr.service",
+            json!(["configuration"]),
+            json!(["creation"]),
+            "service-create",
+            "service.name",
+        ),
+        (
+            alert(
+                EventCategory::Task,
+                106,
+                0,
+                EventFields::TaskCreation(TaskCreationFields {
+                    task_name: Some("\\Updater".to_string()),
+                    task_content: Some("<Task />".to_string()),
+                    user_name: Some("alice".to_string()),
+                    user: Some("alice".to_string()),
+                    process_id: Some("111".to_string()),
+                    image: Some(r"C:\Windows\System32\schtasks.exe".to_string()),
+                }),
+            ),
+            "edr.task",
+            json!(["configuration"]),
+            json!(["creation"]),
+            "task-create",
+            "edr.task.name",
+        ),
+        (
+            alert(
+                EventCategory::Security,
+                4624,
+                0,
+                EventFields::SecurityAudit(security_audit_fields(&[
+                    ("SubjectUserName", "alice"),
+                    ("SubjectDomainName", "ACME"),
+                    ("TargetUserName", "bob"),
+                    ("LogonType", "3"),
+                    ("AuthenticationPackageName", "NTLM"),
+                    ("IpAddress", "10.0.0.9"),
+                ])),
+            ),
+            "edr.security",
+            json!(["authentication", "session"]),
+            json!(["start"]),
+            "logged-in",
+            "edr.security",
+        ),
+    ];
+
+    for (alert, dataset, category, event_type, action, required_field) in cases {
+        let json = ecs_json(&alert);
+        assert_ecs_field_eq(&json, "event.dataset", dataset);
+        assert_ecs_field_eq(&json, "event.category", category);
+        assert_ecs_field_eq(&json, "event.type", event_type);
+        assert_ecs_field_eq(&json, "event.action", action);
+        assert!(
+            json.get(required_field).is_some(),
+            "missing category-specific ECS field {required_field}"
+        );
+    }
+}
+
+#[test]
+fn related_ip_and_user_are_deduplicated() {
+    let mut network = network_connect_event(Platform::Windows);
+    if let rustinel::sensor::RawPayload::Network(fields) = &mut network.payload {
+        fields.source_ip = Some(TEST_DESTINATION_IP.to_string());
+        fields.user = Some(r"ACME\alice".to_string());
+    }
+
+    let normalizer = TestNormalizer::new();
+    let normalized = normalizer
+        .normalizer
+        .normalize(&network)
+        .expect("normalize network");
+    let alert = alert(
+        EventCategory::Network,
+        normalized.event_id,
+        normalized.opcode,
+        normalized.fields,
+    );
+    let json = ecs_json(&alert);
+
+    assert_ecs_field_eq(&json, "related.ip", json!([TEST_DESTINATION_IP]));
+    assert_ecs_field_eq(&json, "related.user", json!(["alice"]));
+}
+
+#[test]
+fn macos_file_create_alert_maps_ecs_fields() {
+    let normalizer = TestNormalizer::new();
+    let normalized = normalizer
+        .normalizer
+        .normalize(&file_create_event(Platform::MacOS))
+        .expect("normalize macos file event");
+    assert_eq!(normalized.platform, Platform::MacOS);
+
+    let alert = Alert {
+        severity: AlertSeverity::High,
+        rule_name: "macOS File Create".to_string(),
+        rule_description: None,
+        rule_id: None,
+        sigma_metadata: None,
+        engine: DetectionEngine::Sigma,
+        event: normalized,
+        match_details: None,
+    };
+    let json = ecs_json(&alert);
+
+    assert_ecs_field_eq(&json, "event.dataset", "edr.file");
+    assert_ecs_field_eq(&json, "event.category", json!(["file"]));
+    assert_ecs_field_eq(&json, "event.type", json!(["creation"]));
+    assert_ecs_field_eq(&json, "event.action", "file-create");
+    assert_ecs_field_eq(&json, "file.path", "/tmp/rustinel-fixture.txt");
+    assert_ecs_field_eq(&json, "host.os.type", "macos");
+    assert_ecs_field_eq(&json, "host.os.family", "darwin");
+}
+
+#[test]
+fn dns_alert_populates_category_specific_fields() {
+    let normalizer = TestNormalizer::new();
+    let normalized = normalizer
+        .normalizer
+        .normalize(&dns_query_event(Platform::Windows))
+        .expect("normalize dns");
+    let alert = alert(
+        EventCategory::Dns,
+        normalized.event_id,
+        normalized.opcode,
+        normalized.fields,
+    );
+    let json = ecs_json(&alert);
+
+    assert_ecs_field_eq(&json, "dns.question.name", TEST_DOMAIN);
+    assert_ecs_field_eq(&json, "dns.resolved_ip", json!([TEST_DESTINATION_IP]));
+    assert_ecs_field_eq(&json, "network.protocol", "dns");
+}
+
+#[test]
+fn ecs_version_matches_the_documented_target() {
+    let json = ecs_json(&alert(
+        EventCategory::Process,
+        1,
+        1,
+        EventFields::ProcessCreation(ProcessCreationFields {
+            hashes: None,
+            imphash: None,
+            container: Default::default(),
+            linux_identity: Default::default(),
+            cgroup_id: None,
+            exec: Default::default(),
+            parent_process_id_derived: false,
+            windows: Default::default(),
+            image: Some(r"C:\Windows\System32\cmd.exe".to_string()),
+            image_source: None,
+            image_truncated: None,
+            command_line: None,
+            process_id: None,
+            process_start_time: None,
+            parent_image: None,
+            parent_process_id: None,
+            parent_command_line: None,
+            parent_user: None,
+            current_directory: None,
+            integrity_level: None,
+            logon_id: None,
+            user: None,
+            original_file_name: None,
+            product: None,
+            description: None,
+            company: None,
+            file_version: None,
+            target_image: None,
+        }),
+    ));
+    let expected_version =
+        std::env::var("RUSTINEL_EXPECTED_ECS_VERSION").unwrap_or_else(|_| "9.5.0".to_string());
+    assert_ecs_field_eq(&json, "ecs.version", expected_version);
+
+    let emitted_version = json["ecs.version"]
+        .as_str()
+        .expect("ecs.version is a string");
+    let output_docs = include_str!("../docs/output.md");
+    let mut output_lines = output_docs.lines();
+    let documented_alert = output_lines
+        .by_ref()
+        .find(|line| *line == "```json")
+        .map(|_| {
+            output_lines
+                .by_ref()
+                .take_while(|line| *line != "```")
+                .collect::<Vec<_>>()
+                .join("\n")
+        })
+        .expect("docs/output.md contains a fenced JSON alert example");
+    let documented_alert: serde_json::Value =
+        serde_json::from_str(&documented_alert).expect("documented alert example is valid JSON");
+    assert_eq!(
+        documented_alert["ecs.version"], emitted_version,
+        "documented alert example must match the emitted ECS version"
+    );
+}
+
+#[test]
+fn ecs_process_image_truncation_marker_is_preserved() {
+    let long_prefix = format!("/{}", "deep/".repeat(52));
+    let json = ecs_json(&alert(
+        EventCategory::Process,
+        1,
+        1,
+        EventFields::ProcessCreation(ProcessCreationFields {
+            hashes: None,
+            imphash: None,
+            container: Default::default(),
+            linux_identity: Default::default(),
+            cgroup_id: None,
+            exec: Default::default(),
+            parent_process_id_derived: false,
+            windows: Default::default(),
+            image: Some(long_prefix),
+            image_source: None,
+            image_truncated: Some(true),
+            command_line: None,
+            process_id: Some("111".to_string()),
+            process_start_time: None,
+            parent_image: None,
+            parent_process_id: None,
+            parent_command_line: None,
+            parent_user: None,
+            current_directory: None,
+            integrity_level: None,
+            logon_id: None,
+            user: None,
+            original_file_name: None,
+            product: None,
+            description: None,
+            company: None,
+            file_version: None,
+            target_image: None,
+        }),
+    ));
+
+    assert_ecs_field_eq(&json, "edr.process.image_truncated", true);
+}
+
+#[test]
+fn test_rule_id_mapping_and_omit_behavior() {
+    // 1. Sigma with ID
+    let alert_sigma_with_id = Alert {
+        severity: AlertSeverity::High,
+        rule_name: "Test Rule".to_string(),
+        rule_description: None,
+        rule_id: Some("sigma::abc-123".to_string()),
+        sigma_metadata: None,
+        engine: DetectionEngine::Sigma,
+        event: NormalizedEvent {
+            timestamp: "2026-01-01T00:00:00Z".to_string(),
+            source_seq: None,
+            ingest_seq: 0,
+            platform: Platform::Windows,
+            provider: "test".to_string(),
+            category: EventCategory::Process,
+            event_id: 1,
+            event_id_string: "1".to_string(),
+            opcode: 1,
+            fields: EventFields::ProcessCreation(ProcessCreationFields {
+                hashes: None,
+                imphash: None,
+                container: Default::default(),
+                linux_identity: Default::default(),
+                cgroup_id: None,
+                exec: Default::default(),
+                parent_process_id_derived: false,
+                windows: Default::default(),
+                image: Some(r"C:\Windows\System32\cmd.exe".to_string()),
+                image_source: None,
+                image_truncated: None,
+                command_line: None,
+                process_id: None,
+                process_start_time: None,
+                parent_image: None,
+                parent_process_id: None,
+                parent_command_line: None,
+                parent_user: None,
+                current_directory: None,
+                integrity_level: None,
+                logon_id: None,
+                user: None,
+                original_file_name: None,
+                product: None,
+                description: None,
+                company: None,
+                file_version: None,
+                target_image: None,
+            }),
+            process_name: None,
+            provenance: Default::default(),
+            process_context: None,
+        },
+        match_details: None,
+    };
+    let json_sigma_with_id = ecs_json(&alert_sigma_with_id);
+    assert_ecs_field_eq(&json_sigma_with_id, "rule.id", "sigma::abc-123");
+
+    // 2. Sigma without ID (omitted)
+    let alert_sigma_no_id = Alert {
+        severity: AlertSeverity::High,
+        rule_name: "Test Rule".to_string(),
+        rule_description: None,
+        rule_id: None,
+        sigma_metadata: None,
+        engine: DetectionEngine::Sigma,
+        event: alert_sigma_with_id.event.clone(),
+        match_details: None,
+    };
+    let json_sigma_no_id = ecs_json(&alert_sigma_no_id);
+    assert!(json_sigma_no_id
+        .get("rule")
+        .and_then(|r| r.get("id"))
+        .is_none());
+
+    // 3. YARA with ID
+    let alert_yara_with_id = Alert {
+        severity: AlertSeverity::Critical,
+        rule_name: "YaraRule".to_string(),
+        rule_description: None,
+        rule_id: Some("yara::yara-rule-uuid".to_string()),
+        sigma_metadata: None,
+        engine: DetectionEngine::Yara,
+        event: alert_sigma_with_id.event.clone(),
+        match_details: None,
+    };
+    let json_yara_with_id = ecs_json(&alert_yara_with_id);
+    assert_ecs_field_eq(&json_yara_with_id, "rule.id", "yara::yara-rule-uuid");
+
+    // 4. YARA without ID (omitted)
+    let alert_yara_no_id = Alert {
+        severity: AlertSeverity::Critical,
+        rule_name: "YaraRule".to_string(),
+        rule_description: None,
+        rule_id: None,
+        sigma_metadata: None,
+        engine: DetectionEngine::Yara,
+        event: alert_sigma_with_id.event.clone(),
+        match_details: None,
+    };
+    let json_yara_no_id = ecs_json(&alert_yara_no_id);
+    assert!(json_yara_no_id
+        .get("rule")
+        .and_then(|r| r.get("id"))
+        .is_none());
+
+    // 5. IOC (always present, formatted as ioc::kind::indicator)
+    let alert_ioc = Alert {
+        severity: AlertSeverity::Medium,
+        rule_name: "ioc:domain:example.com".to_string(),
+        rule_description: None,
+        rule_id: Some("ioc::domain::example.com".to_string()),
+        sigma_metadata: None,
+        engine: DetectionEngine::Ioc,
+        event: alert_sigma_with_id.event.clone(),
+        match_details: None,
+    };
+    let json_ioc = ecs_json(&alert_ioc);
+    assert_ecs_field_eq(&json_ioc, "rule.id", "ioc::domain::example.com");
+}
+
+#[test]
+fn replay_style_mapping_never_invents_identity() {
+    let harness = TestNormalizer::new();
+    let event = harness
+        .normalizer
+        .normalize(&process_start_event(Platform::Linux))
+        .expect("process start should normalize");
+    let alert = Alert {
+        severity: AlertSeverity::High,
+        rule_name: "Identity".to_string(),
+        rule_description: None,
+        rule_id: None,
+        sigma_metadata: None,
+        engine: DetectionEngine::Sigma,
+        event,
+        match_details: None,
+    };
+    let json = serde_json::to_value(rustinel::models::ecs::EcsAlert::from(&alert)).unwrap();
+    for key in [
+        "host.id",
+        "host.name",
+        "agent.id",
+        "agent.type",
+        "agent.version",
+    ] {
+        assert!(
+            json.get(key).is_none(),
+            "{key} must come from the sink only"
+        );
+    }
+}

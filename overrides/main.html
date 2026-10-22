@@ -1,0 +1,47 @@
+{% extends "base.html" %}
+
+<!--
+  Open Graph + Twitter Card meta for rich link previews.
+  Injected into the <head> via Zensical's `extrahead` block.
+  The social image is a PNG (1200x630) because social platforms do not
+  reliably render SVG og:images.
+-->
+{% block extrahead %}
+  {#- Page title: "<page> - <site>" on inner pages, just "<site>" on home -#}
+  {% if page.meta and page.meta.title %}
+    {% set og_title = page.meta.title %}
+  {% elif page.title and not page.is_homepage %}
+    {% set og_title = (page.title | striptags) ~ " - " ~ config.site_name %}
+  {% else %}
+    {% set og_title = config.site_name %}
+  {% endif %}
+
+  {%- if page.meta and page.meta.description %}
+    {% set og_desc = page.meta.description %}
+  {% else %}
+    {% set og_desc = config.site_description %}
+  {%- endif %}
+
+  {%- set base_url = (config.site_url or "https://docs.rustinel.io/") | trim -%}
+  {%- set og_image = base_url ~ "assets/images/social-card.png" -%}
+  {%- set og_url = page.canonical_url or base_url -%}
+
+  <!-- Open Graph -->
+  <meta property="og:type" content="website">
+  <meta property="og:site_name" content="{{ config.site_name }}">
+  <meta property="og:title" content="{{ og_title }}">
+  <meta property="og:description" content="{{ og_desc }}">
+  <meta property="og:url" content="{{ og_url }}">
+  <meta property="og:image" content="{{ og_image }}">
+  <meta property="og:image:type" content="image/png">
+  <meta property="og:image:width" content="1200">
+  <meta property="og:image:height" content="630">
+  <meta property="og:image:alt" content="{{ config.site_name }} — {{ config.site_description }}">
+
+  <!-- Twitter Card -->
+  <meta name="twitter:card" content="summary_large_image">
+  <meta name="twitter:title" content="{{ og_title }}">
+  <meta name="twitter:description" content="{{ og_desc }}">
+  <meta name="twitter:image" content="{{ og_image }}">
+  <meta name="twitter:image:alt" content="{{ config.site_name }} — {{ config.site_description }}">
+{% endblock %}

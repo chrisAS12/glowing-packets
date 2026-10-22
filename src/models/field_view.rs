@@ -1,0 +1,606 @@
+//! Detection field views over Rustinel's canonical event data.
+//!
+//! Sensors populate the snake-case Rust fields in [`NormalizedEvent`].  The
+//! names a rule sees live here instead: each static entry maps one view field
+//! to a semantic Rustinel accessor.  Adding another rule vocabulary therefore
+//! changes this module, routing, and its availability contract, not a sensor.
+
+use super::{EventFields, NormalizedEvent};
+use crate::field_availability::{self, Availability, EventFieldContract};
+use serde::Serialize;
+
+/// A named rule-field vocabulary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
+#[serde(transparent)]
+pub struct FieldViewName(&'static str);
+
+impl FieldViewName {
+    pub const SYSMON: Self = Self("sysmon");
+    /// The Linux audit record vocabulary (`type`, `SYSCALL`, `a0`..`a7`, `exe`,
+    /// `name`), rendered over the eBPF sensor's own measurements.
+    pub const AUDITD: Self = Self("auditd");
+    pub const DEFAULT: Self = Self::SYSMON;
+
+    pub const fn as_str(self) -> &'static str {
+        self.0
+    }
+}
+
+/// Rustinel's semantic field identifiers.
+///
+/// These names describe the data, independent of any external rule schema.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CanonicalField {
+    /// Zero-based argv entry of an exec. Audit `a0`..`a7` on `EXECVE`.
+    /// Raw syscall arguments are a different fact and never share this.
+    AuditArg(u8),
+    AuditComm,
+    AuditEuid,
+    /// Audit `name`: the executed path, or the file path(s) of a file event.
+    AuditName,
+    AuditNameType,
+    /// The syscall entry point: `execve` or `execveat` for an exec.
+    AuditSyscall,
+    /// The audit record types one event stands for.
+    AuditType,
+    AccountName,
+    CdHash,
+    Channel,
+    Code,
+    CodeSigningFlags,
+    CommandLine,
+    Company,
+    Component,
+    ConsumerClass,
+    ConsumerName,
+    ConsumerText,
+    CgroupId,
+    CgroupPath,
+    ContainerId,
+    ContainerRuntime,
+    ContextInfo,
+    ControllingTty,
+    CreationTime,
+    CurrentDirectory,
+    Data,
+    Description,
+    Destination,
+    DestinationHostname,
+    DestinationIp,
+    DestinationPort,
+    DnsLabelCount,
+    DnsLongestLabel,
+    DnsQueryName,
+    DnsNameLength,
+    DnsRegisteredDomain,
+    DnsQueryResults,
+    DnsQueryStatus,
+    DnsQueryTruncated,
+    DnsRecordType,
+    EffectiveGroupId,
+    EffectiveUserId,
+    EventId,
+    EventNamespace,
+    EventType,
+    FileVersion,
+    FilterName,
+    Hashes,
+    HostProcess,
+    ImageLoaded,
+    ImageSource,
+    ImageTruncated,
+    Imphash,
+    Initiated,
+    IntegrityLevel,
+    IsPlatformBinary,
+    KernelStartBoottime,
+    LogonId,
+    MessageNumber,
+    MessageTotal,
+    MountNamespace,
+    NetworkNamespace,
+    NewName,
+    Operation,
+    OriginalFileName,
+    ParentCommandLine,
+    ParentImage,
+    ParentProcessId,
+    ParentUser,
+    Path,
+    PathTruncated,
+    Payload,
+    PidNamespace,
+    PossibleCause,
+    PreExecImage,
+    PreviousCreationTime,
+    ProcessId,
+    ProcessImage,
+    ProcessStartTime,
+    Product,
+    Protocol,
+    ProviderName,
+    ProviderPath,
+    Query,
+    RealGroupId,
+    RealUserId,
+    ResultCode,
+    Script,
+    ScriptBlockId,
+    ScriptBlockText,
+    ServiceFileName,
+    ServiceName,
+    ServiceType,
+    SessionId,
+    Signature,
+    SignatureStatus,
+    Signed,
+    SigningId,
+    SourceFilename,
+    SourceIp,
+    SourcePort,
+    StartType,
+    TargetFilename,
+    TargetImage,
+    TargetObject,
+    TaskContent,
+    TaskName,
+    TeamId,
+    Timestamp,
+    User,
+    UserName,
+    Details,
+}
+
+/// A canonical value without imposing one external schema's representation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CanonicalValue<'a> {
+    String(&'a str),
+    /// A fact several records carry at once, such as audit `type`.
+    Strs(&'static [&'static str]),
+    /// Two values of one field, such as the source and target `name` of a
+    /// rename.
+    Pair(&'a str, &'a str),
+    Bool(bool),
+    U64(u64),
+}
+
+/// One compile-time field mapping in a named view.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FieldMapping {
+    pub name: &'static str,
+    pub canonical: CanonicalField,
+    /// Whether the name is part of enumeration and keyword matching. Some
+    /// compatibility aliases remain addressable without duplicating values.
+    pub enumerate: bool,
+}
+
+const fn field(name: &'static str, canonical: CanonicalField) -> FieldMapping {
+    FieldMapping {
+        name,
+        canonical,
+        enumerate: true,
+    }
+}
+
+const fn alias(name: &'static str, canonical: CanonicalField) -> FieldMapping {
+    FieldMapping {
+        name,
+        canonical,
+        enumerate: false,
+    }
+}
+
+/// Read-only fields computed from another field. They are addressable by
+/// name but are not enumerated, so keyword matching never sees them.
+#[cfg(test)]
+const DERIVED_FIELDS: &[&str] = &[
+    "QueryLabelCount",
+    "QueryLongestLabel",
+    "QueryNameLength",
+    "QueryRegisteredDomain",
+];
+
+/// Sysmon-compatible rule names, sorted for allocation-free binary lookup.
+///
+/// This is the compatibility surface that `NormalizedEvent::get_field`
+/// historically exposed. Keep aliases such as `ImagePath`, lowercase DNS
+/// names, and Rustinel fidelity fields in this table.
+pub const SYSMON_FIELDS: &[FieldMapping] = &[
+    field("AccountName", CanonicalField::AccountName),
+    field("CdHash", CanonicalField::CdHash),
+    field("CgroupId", CanonicalField::CgroupId),
+    field("CgroupPath", CanonicalField::CgroupPath),
+    field("Channel", CanonicalField::Channel),
+    field("Code", CanonicalField::Code),
+    field("CodeSigningFlags", CanonicalField::CodeSigningFlags),
+    field("CommandLine", CanonicalField::CommandLine),
+    field("Company", CanonicalField::Company),
+    field("Component", CanonicalField::Component),
+    field("ConsumerClass", CanonicalField::ConsumerClass),
+    field("ConsumerName", CanonicalField::ConsumerName),
+    field("ConsumerText", CanonicalField::ConsumerText),
+    field("ContainerId", CanonicalField::ContainerId),
+    field("ContainerRuntime", CanonicalField::ContainerRuntime),
+    field("ContextInfo", CanonicalField::ContextInfo),
+    field("ControllingTty", CanonicalField::ControllingTty),
+    field("CreationUtcTime", CanonicalField::CreationTime),
+    field("CurrentDirectory", CanonicalField::CurrentDirectory),
+    field("Data", CanonicalField::Data),
+    field("Description", CanonicalField::Description),
+    field("Destination", CanonicalField::Destination),
+    field("DestinationHostname", CanonicalField::DestinationHostname),
+    field("DestinationIp", CanonicalField::DestinationIp),
+    field("DestinationPort", CanonicalField::DestinationPort),
+    field("Details", CanonicalField::Details),
+    field("EffectiveGroupId", CanonicalField::EffectiveGroupId),
+    field("EffectiveUserId", CanonicalField::EffectiveUserId),
+    field("EventID", CanonicalField::EventId),
+    field("EventNamespace", CanonicalField::EventNamespace),
+    field("EventType", CanonicalField::EventType),
+    field("FileVersion", CanonicalField::FileVersion),
+    field("FilterName", CanonicalField::FilterName),
+    field("Hashes", CanonicalField::Hashes),
+    field("HostProcess", CanonicalField::HostProcess),
+    field("Image", CanonicalField::ProcessImage),
+    field("ImageLoaded", CanonicalField::ImageLoaded),
+    alias("ImagePath", CanonicalField::ServiceFileName),
+    field("ImageSource", CanonicalField::ImageSource),
+    field("ImageTruncated", CanonicalField::ImageTruncated),
+    field("Imphash", CanonicalField::Imphash),
+    field("Initiated", CanonicalField::Initiated),
+    field("IntegrityLevel", CanonicalField::IntegrityLevel),
+    field("IsPlatformBinary", CanonicalField::IsPlatformBinary),
+    field("KernelStartBoottime", CanonicalField::KernelStartBoottime),
+    field("LogonId", CanonicalField::LogonId),
+    field("MessageNumber", CanonicalField::MessageNumber),
+    field("MessageTotal", CanonicalField::MessageTotal),
+    field("MountNamespace", CanonicalField::MountNamespace),
+    field("NetworkNamespace", CanonicalField::NetworkNamespace),
+    field("NewName", CanonicalField::NewName),
+    field("Operation", CanonicalField::Operation),
+    field("OriginalFileName", CanonicalField::OriginalFileName),
+    field("ParentCommandLine", CanonicalField::ParentCommandLine),
+    field("ParentImage", CanonicalField::ParentImage),
+    field("ParentProcessId", CanonicalField::ParentProcessId),
+    field("ParentUser", CanonicalField::ParentUser),
+    field("Path", CanonicalField::Path),
+    field("PathTruncated", CanonicalField::PathTruncated),
+    field("Payload", CanonicalField::Payload),
+    field("PidNamespace", CanonicalField::PidNamespace),
+    field("PossibleCause", CanonicalField::PossibleCause),
+    field("PreExecImage", CanonicalField::PreExecImage),
+    field(
+        "PreviousCreationUtcTime",
+        CanonicalField::PreviousCreationTime,
+    ),
+    field("ProcessId", CanonicalField::ProcessId),
+    field("ProcessStartTime", CanonicalField::ProcessStartTime),
+    field("Product", CanonicalField::Product),
+    field("Protocol", CanonicalField::Protocol),
+    field("ProviderName", CanonicalField::ProviderName),
+    field("ProviderPath", CanonicalField::ProviderPath),
+    field("Provider_Name", CanonicalField::ProviderName),
+    field("Query", CanonicalField::Query),
+    alias("QueryLabelCount", CanonicalField::DnsLabelCount),
+    alias("QueryLongestLabel", CanonicalField::DnsLongestLabel),
+    field("QueryName", CanonicalField::DnsQueryName),
+    alias("QueryNameLength", CanonicalField::DnsNameLength),
+    alias("QueryRegisteredDomain", CanonicalField::DnsRegisteredDomain),
+    field("QueryResults", CanonicalField::DnsQueryResults),
+    field("QueryStatus", CanonicalField::DnsQueryStatus),
+    field("QueryTruncated", CanonicalField::DnsQueryTruncated),
+    field("RealGroupId", CanonicalField::RealGroupId),
+    field("RealUserId", CanonicalField::RealUserId),
+    field("RecordType", CanonicalField::DnsRecordType),
+    field("ResultCode", CanonicalField::ResultCode),
+    field("Script", CanonicalField::Script),
+    field("ScriptBlockId", CanonicalField::ScriptBlockId),
+    field("ScriptBlockText", CanonicalField::ScriptBlockText),
+    field("ServiceFileName", CanonicalField::ServiceFileName),
+    field("ServiceName", CanonicalField::ServiceName),
+    field("ServiceType", CanonicalField::ServiceType),
+    field("SessionId", CanonicalField::SessionId),
+    field("Signature", CanonicalField::Signature),
+    field("SignatureStatus", CanonicalField::SignatureStatus),
+    field("Signed", CanonicalField::Signed),
+    field("SigningId", CanonicalField::SigningId),
+    field("SourceFilename", CanonicalField::SourceFilename),
+    field("SourceIp", CanonicalField::SourceIp),
+    field("SourcePort", CanonicalField::SourcePort),
+    field("StartType", CanonicalField::StartType),
+    field("TargetFilename", CanonicalField::TargetFilename),
+    field("TargetImage", CanonicalField::TargetImage),
+    field("TargetObject", CanonicalField::TargetObject),
+    field("TaskContent", CanonicalField::TaskContent),
+    field("TaskName", CanonicalField::TaskName),
+    field("TeamId", CanonicalField::TeamId),
+    field("User", CanonicalField::User),
+    field("UserName", CanonicalField::UserName),
+    alias("answer", CanonicalField::DnsQueryResults),
+    alias("event_time", CanonicalField::Timestamp),
+    alias("query", CanonicalField::DnsQueryName),
+    alias("record_type", CanonicalField::DnsRecordType),
+    field("timestamp", CanonicalField::Timestamp),
+];
+
+/// Linux audit record names, sorted for allocation-free binary lookup.
+///
+/// This is a projection of eBPF telemetry, not an audit log. `key` and `unit`
+/// are deliberately absent: an audit key is a label an operator configures, and
+/// a view must never manufacture one.
+pub const AUDITD_FIELDS: &[FieldMapping] = &[
+    field("SYSCALL", CanonicalField::AuditSyscall),
+    field("a0", CanonicalField::AuditArg(0)),
+    field("a1", CanonicalField::AuditArg(1)),
+    field("a2", CanonicalField::AuditArg(2)),
+    field("a3", CanonicalField::AuditArg(3)),
+    field("a4", CanonicalField::AuditArg(4)),
+    field("a5", CanonicalField::AuditArg(5)),
+    field("a6", CanonicalField::AuditArg(6)),
+    field("a7", CanonicalField::AuditArg(7)),
+    field("comm", CanonicalField::AuditComm),
+    field("euid", CanonicalField::AuditEuid),
+    field("exe", CanonicalField::ProcessImage),
+    field("name", CanonicalField::AuditName),
+    field("nametype", CanonicalField::AuditNameType),
+    alias("syscall", CanonicalField::AuditSyscall),
+    field("type", CanonicalField::AuditType),
+];
+
+#[derive(Debug, Clone, Copy)]
+pub struct FieldViewDefinition {
+    pub name: FieldViewName,
+    pub fields: &'static [FieldMapping],
+}
+
+/// Every detection view compiled into Rustinel.
+pub const FIELD_VIEWS: &[FieldViewDefinition] = &[
+    FieldViewDefinition {
+        name: FieldViewName::SYSMON,
+        fields: SYSMON_FIELDS,
+    },
+    FieldViewDefinition {
+        name: FieldViewName::AUDITD,
+        fields: AUDITD_FIELDS,
+    },
+];
+
+pub fn mappings(view: FieldViewName) -> &'static [FieldMapping] {
+    FIELD_VIEWS
+        .iter()
+        .find(|definition| definition.name == view)
+        .map(|definition| definition.fields)
+        .unwrap_or(&[])
+}
+
+fn mapping(view: FieldViewName, name: &str) -> Option<&'static FieldMapping> {
+    let mappings = mappings(view);
+    mappings
+        .binary_search_by_key(&name, |mapping| mapping.name)
+        .ok()
+        .map(|index| &mappings[index])
+}
+
+/// The name a contract lists `name` under.
+///
+/// Contracts record each field once, under its enumerated name.
+/// A compatibility alias shares its target's availability, so it resolves to
+/// the enumerated mapping of the same canonical field.
+pub(crate) fn contract_field_name(view: FieldViewName, name: &str) -> &str {
+    let Some(alias) = mapping(view, name).filter(|mapping| !mapping.enumerate) else {
+        return name;
+    };
+    mappings(view)
+        .iter()
+        .find(|mapping| mapping.enumerate && mapping.canonical == alias.canonical)
+        .map_or(name, |mapping| mapping.name)
+}
+
+/// Whether the contract declares `name` unavailable, which hides a value a
+/// producer populated by mistake.
+fn is_never(contract: Option<&'static EventFieldContract>, name: &str) -> bool {
+    matches!(
+        field_availability::availability_in_contract(contract, name),
+        Some(Availability::Never(_))
+    )
+}
+
+/// A borrowed rendering of one event in a selected field vocabulary.
+#[derive(Debug, Clone, Copy)]
+pub struct FieldView<'a> {
+    event: &'a NormalizedEvent,
+    name: FieldViewName,
+}
+
+impl<'a> FieldView<'a> {
+    pub const fn new(event: &'a NormalizedEvent, name: FieldViewName) -> Self {
+        Self { event, name }
+    }
+
+    pub const fn name(self) -> FieldViewName {
+        self.name
+    }
+
+    pub fn get(self, name: &str) -> Option<CanonicalValue<'a>> {
+        // Most reads miss, so the contract is resolved only for a value.
+        let value = self.get_unchecked(name)?;
+        let contract = field_availability::event_contract(self.name, self.event);
+        (!is_never(contract, name)).then_some(value)
+    }
+
+    /// [`Self::get`] against a contract the caller resolved once with
+    /// [`field_availability::event_contract`], for detection, which reads
+    /// hundreds of fields of the same event.
+    pub(crate) fn get_in_contract(
+        self,
+        contract: Option<&'static EventFieldContract>,
+        name: &str,
+    ) -> Option<CanonicalValue<'a>> {
+        let value = self.get_unchecked(name)?;
+        (!is_never(contract, name)).then_some(value)
+    }
+
+    /// Visit every mapped field whose value comes from the canonical model,
+    /// as [`Self::get_in_contract`] would read it, without looking each
+    /// mapping up by name again.
+    ///
+    /// Native payload names, which [`Self::get_unchecked`] falls back to, are
+    /// not visited here; [`Self::dynamic_fields`] lists them.
+    pub(crate) fn visit_mapped(
+        self,
+        contract: Option<&'static EventFieldContract>,
+        mut visit: impl FnMut(&'static FieldMapping, CanonicalValue<'a>),
+    ) {
+        for mapping in self.mappings() {
+            let Some(value) = self.event.canonical_value(mapping.canonical, self.name) else {
+                continue;
+            };
+            if !is_never(contract, mapping.name) {
+                visit(mapping, value);
+            }
+        }
+    }
+
+    /// Read through the mapping without applying the availability contract.
+    /// Contract validation uses this to find contradictory producer state.
+    pub(crate) fn get_unchecked(self, name: &str) -> Option<CanonicalValue<'a>> {
+        if let Some(mapping) = mapping(self.name, name) {
+            if let Some(value) = self.event.canonical_value(mapping.canonical, self.name) {
+                return Some(value);
+            }
+        }
+
+        // Native, allowlisted Event Log fields and test-only generic payloads
+        // are already named for the default compatibility view. They stay
+        // behind the view boundary rather than making the canonical model
+        // string-addressable or leaking automatically into future views.
+        if self.name != FieldViewName::SYSMON {
+            return None;
+        }
+        match &self.event.fields {
+            EventFields::SecurityAudit(fields) => fields.get(name).map(CanonicalValue::String),
+            EventFields::ApplicationEvent(fields) => fields.get(name).map(CanonicalValue::String),
+            EventFields::Generic(fields) => fields
+                .get(name)
+                .map(String::as_str)
+                .map(CanonicalValue::String),
+            _ => None,
+        }
+    }
+
+    pub fn mappings(self) -> &'static [FieldMapping] {
+        mappings(self.name)
+    }
+
+    pub fn dynamic_fields(self) -> Box<dyn Iterator<Item = (&'a str, &'a str)> + 'a> {
+        if self.name != FieldViewName::SYSMON {
+            return Box::new(std::iter::empty());
+        }
+        match &self.event.fields {
+            EventFields::SecurityAudit(fields) => Box::new(
+                fields
+                    .fields
+                    .iter()
+                    .map(|(name, value)| (name.as_str(), value.as_str())),
+            ),
+            EventFields::ApplicationEvent(fields) => Box::new(
+                fields
+                    .fields
+                    .iter()
+                    .map(|(name, value)| (name.as_str(), value.as_str())),
+            ),
+            EventFields::Generic(fields) => Box::new(
+                fields
+                    .iter()
+                    .map(|(name, value)| (name.as_str(), value.as_str())),
+            ),
+            _ => Box::new(std::iter::empty()),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::field_availability::{Availability, FIELD_AVAILABILITY};
+
+    #[test]
+    fn sysmon_table_is_sorted_and_unique() {
+        for pair in SYSMON_FIELDS.windows(2) {
+            assert!(pair[0].name < pair[1].name, "{:?} is not sorted", pair);
+        }
+    }
+
+    #[test]
+    fn auditd_table_is_sorted_and_unique() {
+        for pair in AUDITD_FIELDS.windows(2) {
+            assert!(pair[0].name < pair[1].name, "{:?} is not sorted", pair);
+        }
+    }
+
+    #[test]
+    fn auditd_view_never_maps_operator_labels() {
+        for name in ["key", "unit"] {
+            assert!(mapping(FieldViewName::AUDITD, name).is_none(), "{name}");
+        }
+    }
+
+    #[test]
+    fn rustinel_fidelity_fields_are_part_of_the_sysmon_view() {
+        for name in ["ImageSource", "ImageTruncated", "PathTruncated"] {
+            assert!(mapping(FieldViewName::SYSMON, name).is_some(), "{name}");
+        }
+    }
+
+    #[test]
+    fn every_typed_available_field_has_a_sysmon_mapping() {
+        for contract in FIELD_AVAILABILITY
+            .iter()
+            .filter(|contract| contract.view == FieldViewName::SYSMON)
+            .filter(|contract| !matches!(contract.category, "security" | "windefend"))
+            .filter(|contract| !matches!(contract.category, "security" | "application"))
+        {
+            for field in contract
+                .fields
+                .iter()
+                .filter(|field| !matches!(field.availability, Availability::Never(_)))
+            {
+                assert!(
+                    mapping(FieldViewName::SYSMON, field.field).is_some(),
+                    "missing {}/{}/{}",
+                    contract.platform.as_str(),
+                    contract.category,
+                    field.field
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn every_alias_has_its_target_availability() {
+        for contract in FIELD_AVAILABILITY
+            .iter()
+            .filter(|contract| contract.view == FieldViewName::SYSMON)
+        {
+            let contract = Some(contract);
+            // Derived fields have no enumerated twin: they stay out of keyword
+            // matching and enumeration, and carry their own availability.
+            for alias in SYSMON_FIELDS
+                .iter()
+                .filter(|mapping| !mapping.enumerate && !DERIVED_FIELDS.contains(&mapping.name))
+            {
+                let target = SYSMON_FIELDS
+                    .iter()
+                    .find(|mapping| mapping.enumerate && mapping.canonical == alias.canonical)
+                    .expect("alias has an enumerated target");
+                assert_eq!(
+                    field_availability::availability_in_contract(contract, alias.name),
+                    field_availability::availability_in_contract(contract, target.name),
+                    "{} vs {}",
+                    alias.name,
+                    target.name
+                );
+            }
+        }
+    }
+}

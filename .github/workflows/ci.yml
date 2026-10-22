@@ -1,0 +1,806 @@
+name: CI
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+    branches: [master, main]
+  workflow_call:
+    inputs:
+      skip_atomics:
+        description: Skip source-built atomic tests when release artifacts will be tested
+        required: false
+        type: boolean
+        default: false
+
+env:
+  CARGO_TERM_COLOR: always
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+# rust-cache hashes every toolchain `rustup toolchain list` shows into its key,
+# so each job first removes the runner image's own toolchains: otherwise image
+# rollouts split every cache in two. The key keeps its lockfile hash
+# (Cargo.lock, manifests, rust-toolchain.toml), so a bump makes a new key that
+# falls back to the previous cache. Only main saves; PRs restore main's caches,
+# which keeps the repo under the 10 GB cache cap.
+jobs:
+  fmt:
+    name: Rustfmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2.0.0
+        with:
+          components: rustfmt
+          cache: false
+          rustflags: ""
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+  release-field-contract:
+    name: Release Field Contract
+    if: github.ref_type == 'tag'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - name: Require released since versions
+        run: |
+          if grep -n '"since": "unreleased"' compatibility/field-availability.json; then
+            echo "::error file=src/field_availability.rs::Replace every Some(UNRELEASED) with the version being released, then run cargo run --bin generate-docs"
+            exit 1
+          fi
+
+  supply-chain:
+    name: Supply Chain
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2.0.0
+        with:
+          cache: false
+          rustflags: ""
+      - uses: taiki-e/install-action@1168f6810a3cb30a3514bf5756a3b7f0422c6df8 # v2.87.28
+        with:
+          tool: cargo-deny
+      - name: Check root dependencies
+        run: cargo deny --locked check
+      - name: Check eBPF dependencies
+        working-directory: ebpf
+        run: cargo deny --locked check
+
+  ebpf-build:
+    name: Linux eBPF Build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      # bpf-linker links against a specific LLVM, so it has to match the LLVM
+      # the nightly toolchain ships. Both pins move together — bumping one
+      # without the other breaks this job.
+      - name: Setup nightly Rust toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2.0.0
+        with:
+          toolchain: nightly-2026-08-11
+          components: rust-src
+          cache: false
+          rustflags: ""
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          # Keeps the toolchain hash: the nightly and bpf-linker pins live in
+          # this job, so a pin bump must change the key and drop the cached
+          # bpf-linker binary.
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      - name: Install bpf-linker
+        run: command -v bpf-linker >/dev/null 2>&1 || cargo install bpf-linker --version 0.10.4 --locked
+
+      - name: Build eBPF object
+        run: |
+          cd ebpf
+          cargo build --release
+          cp target/bpfel-unknown-none/release/rustinel-ebpf rustinel-ebpf.o
+
+      - name: Upload eBPF artifact
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: rustinel-ebpf-object
+          path: ebpf/rustinel-ebpf.o
+          retention-days: 1
+
+  ebpf-load:
+    name: Linux eBPF Load (${{ matrix.kernel }})
+    runs-on: ubuntu-latest
+    needs: ebpf-build
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        kernel: [runner, "5.10"]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2.0.0
+        with:
+          cache: false
+          rustflags: ""
+      - name: Keep only the pinned toolchain
+        shell: bash
+        run: |
+          pin="$(sed -n 's/^channel = "\(.*\)"/\1/p' rust-toolchain.toml)"
+          rustup toolchain list --quiet | tr -d '\r' | { grep -v "^${pin}-" || true; } |
+            xargs -r -n1 rustup toolchain uninstall
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+          # One cache per leg: they build different things, and a shared key
+          # let the quicker 5.10 leg save first, so the runner leg's debug
+          # build for the live tests was never cached.
+          key: ${{ matrix.kernel }}
+      - name: Download eBPF artifact
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: rustinel-ebpf-object
+          path: .ci/ebpf-object
+      - name: Build agent with downloaded eBPF object
+        run: |
+          cp .ci/ebpf-object/rustinel-ebpf.o ebpf/rustinel-ebpf.o
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS="-C target-feature=+crt-static" \
+            cargo build --locked --release --target x86_64-unknown-linux-gnu
+      - name: Load and exercise eBPF on runner kernel
+        if: matrix.kernel == 'runner'
+        run: |
+          sudo -E python3 tests/ebpf_load_smoke.py \
+            --binary target/x86_64-unknown-linux-gnu/release/rustinel \
+            --ebpf-object .ci/ebpf-object/rustinel-ebpf.o \
+            --rules-dir rules/sigma \
+            --artifacts-dir .ci/ebpf-load-runner
+          sudo -E python3 tests/native_capture_contract.py \
+            --binary "$GITHUB_WORKSPACE/target/x86_64-unknown-linux-gnu/release/rustinel"
+      - name: Run live eBPF tests on runner kernel
+        if: matrix.kernel == 'runner'
+        run: tests/ebpf_live_tests.sh
+      - name: Check graceful systemd stop on runner kernel
+        if: matrix.kernel == 'runner'
+        run: |
+          sudo -E python3 tests/systemd_stop_smoke.py \
+            --binary "$GITHUB_WORKSPACE/target/x86_64-unknown-linux-gnu/release/rustinel" \
+            --rules-dir "$GITHUB_WORKSPACE/rules/sigma"
+      - name: Load and exercise eBPF on Linux 5.10
+        if: matrix.kernel == '5.10'
+        uses: cilium/little-vm-helper@f86d344aca812dda5aef167867a9a0a90ca6cca5 # v0.0.31
+        with:
+          test-name: rustinel-ebpf-load
+          image: kind
+          # LVH's rolling tag extracts to kind_5.10.qcow2 but the action looks
+          # for kind_5.10-main.qcow2. Use the immutable dated tag so its image
+          # name and the action's derived path agree.
+          image-version: 5.10-20260914.012528
+          kernel-version: 5.10-main
+          host-mount: .
+          install-dependencies: true
+          cpu: 2
+          mem: 4G
+          cmd: |
+            uname -a
+            python3 /host/tests/ebpf_load_smoke.py \
+              --binary /host/target/x86_64-unknown-linux-gnu/release/rustinel \
+              --ebpf-object /host/.ci/ebpf-object/rustinel-ebpf.o \
+              --rules-dir /host/rules/sigma \
+              --artifacts-dir /host/.ci/ebpf-load-5.10 \
+              --expected-degradations /host/tests/ebpf_expected_degradations_5.10.txt
+            python3 /host/tests/native_capture_contract.py \
+              --binary /host/target/x86_64-unknown-linux-gnu/release/rustinel
+      - name: Upload eBPF load diagnostics
+        if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ebpf-load-${{ matrix.kernel }}
+          path: .ci/ebpf-load-${{ matrix.kernel }}/
+          include-hidden-files: true
+          if-no-files-found: warn
+
+  clippy-linux:
+    name: Clippy (Linux)
+    runs-on: ubuntu-latest
+    needs: ebpf-build
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2.0.0
+        with:
+          components: clippy
+          cache: false
+          rustflags: ""
+      - name: Keep only the pinned toolchain
+        shell: bash
+        run: |
+          pin="$(sed -n 's/^channel = "\(.*\)"/\1/p' rust-toolchain.toml)"
+          rustup toolchain list --quiet | tr -d '\r' | { grep -v "^${pin}-" || true; } |
+            xargs -r -n1 rustup toolchain uninstall
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Download eBPF artifact
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: rustinel-ebpf-object
+          path: ebpf/
+      - run: cargo clippy --locked --all-targets -- -D clippy::all
+
+  clippy-windows:
+    name: Clippy (Windows)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2.0.0
+        with:
+          components: clippy
+          cache: false
+          rustflags: ""
+      - name: Keep only the pinned toolchain
+        shell: bash
+        run: |
+          pin="$(sed -n 's/^channel = "\(.*\)"/\1/p' rust-toolchain.toml)"
+          rustup toolchain list --quiet | tr -d '\r' | { grep -v "^${pin}-" || true; } |
+            xargs -r -n1 rustup toolchain uninstall
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - run: cargo clippy --locked --all-targets -- -D clippy::all
+
+  clippy-macos:
+    name: Clippy (macOS)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2.0.0
+        with:
+          components: clippy
+          cache: false
+          rustflags: ""
+      - name: Keep only the pinned toolchain
+        shell: bash
+        run: |
+          pin="$(sed -n 's/^channel = "\(.*\)"/\1/p' rust-toolchain.toml)"
+          rustup toolchain list --quiet | tr -d '\r' | { grep -v "^${pin}-" || true; } |
+            xargs -r -n1 rustup toolchain uninstall
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - run: cargo clippy --locked --all-targets -- -D clippy::all
+
+  test-linux:
+    name: Tests (Linux)
+    runs-on: ubuntu-latest
+    needs: ebpf-build
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2.0.0
+        with:
+          cache: false
+          rustflags: ""
+      - name: Keep only the pinned toolchain
+        shell: bash
+        run: |
+          pin="$(sed -n 's/^channel = "\(.*\)"/\1/p' rust-toolchain.toml)"
+          rustup toolchain list --quiet | tr -d '\r' | { grep -v "^${pin}-" || true; } |
+            xargs -r -n1 rustup toolchain uninstall
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Download eBPF artifact
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: rustinel-ebpf-object
+          path: ebpf/
+      - run: cargo test --locked --verbose
+      - name: Test the eBPF smoke test's degradation detection
+        run: python3 tests/test_ebpf_load_smoke.py
+
+      - name: Test process termination against a spawned child
+        run: |
+          cargo build --locked --example memory_target
+          cargo test --locked --test active_response -- --ignored
+      - name: Report conditional test outcomes
+        shell: bash
+        run: |
+          # Passing tests hide their output, so a test that skips for a missing
+          # precondition shows as ok. Re-run them uncaptured and list the skips.
+          {
+            cargo test --locked --lib -- --nocapture trust:: windows_acl::
+            cargo test --locked --test yara_disk -- --nocapture unreadable
+            cargo test --locked --lib -- --nocapture running_kernel
+            cargo test --locked --test linux_socket_tuple -- --nocapture running_kernel
+          } 2>&1 | tee conditional-tests.log
+          {
+            echo "### Conditional tests"
+            grep RUSTINEL_TEST_SKIPPED conditional-tests.log || echo "No conditional test was skipped."
+          } >> "$GITHUB_STEP_SUMMARY"
+      - name: Test integration group permissions as root
+        shell: bash
+        run: |
+          set -euo pipefail
+          test_binary="$(cargo test --locked --lib --no-run --message-format=json | jq -r 'select(.reason == "compiler-artifact" and .target.kind == ["lib"] and .executable != null) | .executable')"
+          sudo "$test_binary" integration_group_ --ignored --test-threads=1
+
+  test-windows:
+    name: Tests (Windows)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2.0.0
+        with:
+          cache: false
+          rustflags: ""
+      - name: Keep only the pinned toolchain
+        shell: bash
+        run: |
+          pin="$(sed -n 's/^channel = "\(.*\)"/\1/p' rust-toolchain.toml)"
+          rustup toolchain list --quiet | tr -d '\r' | { grep -v "^${pin}-" || true; } |
+            xargs -r -n1 rustup toolchain uninstall
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - run: cargo test --locked --verbose
+      - name: Test process-memory scanning (elevated runner)
+        run: |
+          cargo build --locked --example memory_target
+          cargo test --locked --test yara_memory -- --ignored
+          cargo test --locked --test active_response -- --ignored
+      - name: Report conditional test outcomes
+        shell: bash
+        run: |
+          # Passing tests hide their output, so a test that skips for a missing
+          # precondition shows as ok. Re-run them uncaptured and list the skips.
+          {
+            cargo test --locked --lib -- --nocapture trust:: windows_acl::
+          } 2>&1 | tee conditional-tests.log
+          {
+            echo "### Conditional tests"
+            grep RUSTINEL_TEST_SKIPPED conditional-tests.log || echo "No conditional test was skipped."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  test-macos:
+    name: Tests (macOS)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2.0.0
+        with:
+          cache: false
+          rustflags: ""
+      - name: Keep only the pinned toolchain
+        shell: bash
+        run: |
+          pin="$(sed -n 's/^channel = "\(.*\)"/\1/p' rust-toolchain.toml)"
+          rustup toolchain list --quiet | tr -d '\r' | { grep -v "^${pin}-" || true; } |
+            xargs -r -n1 rustup toolchain uninstall
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - run: cargo test --locked --verbose
+      - name: Test process termination against a spawned child
+        run: |
+          cargo build --locked --example memory_target
+          cargo test --locked --test active_response -- --ignored
+      - name: Report conditional test outcomes
+        shell: bash
+        run: |
+          # Passing tests hide their output, so a test that skips for a missing
+          # precondition shows as ok. Re-run them uncaptured and list the skips.
+          {
+            cargo test --locked --lib -- --nocapture trust:: windows_acl::
+            cargo test --locked --test yara_disk -- --nocapture unreadable
+          } 2>&1 | tee conditional-tests.log
+          {
+            echo "### Conditional tests"
+            grep RUSTINEL_TEST_SKIPPED conditional-tests.log || echo "No conditional test was skipped."
+          } >> "$GITHUB_STEP_SUMMARY"
+      - name: Test integration group permissions as root
+        shell: bash
+        run: |
+          set -euo pipefail
+          test_binary="$(cargo test --locked --lib --no-run --message-format=json | jq -r 'select(.reason == "compiler-artifact" and .target.kind == ["lib"] and .executable != null) | .executable')"
+          sudo "$test_binary" integration_group_ --ignored --test-threads=1
+
+  atomic-linux:
+    name: Atomic (linux)
+    if: ${{ !inputs.skip_atomics }}
+    runs-on: ubuntu-latest
+    needs: ebpf-build
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2.0.0
+        with:
+          cache: false
+          rustflags: ""
+
+      - name: Keep only the pinned toolchain
+        shell: bash
+        run: |
+          pin="$(sed -n 's/^channel = "\(.*\)"/\1/p' rust-toolchain.toml)"
+          rustup toolchain list --quiet | tr -d '\r' | { grep -v "^${pin}-" || true; } |
+            xargs -r -n1 rustup toolchain uninstall
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      - name: Download eBPF artifact
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: rustinel-ebpf-object
+          path: ebpf/
+
+      - name: Build PR binary
+        run: cargo build --locked --release
+
+      - name: Read shared atomic rules pin
+        id: rules-pin
+        shell: bash
+        run: |
+          ref="$(cat .github/atomic-rules-ref)"
+          if [[ ! "$ref" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "Expected a full commit SHA in .github/atomic-rules-ref" >&2
+            exit 1
+          fi
+          echo "ref=$ref" >> "$GITHUB_OUTPUT"
+
+      - name: Check out pinned rules
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          repository: Karib0u/rustinel-rules
+          ref: ${{ steps.rules-pin.outputs.ref }}
+          path: rustinel-rules
+          persist-credentials: false
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+        with:
+          enable-cache: false
+
+      - name: Build pinned rules pack
+        working-directory: rustinel-rules
+        run: |
+          uv sync --frozen
+          # Validate a rules commit, not the enclosing engine release tag.
+          uv run python -c "import os, subprocess, sys; os.environ.pop('GITHUB_REF_TYPE', None); sys.exit(subprocess.call([sys.executable, 'tools/validate.py']))"
+          uv run python tools/build_packs.py
+
+      - name: Check atomic coverage metadata
+        working-directory: rustinel-rules
+        run: python tests/atomic/run_atomics.py --check-coverage --strict-essential
+
+      - name: Run atomic tests (Linux)
+        working-directory: rustinel-rules
+        run: |
+          # The hosted runner leaves /opt writable by other accounts.
+          # The agent requires trusted parent directories for rules.
+          sudo chmod go-w /opt
+          sudo install -d -m 755 /opt/rustinel
+          sudo -E python3 tests/atomic/run_atomics.py \
+            --platform linux \
+            --engine-bin "$GITHUB_WORKSPACE/scripts/atomic_managed_service.sh" \
+            --engine-dir /opt/rustinel \
+            --rules-dir "$GITHUB_WORKSPACE/rustinel-rules" \
+            --pack auto
+        shell: bash
+
+      - name: Prepare atomic logs for upload (Unix)
+        if: always()
+        run: |
+          if [ -d /opt/rustinel/logs ]; then
+            sudo cp -a /opt/rustinel/logs rustinel-rules/tests/atomic/managed-logs
+            sudo chown -R "$(id -u):$(id -g)" rustinel-rules/tests/atomic/managed-logs
+          fi
+          if [ -f /opt/rustinel/engine.stdout.log ]; then
+            sudo cp /opt/rustinel/engine.stdout.log rustinel-rules/tests/atomic/engine.stdout.log
+            sudo chown "$(id -u):$(id -g)" rustinel-rules/tests/atomic/engine.stdout.log
+          fi
+        shell: bash
+
+      - name: Upload atomic report and logs
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: atomic-linux
+          path: |
+            rustinel-rules/tests/atomic/report-*.json
+            rustinel-rules/tests/atomic/.engine/engine.stdout.log
+            rustinel-rules/tests/atomic/.engine/logs/
+            rustinel-rules/tests/atomic/engine.stdout.log
+            rustinel-rules/tests/atomic/managed-logs/
+          include-hidden-files: true
+          if-no-files-found: warn
+
+  # Windows needs no eBPF object, so it starts at once instead of waiting on
+  # ebpf-build. Its ~75 atomics run sequentially and are the long pole, so
+  # they are split across three runners.
+  atomic:
+    name: Atomic (windows shard ${{ matrix.shard }})
+    if: ${{ !inputs.skip_atomics }}
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1/3, 2/3, 3/3]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2.0.0
+        with:
+          cache: false
+          rustflags: ""
+
+      - name: Keep only the pinned toolchain
+        shell: bash
+        run: |
+          pin="$(sed -n 's/^channel = "\(.*\)"/\1/p' rust-toolchain.toml)"
+          rustup toolchain list --quiet | tr -d '\r' | { grep -v "^${pin}-" || true; } |
+            xargs -r -n1 rustup toolchain uninstall
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      # Each shard builds its own binary: with a warm cache that beats a
+      # shared build job plus an artifact hop.
+      - name: Build PR binary
+        run: cargo build --locked --release
+
+      - name: Run native capture contract (Windows)
+        if: matrix.shard == '1/3'
+        run: python tests\native_capture_contract.py --binary "$env:GITHUB_WORKSPACE\target\release\rustinel.exe"
+        shell: pwsh
+
+      - name: Read shared atomic rules pin
+        id: rules-pin
+        shell: bash
+        run: |
+          ref="$(cat .github/atomic-rules-ref)"
+          if [[ ! "$ref" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "Expected a full commit SHA in .github/atomic-rules-ref" >&2
+            exit 1
+          fi
+          echo "ref=$ref" >> "$GITHUB_OUTPUT"
+
+      - name: Check out pinned rules
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          repository: Karib0u/rustinel-rules
+          ref: ${{ steps.rules-pin.outputs.ref }}
+          path: rustinel-rules
+          persist-credentials: false
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+        with:
+          enable-cache: false
+
+      - name: Build pinned rules pack
+        working-directory: rustinel-rules
+        run: |
+          uv sync --frozen
+          # Validate a rules commit, not the enclosing engine release tag.
+          uv run python -c "import os, subprocess, sys; os.environ.pop('GITHUB_REF_TYPE', None); sys.exit(subprocess.call([sys.executable, 'tools/validate.py']))"
+          uv run python tools/build_packs.py
+
+      - name: Check atomic coverage metadata
+        working-directory: rustinel-rules
+        run: python tests/atomic/run_atomics.py --check-coverage --strict-essential
+
+      - name: Exclude workspace from Defender (Windows, for EICAR)
+        run: Add-MpPreference -ExclusionPath "$env:GITHUB_WORKSPACE" -ErrorAction SilentlyContinue
+        shell: pwsh
+
+      - name: Run atomic tests (Windows)
+        working-directory: rustinel-rules
+        run: |
+          # The runner's D:\a grants Users write, and the agent refuses inputs
+          # other accounts can change. The harness copies the pack into an
+          # existing engine dir, so a protected one keeps the copies private.
+          $engineDir = "$env:GITHUB_WORKSPACE\rustinel-rules\tests\atomic\.engine"
+          New-Item -ItemType Directory -Path $engineDir -Force | Out-Null
+          $runner = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+          icacls $engineDir /inheritance:r /grant:r "*S-1-5-18:(OI)(CI)F" "*S-1-5-32-544:(OI)(CI)F" "*${runner}:(OI)(CI)F"
+          if ($LASTEXITCODE -ne 0) { throw "icacls failed on $engineDir" }
+          # Keep fixture executables inside the workspace's Defender exclusion.
+          $atomicTemp = Join-Path $env:GITHUB_WORKSPACE "atomic-temp"
+          New-Item -ItemType Directory -Path $atomicTemp -Force | Out-Null
+          $env:TEMP = $atomicTemp
+          $env:TMP = $atomicTemp
+          python tests\atomic\run_atomics.py `
+            --platform windows `
+            --engine-bin "$env:GITHUB_WORKSPACE\target\release\rustinel.exe" `
+            --engine-dir "$env:GITHUB_WORKSPACE\rustinel-rules\tests\atomic\.engine" `
+            --rules-dir "$env:GITHUB_WORKSPACE\rustinel-rules" `
+            --pack auto `
+            --shard "${{ matrix.shard }}"
+        shell: pwsh
+
+      - name: Upload atomic report and logs
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: atomic-windows-${{ strategy.job-index }}
+          path: |
+            rustinel-rules/tests/atomic/report-*.json
+            rustinel-rules/tests/atomic/.engine/engine.stdout.log
+            rustinel-rules/tests/atomic/.engine/logs/
+          include-hidden-files: true
+          if-no-files-found: warn
+
+  # Branch protection requires "Atomic (windows)", so keep that name as the
+  # roll-up of the Windows shards.
+  atomic-windows:
+    name: Atomic (windows)
+    needs: atomic
+    if: ${{ always() && !inputs.skip_atomics }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require every atomic shard to pass
+        env:
+          RESULT: ${{ needs.atomic.result }}
+        run: '[ "$RESULT" = "success" ]'
+
+  atomic-macos:
+    name: Atomic (macOS)
+    if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && !inputs.skip_atomics }}
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2.0.0
+        with:
+          cache: false
+          rustflags: ""
+
+      - name: Keep only the pinned toolchain
+        shell: bash
+        run: |
+          pin="$(sed -n 's/^channel = "\(.*\)"/\1/p' rust-toolchain.toml)"
+          rustup toolchain list --quiet | tr -d '\r' | { grep -v "^${pin}-" || true; } |
+            xargs -r -n1 rustup toolchain uninstall
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      - name: Build main binary
+        run: cargo build --locked --release
+
+      - name: Import signing identity
+        env:
+          SIGN_IDENTITY: ${{ secrets.MACOS_SIGN_IDENTITY }}
+          CERT_P12_BASE64: ${{ secrets.MACOS_CERT_P12_BASE64 }}
+          CERT_PASSWORD: ${{ secrets.MACOS_CERT_PASSWORD }}
+        run: |
+          : "${SIGN_IDENTITY:?MACOS_SIGN_IDENTITY is required}"
+          : "${CERT_P12_BASE64:?MACOS_CERT_P12_BASE64 is required}"
+          : "${CERT_PASSWORD:?MACOS_CERT_PASSWORD is required}"
+          KEYCHAIN="$RUNNER_TEMP/rustinel-signing.keychain-db"
+          KEYCHAIN_PASSWORD="$(uuidgen)"
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          echo "$CERT_P12_BASE64" | base64 --decode > "$RUNNER_TEMP/cert.p12"
+          security import "$RUNNER_TEMP/cert.p12" -k "$KEYCHAIN" -P "$CERT_PASSWORD" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple: -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          security list-keychains -d user -s "$KEYCHAIN" $(security list-keychains -d user | tr -d '"')
+          rm -f "$RUNNER_TEMP/cert.p12"
+
+      - name: Build signed app bundle
+        env:
+          SIGN_IDENTITY: ${{ secrets.MACOS_SIGN_IDENTITY }}
+          PROVISION_PROFILE_BASE64: ${{ secrets.MACOS_PROVISIONING_PROFILE_BASE64 }}
+        run: |
+          : "${PROVISION_PROFILE_BASE64:?MACOS_PROVISIONING_PROFILE_BASE64 is required}"
+          echo "$PROVISION_PROFILE_BASE64" | base64 --decode > "$RUNNER_TEMP/rustinel.provisionprofile"
+          scripts/macos/package-app.sh \
+            --binary target/release/rustinel \
+            --output "$RUNNER_TEMP/Rustinel.app" \
+            --profile "$RUNNER_TEMP/rustinel.provisionprofile" \
+            --identity "$SIGN_IDENTITY"
+
+      - name: Remove signing credentials
+        if: always()
+        run: |
+          rm -f "$RUNNER_TEMP/cert.p12" "$RUNNER_TEMP/rustinel.provisionprofile"
+          security delete-keychain "$RUNNER_TEMP/rustinel-signing.keychain-db" 2>/dev/null || true
+
+      - name: Read shared atomic rules pin
+        id: rules-pin
+        shell: bash
+        run: |
+          ref="$(cat .github/atomic-rules-ref)"
+          if [[ ! "$ref" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "Expected a full commit SHA in .github/atomic-rules-ref" >&2
+            exit 1
+          fi
+          echo "ref=$ref" >> "$GITHUB_OUTPUT"
+
+      - name: Check out pinned rules
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          repository: Karib0u/rustinel-rules
+          ref: ${{ steps.rules-pin.outputs.ref }}
+          path: rustinel-rules
+          persist-credentials: false
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+        with:
+          enable-cache: false
+
+      - name: Build pinned rules pack
+        working-directory: rustinel-rules
+        run: |
+          uv sync --frozen
+          # Validate a rules commit, not the enclosing engine release tag.
+          uv run python -c "import os, subprocess, sys; os.environ.pop('GITHUB_REF_TYPE', None); sys.exit(subprocess.call([sys.executable, 'tools/validate.py']))"
+          uv run python tools/build_packs.py
+
+      - name: Check atomic coverage metadata
+        working-directory: rustinel-rules
+        run: python tests/atomic/run_atomics.py --check-coverage --strict-essential
+
+      - name: Run atomic tests
+        working-directory: rustinel-rules
+        run: |
+          sudo -E python3 tests/atomic/run_atomics.py \
+            --platform macos \
+            --engine-bin "$RUNNER_TEMP/Rustinel.app/Contents/MacOS/rustinel" \
+            --engine-dir "$GITHUB_WORKSPACE/rustinel-rules/tests/atomic/.engine" \
+            --rules-dir "$GITHUB_WORKSPACE/rustinel-rules" \
+            --pack auto
+
+      - name: Prepare atomic logs for upload
+        if: always()
+        run: |
+          if [ -d rustinel-rules/tests/atomic/.engine/logs ]; then
+            sudo chown -R "$(id -u):$(id -g)" rustinel-rules/tests/atomic/.engine/logs
+          fi
+
+      - name: Upload atomic report and logs
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: atomic-macos
+          path: |
+            rustinel-rules/tests/atomic/report-*.json
+            rustinel-rules/tests/atomic/.engine/engine.stdout.log
+            rustinel-rules/tests/atomic/.engine/logs/
+          include-hidden-files: true
+          if-no-files-found: warn

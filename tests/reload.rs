@@ -1,0 +1,1102 @@
+#[cfg(test)]
+mod common;
+
+use std::sync::Arc;
+use std::time::Duration;
+
+use common::{dns_query_event, process_start_event, SigmaFixture, TestNormalizer, YaraFixture};
+use rustinel::{
+    alerts::AlertSink,
+    config::{ReloadConfig, ResponseConfig, ScannerConfig},
+    engine::{DetectionPass, DetectorStore, Engine, SigmaMatchMode},
+    ioc::IocEngine,
+    models::{CanonicalEvent, MatchDebugLevel},
+    reload::{spawn_reload_worker, ReloadAlertContext, ReloadTarget},
+    response::ResponseEngine,
+    scanner::Scanner,
+    sensor::Platform,
+};
+use tokio::sync::mpsc;
+
+fn host_platform() -> Platform {
+    if cfg!(windows) {
+        Platform::Windows
+    } else if cfg!(target_os = "macos") {
+        Platform::MacOS
+    } else {
+        Platform::Linux
+    }
+}
+
+fn dummy_response_config() -> Arc<arc_swap::ArcSwap<ResponseConfig>> {
+    Arc::new(arc_swap::ArcSwap::from(Arc::new(ResponseConfig {
+        enabled: false,
+        prevention_enabled: false,
+        min_severity: "critical".to_string(),
+        channel_capacity: 4,
+        allowlist_images: Vec::new(),
+        allowlist_paths: Vec::new(),
+    })))
+}
+
+fn scanner_cfg(sigma: &SigmaFixture, yara: &YaraFixture) -> ScannerConfig {
+    ScannerConfig {
+        sigma_enabled: true,
+        sigma_rules_path: sigma.rules_dir().to_path_buf(),
+        sigma_local_rules_paths: Vec::new(),
+        sigma_match_mode: SigmaMatchMode::Best,
+        yara_enabled: true,
+        yara_rules_path: yara.rules_dir().to_path_buf(),
+        yara_local_rules_paths: Vec::new(),
+        yara_allowlist_paths: Vec::new(),
+        yara_scan_timeout_ms: 10_000,
+        yara_max_file_mb: 64,
+        yara_memory_enabled: false,
+        yara_memory_queue_capacity: 8,
+        yara_memory_delay_ms: 0,
+        yara_memory_max_process_mb: 64,
+        yara_memory_max_region_mb: 8,
+        yara_memory_include_private: true,
+        yara_memory_include_image: false,
+        yara_memory_include_mapped: false,
+    }
+}
+
+/// Waits for the reload worker to finish everything sent before it.
+///
+/// The worker handles a batch in a fixed order (Sigma, YARA, IOC, config), so
+/// a config reload that has taken effect proves every earlier target in its
+/// batch, and every earlier batch, has been processed. Asserting on state
+/// after this barrier replaces a fixed sleep: it holds for a slow compile on
+/// a loaded runner and also for reloads the worker is expected to reject.
+async fn wait_for_response(
+    response: &Arc<arc_swap::ArcSwap<ResponseConfig>>,
+    condition: impl Fn(&ResponseConfig) -> bool + Send + 'static,
+) {
+    let response = Arc::clone(response);
+    common::wait_until(Duration::from_secs(30), move || condition(&response.load())).await;
+}
+
+struct ReloadBarrier {
+    _dir: tempfile::TempDir,
+    config_path: std::path::PathBuf,
+    response: Arc<arc_swap::ArcSwap<ResponseConfig>>,
+    round: std::cell::Cell<usize>,
+}
+
+impl ReloadBarrier {
+    const SEVERITIES: [&'static str; 4] = ["low", "medium", "high", "critical"];
+
+    fn new() -> Self {
+        let dir = tempfile::tempdir().expect("barrier tempdir");
+        let config_path = dir.path().join("barrier.toml");
+        std::fs::write(&config_path, "[response]\nenabled = false\n").expect("write barrier");
+        let response = dummy_response_config();
+        response.store(Arc::new(ResponseConfig {
+            min_severity: "none".to_string(),
+            ..(**response.load()).clone()
+        }));
+        Self {
+            _dir: dir,
+            config_path,
+            response,
+            round: std::cell::Cell::new(0),
+        }
+    }
+
+    fn config_path(&self) -> Option<std::path::PathBuf> {
+        Some(self.config_path.clone())
+    }
+
+    fn response(&self) -> Arc<arc_swap::ArcSwap<ResponseConfig>> {
+        Arc::clone(&self.response)
+    }
+
+    async fn wait(&self, tx: &mpsc::UnboundedSender<ReloadTarget>) {
+        let round = self.round.get();
+        self.round.set(round + 1);
+        let severity = Self::SEVERITIES[round % Self::SEVERITIES.len()];
+        std::fs::write(
+            &self.config_path,
+            format!("[response]\nenabled = false\nmin_severity = \"{severity}\"\n"),
+        )
+        .expect("write barrier");
+        tx.send(ReloadTarget::Config).expect("send barrier");
+        let response = Arc::clone(&self.response);
+        common::wait_until(Duration::from_secs(30), move || {
+            response.load().min_severity == severity
+        })
+        .await;
+    }
+}
+
+#[tokio::test]
+async fn sigma_reload_swaps_valid_rules_and_allows_empty_rules() {
+    let sigma = SigmaFixture::new();
+    let platform = host_platform();
+    sigma.write_process_rule(platform);
+    let yara = YaraFixture::new();
+    yara.write_default_rule();
+    let ioc = common::IocFixture::new();
+
+    let mut engine = Engine::new_for_platform(platform);
+    engine
+        .load_rules(sigma.rules_dir())
+        .expect("load initial sigma");
+    let store = DetectorStore::new(
+        Arc::new(engine),
+        Arc::new(Scanner::new(yara.rules_dir()).expect("load yara")),
+        Arc::new(IocEngine::load(&ioc.config())),
+    );
+
+    let previous_sigma = store.sigma();
+
+    std::fs::remove_file(sigma.rules_dir().join("process.yml")).expect("remove rule A");
+    sigma.write_rule(
+        "network.yml",
+        &format!(
+            r#"title: Reloaded Network
+logsource:
+  product: {product}
+  category: network_connection
+detection:
+  selection:
+    DestinationPort: "443"
+  condition: selection
+level: high
+        "#,
+            product = match platform {
+                Platform::Windows => "windows",
+                Platform::Linux => "linux",
+                Platform::MacOS => "macos",
+            }
+        ),
+    );
+
+    let barrier = ReloadBarrier::new();
+    let (tx, rx) = mpsc::unbounded_channel();
+    let handle = spawn_reload_worker(
+        Arc::clone(&store),
+        scanner_cfg(&sigma, &yara),
+        ioc.config(),
+        ReloadConfig {
+            enabled: true,
+            debounce_ms: 100,
+            fallback_poll_interval_ms: 60000,
+        },
+        MatchDebugLevel::Off,
+        None,
+        barrier.config_path(),
+        barrier.response(),
+        None,
+        rx,
+    );
+    tx.send(ReloadTarget::Sigma).expect("send reload");
+    barrier.wait(&tx).await;
+
+    let harness = TestNormalizer::new();
+    let process = harness
+        .normalizer
+        .normalize(&process_start_event(platform))
+        .unwrap();
+    let network = harness
+        .normalizer
+        .normalize(&common::network_connect_event(platform))
+        .unwrap();
+    assert!(!store.sigma().check_event(&network).is_empty());
+    assert!(store.sigma().check_event(&process).is_empty());
+    assert!(!previous_sigma.check_event(&process).is_empty());
+    assert!(previous_sigma.check_event(&network).is_empty());
+
+    std::fs::remove_file(sigma.rules_dir().join("network.yml")).expect("remove rule B");
+    tx.send(ReloadTarget::Sigma).expect("send empty reload");
+    barrier.wait(&tx).await;
+    assert!(store.sigma().check_event(&network).is_empty());
+    drop(tx);
+    handle.abort();
+}
+
+#[tokio::test]
+async fn sigma_reload_emits_pending_correlations() {
+    let sigma = SigmaFixture::new();
+    let platform = host_platform();
+    let product = match platform {
+        Platform::Windows => "windows",
+        Platform::Linux => "linux",
+        Platform::MacOS => "macos",
+    };
+    sigma.write_rule(
+        "image.yml",
+        &format!(
+            r#"title: Reload Image
+id: reload-image
+logsource:
+  product: {product}
+  category: process_creation
+detection:
+  selection:
+    Image|contains: curl
+  condition: selection
+"#
+        ),
+    );
+    sigma.write_rule(
+        "count.yml",
+        r#"title: Reload Count
+id: reload-count
+correlation:
+  type: event_count
+  rules:
+    - reload-image
+  timespan: 1m
+  condition:
+    gte: 1
+"#,
+    );
+    let yara = YaraFixture::new();
+    yara.write_default_rule();
+    let ioc = common::IocFixture::new();
+    let mut engine = Engine::new_for_platform(platform);
+    engine.load_rules(sigma.rules_dir()).unwrap();
+    let store = DetectorStore::new(
+        Arc::new(engine),
+        Arc::new(Scanner::new(yara.rules_dir()).unwrap()),
+        Arc::new(IocEngine::load(&ioc.config())),
+    );
+    let harness = TestNormalizer::new();
+    let event = harness
+        .normalizer
+        .normalize(&process_start_event(platform))
+        .unwrap();
+    store
+        .sigma()
+        .evaluate_event_pass(&event, DetectionPass::Admission);
+
+    let output = tempfile::NamedTempFile::new().unwrap();
+    let (writer, guard) =
+        tracing_appender::non_blocking(std::fs::File::create(output.path()).unwrap());
+    let (response_engine, response_worker) = ResponseEngine::new(dummy_response_config());
+    let context = ReloadAlertContext {
+        host_state: harness.host_state,
+        alert_sink: AlertSink::new(writer),
+        response_engine,
+    };
+    let (tx, rx) = mpsc::unbounded_channel();
+    let handle = spawn_reload_worker(
+        Arc::clone(&store),
+        scanner_cfg(&sigma, &yara),
+        ioc.config(),
+        ReloadConfig {
+            enabled: true,
+            debounce_ms: 100,
+            fallback_poll_interval_ms: 60000,
+        },
+        MatchDebugLevel::Off,
+        None,
+        None,
+        dummy_response_config(),
+        Some(context),
+        rx,
+    );
+    tx.send(ReloadTarget::Sigma).unwrap();
+    drop(tx);
+    tokio::time::timeout(Duration::from_secs(5), handle)
+        .await
+        .unwrap()
+        .unwrap();
+    response_worker.await.unwrap();
+    drop(guard);
+
+    let alerts = std::fs::read_to_string(output.path()).unwrap();
+    assert!(alerts.contains("Reload Count"), "{alerts}");
+}
+
+#[tokio::test]
+async fn yara_reload_swaps_valid_rules_and_allows_empty_rules() {
+    let sigma = SigmaFixture::new();
+    let platform = host_platform();
+    sigma.write_process_rule(platform);
+    let yara = YaraFixture::new();
+    yara.write_rule("a.yar", "RuleA", "AAA_RELOAD_MARKER");
+    let ioc = common::IocFixture::new();
+    let mut engine = Engine::new_for_platform(platform);
+    engine.load_rules(sigma.rules_dir()).expect("load sigma");
+    let store = DetectorStore::new(
+        Arc::new(engine),
+        Arc::new(Scanner::new(yara.rules_dir()).expect("load yara A")),
+        Arc::new(IocEngine::load(&ioc.config())),
+    );
+
+    let previous_yara = store.yara();
+
+    std::fs::remove_file(yara.rules_dir().join("a.yar")).expect("remove rule A");
+    yara.write_rule("b.yar", "RuleB", "BBB_RELOAD_MARKER");
+    let barrier = ReloadBarrier::new();
+    let (tx, rx) = mpsc::unbounded_channel();
+    let handle = spawn_reload_worker(
+        Arc::clone(&store),
+        scanner_cfg(&sigma, &yara),
+        ioc.config(),
+        ReloadConfig {
+            enabled: true,
+            debounce_ms: 100,
+            fallback_poll_interval_ms: 60000,
+        },
+        MatchDebugLevel::Off,
+        None,
+        barrier.config_path(),
+        barrier.response(),
+        None,
+        rx,
+    );
+    tx.send(ReloadTarget::Yara).expect("send yara reload");
+    barrier.wait(&tx).await;
+    assert!(
+        store
+            .yara()
+            .scan_bytes(b"BBB_RELOAD_MARKER", MatchDebugLevel::Off)
+            .unwrap()
+            .len()
+            == 1
+    );
+
+    assert_eq!(
+        previous_yara
+            .scan_bytes(b"AAA_RELOAD_MARKER", MatchDebugLevel::Off)
+            .unwrap()
+            .len(),
+        1
+    );
+    assert!(previous_yara
+        .scan_bytes(b"BBB_RELOAD_MARKER", MatchDebugLevel::Off)
+        .unwrap()
+        .is_empty());
+
+    std::fs::remove_file(yara.rules_dir().join("b.yar")).expect("remove rule B");
+    tx.send(ReloadTarget::Yara).expect("send empty reload");
+    barrier.wait(&tx).await;
+    assert!(store
+        .yara()
+        .scan_bytes(b"BBB_RELOAD_MARKER", MatchDebugLevel::Off)
+        .unwrap()
+        .is_empty());
+    drop(tx);
+    handle.abort();
+}
+
+#[tokio::test]
+async fn ioc_reload_swaps_valid_indicators_and_rejects_empty_set() {
+    let sigma = SigmaFixture::new();
+    let platform = host_platform();
+    sigma.write_process_rule(platform);
+    let yara = YaraFixture::new();
+    yara.write_default_rule();
+    let ioc = common::IocFixture::new();
+    ioc.write_domains("old.example.test");
+
+    let mut engine = Engine::new_for_platform(platform);
+    engine.load_rules(sigma.rules_dir()).expect("load sigma");
+    let store = DetectorStore::new(
+        Arc::new(engine),
+        Arc::new(Scanner::new(yara.rules_dir()).expect("load yara")),
+        Arc::new(IocEngine::load(&ioc.config())),
+    );
+
+    let previous_ioc = store.ioc();
+
+    ioc.write_domains("example.test");
+    let barrier = ReloadBarrier::new();
+    let (tx, rx) = mpsc::unbounded_channel();
+    let handle = spawn_reload_worker(
+        Arc::clone(&store),
+        scanner_cfg(&sigma, &yara),
+        ioc.config(),
+        ReloadConfig {
+            enabled: true,
+            debounce_ms: 100,
+            fallback_poll_interval_ms: 60000,
+        },
+        MatchDebugLevel::Off,
+        None,
+        barrier.config_path(),
+        barrier.response(),
+        None,
+        rx,
+    );
+    tx.send(ReloadTarget::Ioc).expect("send ioc reload");
+    barrier.wait(&tx).await;
+    let event = CanonicalEvent::from_normalized(
+        TestNormalizer::new()
+            .normalizer
+            .normalize(&dns_query_event(platform))
+            .unwrap(),
+    );
+    assert_eq!(store.ioc().check_event(&event).len(), 1);
+    assert!(previous_ioc.check_event(&event).is_empty());
+
+    ioc.write_domains("");
+    tx.send(ReloadTarget::Ioc).expect("send empty reload");
+    barrier.wait(&tx).await;
+    assert_eq!(store.ioc().check_event(&event).len(), 1);
+    drop(tx);
+    handle.abort();
+}
+
+#[tokio::test]
+async fn test_reload_poller_fallback_polling() {
+    use rustinel::config::IocConfig;
+    use std::path::PathBuf;
+    use std::time::Duration;
+
+    let tempdir = tempfile::tempdir().expect("create tempdir");
+    let non_existent_dir = tempdir.path().join("non_existent_sigma_rules");
+    let missing_yara_dir = tempdir.path().join("non_existent_yara_rules");
+
+    let scanner_cfg = ScannerConfig {
+        sigma_enabled: true,
+        sigma_rules_path: non_existent_dir.clone(),
+        sigma_local_rules_paths: Vec::new(),
+        sigma_match_mode: SigmaMatchMode::Best,
+        yara_enabled: true,
+        yara_rules_path: missing_yara_dir,
+        yara_local_rules_paths: Vec::new(),
+        yara_allowlist_paths: Vec::new(),
+        yara_scan_timeout_ms: 10_000,
+        yara_max_file_mb: 64,
+        yara_memory_enabled: false,
+        yara_memory_queue_capacity: 0,
+        yara_memory_delay_ms: 0,
+        yara_memory_max_process_mb: 0,
+        yara_memory_max_region_mb: 0,
+        yara_memory_include_private: false,
+        yara_memory_include_image: false,
+        yara_memory_include_mapped: false,
+    };
+
+    let ioc_cfg = IocConfig {
+        enabled: false,
+        hashes_path: PathBuf::from(""),
+        ips_path: PathBuf::from(""),
+        domains_path: PathBuf::from(""),
+        paths_regex_path: PathBuf::from(""),
+        default_severity: "high".to_string(),
+        max_file_size_mb: 0,
+        hash_allowlist_paths: Vec::new(),
+    };
+
+    let reload_cfg = ReloadConfig {
+        enabled: true,
+        debounce_ms: 10,
+        fallback_poll_interval_ms: 100,
+    };
+
+    let (reload_tx, mut reload_rx) = mpsc::unbounded_channel();
+
+    // Keep the YARA path absent throughout the test so watcher setup must fail,
+    // even if it runs after the Sigma directory is created.
+    let poller =
+        rustinel::reload::spawn_reload_poller(scanner_cfg, ioc_cfg, reload_cfg, None, reload_tx);
+
+    // Let the poller capture the initial fingerprints before changing Sigma rules.
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    // Now, create the directory and add a rules file to trigger a fingerprint change
+    std::fs::create_dir_all(&non_existent_dir).expect("create dir");
+    std::fs::write(
+        non_existent_dir.join("rule.yml"),
+        r#"title: Test Rule
+logsource:
+  product: windows
+  category: process_creation
+detection:
+  selection:
+    Image: "test.exe"
+  condition: selection
+level: high
+"#,
+    )
+    .expect("write rule");
+
+    // The polling loop (running at 100ms interval in test mode) should pick this up
+    // and send a ReloadTarget::Sigma event to the channel.
+    let event = tokio::time::timeout(Duration::from_millis(1500), reload_rx.recv())
+        .await
+        .expect("Timeout waiting for reload event")
+        .expect("Channel closed unexpectedly");
+
+    assert_eq!(event, ReloadTarget::Sigma);
+
+    poller.shutdown().await;
+}
+
+/// Regression test for a watcher-setup deadlock on deep rule trees.
+///
+/// notify watches `IN_OPEN`, so walking a tree to register it recursively queues one
+/// inotify event per directory. The callback used to block once the wake-up channel
+/// filled, parking notify's event-loop thread — the same thread the *next*
+/// `Watcher::watch()` call waits on for its acknowledgement. Setup never returned,
+/// hot reload never activated, and the process never shut down.
+///
+/// Reproducing it therefore needs both a tree larger than the channel (100) and a
+/// second watch target registered after it; here, the config file's parent.
+#[tokio::test]
+async fn test_reload_poller_handles_rule_tree_with_many_directories() {
+    use rustinel::config::IocConfig;
+    use std::path::PathBuf;
+    use std::time::Duration;
+
+    // More directories than the wake-up channel can hold (capacity 100).
+    const DIR_COUNT: usize = 150;
+
+    let tempdir = tempfile::tempdir().expect("create tempdir");
+    let sigma_dir = tempdir.path().join("sigma");
+    for i in 0..DIR_COUNT {
+        let sub = sigma_dir.join(format!("category_{i:03}"));
+        std::fs::create_dir_all(&sub).expect("create rule subdir");
+        std::fs::write(sub.join("rule.yml"), sigma_rule_yaml("test.exe")).expect("write rule");
+    }
+
+    let config_dir = tempdir.path().join("etc");
+    std::fs::create_dir_all(&config_dir).expect("create config dir");
+    let config_path = config_dir.join("rustinel.toml");
+    std::fs::write(&config_path, "").expect("write config");
+
+    let scanner_cfg = ScannerConfig {
+        sigma_enabled: true,
+        sigma_rules_path: sigma_dir.clone(),
+        sigma_local_rules_paths: Vec::new(),
+        sigma_match_mode: SigmaMatchMode::Best,
+        yara_enabled: false,
+        yara_rules_path: PathBuf::from(""),
+        yara_local_rules_paths: Vec::new(),
+        yara_allowlist_paths: Vec::new(),
+        yara_scan_timeout_ms: 10_000,
+        yara_max_file_mb: 64,
+        yara_memory_enabled: false,
+        yara_memory_queue_capacity: 0,
+        yara_memory_delay_ms: 0,
+        yara_memory_max_process_mb: 0,
+        yara_memory_max_region_mb: 0,
+        yara_memory_include_private: false,
+        yara_memory_include_image: false,
+        yara_memory_include_mapped: false,
+    };
+
+    let ioc_cfg = IocConfig {
+        enabled: false,
+        hashes_path: PathBuf::from(""),
+        ips_path: PathBuf::from(""),
+        domains_path: PathBuf::from(""),
+        paths_regex_path: PathBuf::from(""),
+        default_severity: "high".to_string(),
+        max_file_size_mb: 0,
+        hash_allowlist_paths: Vec::new(),
+    };
+
+    // A poll interval far beyond the test timeout: only a working watcher can
+    // produce the reload event below.
+    let reload_cfg = ReloadConfig {
+        enabled: true,
+        debounce_ms: 10,
+        fallback_poll_interval_ms: 3_600_000,
+    };
+
+    let (reload_tx, mut reload_rx) = mpsc::unbounded_channel();
+    let poller = rustinel::reload::spawn_reload_poller(
+        scanner_cfg,
+        ioc_cfg,
+        reload_cfg,
+        Some(config_path),
+        reload_tx,
+    );
+
+    // Let watcher setup finish before touching the tree.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    std::fs::write(
+        sigma_dir.join("category_000").join("added.yml"),
+        sigma_rule_yaml("added.exe"),
+    )
+    .expect("write rule");
+
+    let event = tokio::time::timeout(Duration::from_secs(10), reload_rx.recv())
+        .await
+        .expect("watcher setup deadlocked: no reload event")
+        .expect("Channel closed unexpectedly");
+    assert_eq!(event, ReloadTarget::Sigma);
+
+    tokio::time::timeout(Duration::from_secs(5), poller.shutdown())
+        .await
+        .expect("poller did not shut down");
+}
+
+fn sigma_rule_yaml(image: &str) -> String {
+    format!(
+        r#"title: Test Rule {image}
+logsource:
+  product: windows
+  category: process_creation
+detection:
+  selection:
+    Image: "{image}"
+  condition: selection
+level: high
+"#
+    )
+}
+
+#[tokio::test]
+async fn test_reload_rejects_invalid_rules_but_keeps_previous_rules() {
+    let sigma = SigmaFixture::new();
+    let platform = host_platform();
+    sigma.write_process_rule(platform);
+    let yara = YaraFixture::new();
+    yara.write_default_rule();
+    let ioc = common::IocFixture::new();
+
+    let mut engine = Engine::new_for_platform(platform);
+    engine
+        .load_rules(sigma.rules_dir())
+        .expect("load initial sigma");
+    let store = DetectorStore::new(
+        Arc::new(engine),
+        Arc::new(Scanner::new(yara.rules_dir()).expect("load yara")),
+        Arc::new(IocEngine::load(&ioc.config())),
+    );
+
+    let barrier = ReloadBarrier::new();
+    let (tx, rx) = mpsc::unbounded_channel();
+    let handle = spawn_reload_worker(
+        Arc::clone(&store),
+        scanner_cfg(&sigma, &yara),
+        ioc.config(),
+        ReloadConfig {
+            enabled: true,
+            debounce_ms: 100,
+            fallback_poll_interval_ms: 60000,
+        },
+        MatchDebugLevel::Off,
+        None,
+        barrier.config_path(),
+        barrier.response(),
+        None,
+        rx,
+    );
+
+    // Delete the original valid Sigma rule file and write a completely invalid rule file
+    std::fs::remove_file(sigma.rules_dir().join("process.yml")).expect("remove valid sigma rule");
+    sigma.write_rule("invalid_rule.yml", "invalid: yaml: syntax: [error");
+
+    tx.send(ReloadTarget::Sigma).expect("send reload");
+    barrier.wait(&tx).await;
+
+    // The reload should have been rejected (keeping the previous rules active in memory).
+    // Let's verify that the original process rules (no longer on disk) are still working.
+    let proc_event = TestNormalizer::new()
+        .normalizer
+        .normalize(&process_start_event(platform))
+        .unwrap();
+    assert!(!store.sigma().check_event(&proc_event).is_empty());
+
+    // Delete the original valid YARA rule file and write an invalid YARA rule
+    std::fs::remove_file(yara.rules_dir().join("marker.yar")).expect("remove valid yara rule");
+    std::fs::write(
+        yara.rules_dir().join("invalid_rule.yar"),
+        "rule invalid { syntax_error }",
+    )
+    .unwrap();
+    tx.send(ReloadTarget::Yara).expect("send reload");
+    barrier.wait(&tx).await;
+
+    // YARA reload should also be rejected, keeping the default YARA rule (no longer on disk) active
+    assert_eq!(
+        store
+            .yara()
+            .scan_bytes(b"RUSTINEL_TEST_MARKER", MatchDebugLevel::Off)
+            .unwrap()
+            .len(),
+        1
+    );
+
+    drop(tx);
+    handle.abort();
+}
+
+#[tokio::test]
+async fn test_reload_accepts_partially_invalid_rules() {
+    let sigma = SigmaFixture::new();
+    let platform = host_platform();
+    let yara = YaraFixture::new();
+    let ioc = common::IocFixture::new();
+
+    let engine = Engine::new_for_platform(platform);
+    // Start with empty rules
+    let store = DetectorStore::new(
+        Arc::new(engine),
+        Arc::new(Scanner::new(yara.rules_dir()).expect("load yara")),
+        Arc::new(IocEngine::load(&ioc.config())),
+    );
+
+    let barrier = ReloadBarrier::new();
+    let (tx, rx) = mpsc::unbounded_channel();
+    let handle = spawn_reload_worker(
+        Arc::clone(&store),
+        scanner_cfg(&sigma, &yara),
+        ioc.config(),
+        ReloadConfig {
+            enabled: true,
+            debounce_ms: 100,
+            fallback_poll_interval_ms: 60000,
+        },
+        MatchDebugLevel::Off,
+        None,
+        barrier.config_path(),
+        barrier.response(),
+        None,
+        rx,
+    );
+
+    // Write one valid and one invalid Sigma rule file
+    sigma.write_process_rule(platform);
+    sigma.write_rule("invalid_rule.yml", "invalid: yaml: syntax: [error");
+
+    tx.send(ReloadTarget::Sigma).expect("send reload");
+    barrier.wait(&tx).await;
+
+    // The reload should have succeeded (loading the valid rule)
+    let proc_event = TestNormalizer::new()
+        .normalizer
+        .normalize(&process_start_event(platform))
+        .unwrap();
+    assert!(!store.sigma().check_event(&proc_event).is_empty());
+
+    // Write one valid and one invalid YARA rule file
+    yara.write_default_rule();
+    std::fs::write(
+        yara.rules_dir().join("invalid_rule.yar"),
+        "rule invalid { syntax_error }",
+    )
+    .unwrap();
+    tx.send(ReloadTarget::Yara).expect("send reload");
+    barrier.wait(&tx).await;
+
+    // The reload should have succeeded (loading the valid rule)
+    assert_eq!(
+        store
+            .yara()
+            .scan_bytes(b"RUSTINEL_TEST_MARKER", MatchDebugLevel::Off)
+            .unwrap()
+            .len(),
+        1
+    );
+
+    drop(tx);
+    handle.abort();
+}
+
+#[tokio::test]
+async fn test_config_reload_swaps_updated_response_config() {
+    let dir = tempfile::tempdir().unwrap();
+    let config_file_path = dir.path().join("config.toml");
+
+    // Write initial configuration
+    std::fs::write(
+        &config_file_path,
+        r#"
+[response]
+enabled = false
+prevention_enabled = false
+min_severity = "high"
+"#,
+    )
+    .unwrap();
+
+    // Verify we can load it initially
+    let cfg =
+        rustinel::config::AppConfig::from_config_path(Some(config_file_path.clone())).unwrap();
+    assert!(!cfg.response.enabled);
+    assert!(!cfg.response.prevention_enabled);
+    assert_eq!(cfg.response.min_severity, "high");
+
+    let response_config = Arc::new(arc_swap::ArcSwap::from(Arc::new(cfg.response)));
+
+    let sigma = SigmaFixture::new();
+    let yara = YaraFixture::new();
+    let ioc = common::IocFixture::new();
+
+    let store = DetectorStore::new(
+        Arc::new(Engine::new_for_platform(host_platform())),
+        Arc::new(Scanner::empty()),
+        Arc::new(IocEngine::load(&ioc.config())),
+    );
+
+    let (tx, rx) = mpsc::unbounded_channel();
+    let handle = spawn_reload_worker(
+        Arc::clone(&store),
+        scanner_cfg(&sigma, &yara),
+        ioc.config(),
+        ReloadConfig {
+            enabled: true,
+            debounce_ms: 100,
+            fallback_poll_interval_ms: 60000,
+        },
+        MatchDebugLevel::Off,
+        None,
+        Some(config_file_path.clone()),
+        response_config.clone(),
+        None,
+        rx,
+    );
+
+    // Write updated configuration
+    std::fs::write(
+        &config_file_path,
+        r#"
+[response]
+enabled = true
+prevention_enabled = true
+min_severity = "low"
+"#,
+    )
+    .unwrap();
+
+    tx.send(ReloadTarget::Config).expect("send reload config");
+    wait_for_response(&response_config, |config| config.enabled).await;
+
+    // Check that response config is swapped atomically with the new values!
+    let updated = response_config.load();
+    assert!(updated.enabled);
+    assert!(updated.prevention_enabled);
+    assert_eq!(updated.min_severity, "low");
+
+    drop(tx);
+    handle.abort();
+}
+
+fn build_critical_process_alert(pid: u32, image: &str) -> rustinel::models::Alert {
+    use rustinel::models::*;
+    use rustinel::sensor::Platform;
+    Alert {
+        severity: AlertSeverity::Critical,
+        rule_name: "TestCriticalRule".to_string(),
+        rule_description: None,
+        rule_id: None,
+        sigma_metadata: None,
+        engine: DetectionEngine::Yara,
+        event: NormalizedEvent {
+            timestamp: "2026-01-01T00:00:00Z".to_string(),
+            source_seq: None,
+            ingest_seq: 0,
+            platform: Platform::Linux,
+            provider: "test".to_string(),
+            category: EventCategory::Process,
+            event_id: 1,
+            event_id_string: "1".to_string(),
+            opcode: 1,
+            fields: EventFields::ProcessCreation(ProcessCreationFields {
+                hashes: None,
+                imphash: None,
+                container: Default::default(),
+                linux_identity: Default::default(),
+                cgroup_id: None,
+                exec: Default::default(),
+                parent_process_id_derived: false,
+                windows: Default::default(),
+                image: Some(image.to_string()),
+                image_source: None,
+                image_truncated: None,
+                process_id: Some(pid.to_string()),
+                process_start_time: None,
+                command_line: None,
+                original_file_name: None,
+                product: None,
+                description: None,
+                company: None,
+                file_version: None,
+                target_image: None,
+                parent_process_id: None,
+                parent_image: None,
+                parent_command_line: None,
+                parent_user: None,
+                current_directory: None,
+                integrity_level: None,
+                logon_id: None,
+                user: None,
+            }),
+            process_name: None,
+            provenance: Default::default(),
+            process_context: None,
+        },
+        match_details: None,
+    }
+}
+
+#[tokio::test]
+async fn test_config_reload_decision_disabled_to_terminate() {
+    let dir = tempfile::tempdir().unwrap();
+    let config_file_path = dir.path().join("config.toml");
+
+    // Start with response disabled
+    std::fs::write(
+        &config_file_path,
+        r#"
+[response]
+enabled = false
+prevention_enabled = false
+min_severity = "critical"
+"#,
+    )
+    .unwrap();
+
+    let cfg =
+        rustinel::config::AppConfig::from_config_path(Some(config_file_path.clone())).unwrap();
+    let response_config = Arc::new(arc_swap::ArcSwap::from(Arc::new(cfg.response)));
+
+    let sigma = SigmaFixture::new();
+    let yara = YaraFixture::new();
+    let ioc = common::IocFixture::new();
+
+    let store = DetectorStore::new(
+        Arc::new(Engine::new_for_platform(host_platform())),
+        Arc::new(Scanner::empty()),
+        Arc::new(IocEngine::load(&ioc.config())),
+    );
+
+    let (tx, rx) = mpsc::unbounded_channel();
+    let handle = spawn_reload_worker(
+        Arc::clone(&store),
+        scanner_cfg(&sigma, &yara),
+        ioc.config(),
+        ReloadConfig {
+            enabled: true,
+            debounce_ms: 100,
+            fallback_poll_interval_ms: 60000,
+        },
+        MatchDebugLevel::Off,
+        None,
+        Some(config_file_path.clone()),
+        response_config.clone(),
+        None,
+        rx,
+    );
+
+    // Build a ResponseEngine sharing the same ArcSwap config
+    let (response_engine, response_worker) =
+        rustinel::response::ResponseEngine::new(response_config.clone());
+
+    // Build a critical-severity alert with a non-protected PID distinct from this process.
+    let test_pid = std::process::id()
+        .checked_add(1)
+        .filter(|pid| *pid > 4)
+        .unwrap_or(5);
+    let alert = build_critical_process_alert(test_pid, "/tmp/evil");
+
+    // Before reload: response is disabled
+    let decision_before = response_engine.decision_for_alert(&alert);
+    assert_eq!(
+        decision_before,
+        rustinel::response::ResponseDecision::Disabled
+    );
+
+    // Write updated config: enable response + prevention
+    std::fs::write(
+        &config_file_path,
+        r#"
+[response]
+enabled = true
+prevention_enabled = true
+min_severity = "critical"
+"#,
+    )
+    .unwrap();
+
+    tx.send(ReloadTarget::Config).expect("send reload config");
+    wait_for_response(&response_config, |config| config.prevention_enabled).await;
+
+    // After reload: decision should be Terminate
+    let decision_after = response_engine.decision_for_alert(&alert);
+    assert!(
+        matches!(
+            decision_after,
+            rustinel::response::ResponseDecision::Terminate { pid, .. } if pid == test_pid
+        ),
+        "expected Terminate, got: {:?}",
+        decision_after,
+    );
+
+    drop(tx);
+    response_worker.abort();
+    handle.abort();
+}
+
+/// A reload whose input another account can write is refused as a whole, and
+/// the previous detectors stay active.
+#[cfg(unix)]
+#[tokio::test]
+async fn reload_rejects_inputs_writable_by_other_accounts() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let sigma = SigmaFixture::new();
+    let platform = host_platform();
+    sigma.write_process_rule(platform);
+    let yara = YaraFixture::new();
+    yara.write_rule("a.yar", "RuleA", "AAA_RELOAD_MARKER");
+    let ioc = common::IocFixture::new();
+    ioc.write_domains("old.example.test");
+
+    let mut engine = Engine::new_for_platform(platform);
+    engine.load_rules(sigma.rules_dir()).expect("load sigma");
+    let store = DetectorStore::new(
+        Arc::new(engine),
+        Arc::new(Scanner::new(yara.rules_dir()).expect("load yara")),
+        Arc::new(IocEngine::load(&ioc.config())),
+    );
+    let previous_sigma = store.sigma();
+    let previous_yara = store.yara();
+    let previous_ioc = store.ioc();
+
+    let world_writable = |path: std::path::PathBuf| {
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o666))
+            .expect("make input world-writable");
+    };
+    world_writable(sigma.write_rule(
+        "planted.yml",
+        "title: Planted\nlogsource:\n  category: process_creation\ndetection:\n  selection:\n    Image|exists: true\n  condition: selection\n",
+    ));
+    world_writable(yara.write_rule("b.yar", "RuleB", "BBB_RELOAD_MARKER"));
+    world_writable(ioc.write_domains("new.example.test"));
+
+    let barrier = ReloadBarrier::new();
+    let (tx, rx) = mpsc::unbounded_channel();
+    let handle = spawn_reload_worker(
+        Arc::clone(&store),
+        scanner_cfg(&sigma, &yara),
+        ioc.config(),
+        ReloadConfig {
+            enabled: true,
+            debounce_ms: 100,
+            fallback_poll_interval_ms: 60000,
+        },
+        MatchDebugLevel::Off,
+        None,
+        barrier.config_path(),
+        barrier.response(),
+        None,
+        rx,
+    );
+    for target in [ReloadTarget::Sigma, ReloadTarget::Yara, ReloadTarget::Ioc] {
+        tx.send(target).expect("send reload");
+    }
+    barrier.wait(&tx).await;
+
+    assert!(Arc::ptr_eq(&store.sigma(), &previous_sigma));
+    assert!(Arc::ptr_eq(&store.yara(), &previous_yara));
+    assert!(Arc::ptr_eq(&store.ioc(), &previous_ioc));
+    assert!(store
+        .yara()
+        .scan_bytes(b"BBB_RELOAD_MARKER", MatchDebugLevel::Off)
+        .unwrap()
+        .is_empty());
+    drop(tx);
+    handle.abort();
+}

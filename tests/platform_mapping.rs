@@ -1,0 +1,520 @@
+#[cfg(test)]
+mod common;
+
+use common::{
+    dns_query_event, file_create_event, file_event, network_connect_event, process_start_event,
+    test_file_path, TestNormalizer,
+};
+use rustinel::{
+    engine::Engine,
+    models::{CanonicalEvent, EventCategory, EventFields},
+    sensor::{event_actions::rows_for, Platform, SensorAction, SensorNormalization},
+};
+
+#[cfg(target_os = "linux")]
+fn write_cstr<const N: usize>(dst: &mut [u8; N], value: &str) {
+    let bytes = value.as_bytes();
+    let len = bytes.len().min(N.saturating_sub(1));
+    dst[..len].copy_from_slice(&bytes[..len]);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn linux_ebpf_raw_events_map_to_sensor_events() {
+    use rustinel::sensor::linux::events::{
+        mapping, DnsEvent, FileEvent, NetworkEvent, ProcessEvent, ARGV_CAPACITY,
+        DNS_EVENT_RESPONSE, DNS_PAYLOAD_CAPACITY, FILE_PATH_LEN, PROCESS_IMAGE_CAPACITY,
+    };
+    use rustinel::sensor::linux::paths::{DirFdIndex, AT_FDCWD};
+    use rustinel::sensor::{RawPayload, SensorAction};
+    use std::os::fd::AsRawFd;
+
+    let mut process = ProcessEvent {
+        identity: Default::default(),
+        event_time_ns: 0,
+        source_seq: 0,
+        cgroup_id: 55,
+        process_start_time: 123_456,
+        parent_process_start_time: 111_222,
+        kind: 1,
+        pid: 42,
+        uid: 1000,
+        parent_pid: 41,
+        creator_tid: 43,
+        creator_tgid: 41,
+        comm: [0; 16],
+        image: [0; PROCESS_IMAGE_CAPACITY],
+        args_len: 0,
+        args_count: 0,
+        args_truncated: 0,
+        image_truncated: 0,
+        parent_pid_derived: 0,
+        exec_syscall: 0,
+        args: [0; ARGV_CAPACITY],
+    };
+    write_cstr(&mut process.image, "/usr/bin/curl");
+    // Kernel-captured argv: NUL-separated, `args_len` bytes long.
+    let argv = b"/usr/bin/curl\0-sS\0https://example.test\0";
+    process.args[..argv.len()].copy_from_slice(argv);
+    process.args_len = argv.len() as u16;
+    process.args_count = 3;
+
+    let mapped = mapping::process_event_to_sensor(&process);
+    assert_eq!(mapped.action, SensorAction::Start);
+    assert_eq!(mapped.normalization.event_id, 1);
+    match mapped.payload {
+        RawPayload::Process(ref fields) => assert_eq!(
+            fields.command_line.as_deref(),
+            Some("/usr/bin/curl -sS https://example.test")
+        ),
+        _ => panic!("expected process payload"),
+    }
+
+    let long_image = format!("/{}", "deep/".repeat(64));
+    write_cstr(&mut process.image, &long_image);
+    process.image_truncated = 1;
+    let mapped = mapping::process_event_to_sensor(&process);
+    match mapped.payload {
+        RawPayload::Process(fields) => {
+            assert_eq!(
+                fields.image.as_deref().map(str::len),
+                Some(PROCESS_IMAGE_CAPACITY - 1)
+            );
+            let rustinel::sensor::RawProcessPlatform::Linux(source) = *fields.platform else {
+                panic!("expected Linux process facts");
+            };
+            assert_eq!(source.image_truncated, Some(true));
+        }
+        _ => panic!("expected process payload"),
+    }
+
+    process.kind = 2;
+    let mapped = mapping::process_event_to_sensor(&process);
+    assert_eq!(mapped.action, SensorAction::Stop);
+    assert_eq!(mapped.normalization.event_id, 5);
+
+    let mut network = NetworkEvent {
+        event_time_ns: 0,
+        source_seq: 0,
+        pid: 42,
+        uid: 1000,
+        fd: 3,
+        ret: 0,
+        dport: 443,
+        sport: 51324,
+        af: 2,
+        protocol: 17,
+        tuple_flags: 0,
+        daddr: [0; 16],
+        saddr: [0; 16],
+        process_start_time: 123_456,
+    };
+    network.daddr[..4].copy_from_slice(&[198, 51, 100, 10]);
+    network.saddr[..4].copy_from_slice(&[10, 0, 0, 5]);
+    let mapped = mapping::network_event_to_sensor(&network);
+    match mapped.payload {
+        RawPayload::Network(fields) => {
+            assert_eq!(fields.destination_ip.as_deref(), Some("198.51.100.10"));
+            assert!(fields.source_ip.is_none());
+            assert!(fields.source_port.is_none());
+            // The hook covers UDP connects too, so the transport comes from
+            // the measured IP protocol rather than a fixed `tcp`.
+            assert_eq!(fields.protocol.as_deref(), Some("udp"));
+            // The probe hooks `connect()` only, so a captured connection is
+            // outbound by construction.
+            assert_eq!(fields.initiated, Some(true));
+        }
+        _ => panic!("expected network payload"),
+    }
+
+    network.tuple_flags = rustinel::sensor::linux::socket_tuple_abi::TUPLE_MEASURED
+        | rustinel::sensor::linux::socket_tuple_abi::INBOUND;
+    let measured = mapping::network_event_to_sensor(&network);
+    let normalizer = TestNormalizer::new();
+    let normalized = normalizer.normalizer.normalize(&measured).unwrap();
+    assert!(normalized.provenance.entries().iter().all(|entry| ![
+        "SourceIp",
+        "SourcePort",
+        "Protocol"
+    ]
+    .contains(&entry.field.as_str())));
+    match normalized.fields {
+        EventFields::NetworkConnection(fields) => {
+            assert_eq!(fields.source_ip.as_deref(), Some("10.0.0.5"));
+            assert_eq!(fields.source_port.as_deref(), Some("51324"));
+            assert_eq!(fields.protocol.as_deref(), Some("udp"));
+            assert_eq!(fields.initiated, Some(false));
+        }
+        _ => panic!("expected measured network payload"),
+    }
+    network.tuple_flags = 0;
+
+    // Zero placeholders are absent too, never `0.0.0.0` and `0`.
+    network.sport = 0;
+    network.saddr = [0; 16];
+    let mapped = mapping::network_event_to_sensor(&network);
+    match mapped.payload {
+        RawPayload::Network(fields) => {
+            assert_eq!(fields.destination_ip.as_deref(), Some("198.51.100.10"));
+            assert!(fields.source_ip.is_none());
+            assert!(fields.source_port.is_none());
+        }
+        _ => panic!("expected network payload"),
+    }
+
+    // Same for IPv6, where the unassigned address is `::`.
+    network.af = 10;
+    let mapped = mapping::network_event_to_sensor(&network);
+    match mapped.payload {
+        RawPayload::Network(fields) => assert!(fields.source_ip.is_none()),
+        _ => panic!("expected network payload"),
+    }
+
+    let mut file = FileEvent {
+        event_time_ns: 0,
+        source_seq: 0,
+        kind: 3,
+        pid: 42,
+        uid: 1000,
+        flags: 0,
+        dfd: AT_FDCWD,
+        aux_dfd: AT_FDCWD,
+        dfd_token: 0,
+        aux_dfd_token: 0,
+        inode: 0,
+        device: 0,
+        _identity_pad: 0,
+        path: [0; FILE_PATH_LEN],
+        aux_path: [0; FILE_PATH_LEN],
+        comm: [0; 16],
+        process_start_time: 123_456,
+    };
+    write_cstr(&mut file.path, "/tmp/new.txt");
+    write_cstr(&mut file.aux_path, "/tmp/old.txt");
+    let mapped = mapping::file_event_to_sensor(&DirFdIndex::new(), &file)
+        .expect("absolute paths should map");
+    assert_eq!(mapped.action, SensorAction::Rename);
+    match mapped.payload {
+        RawPayload::File(fields) => {
+            assert_eq!(fields.source_filename.as_deref(), Some("/tmp/old.txt"));
+            assert_eq!(fields.target_filename.as_deref(), Some("/tmp/new.txt"));
+            assert!(fields.path_truncated.is_none());
+        }
+        _ => panic!("expected file payload"),
+    }
+
+    // The *at syscalls allow relative names, and the same name under two
+    // descriptors is two different files. Both sides of a rename carry their
+    // own descriptor and are resolved independently.
+    let etc = std::fs::File::open("/etc").expect("/etc should be openable");
+    let tmp = std::fs::File::open("/tmp").expect("/tmp should be openable");
+    let mut relative = FileEvent {
+        event_time_ns: 0,
+        source_seq: 0,
+        kind: 3,
+        pid: std::process::id(),
+        uid: 1000,
+        flags: 0,
+        dfd: tmp.as_raw_fd(),
+        aux_dfd: etc.as_raw_fd(),
+        dfd_token: 0,
+        aux_dfd_token: 0,
+        inode: 0,
+        device: 0,
+        _identity_pad: 0,
+        path: [0; FILE_PATH_LEN],
+        aux_path: [0; FILE_PATH_LEN],
+        comm: [0; 16],
+        process_start_time: 123_456,
+    };
+    write_cstr(&mut relative.path, "shadow.bak");
+    write_cstr(&mut relative.aux_path, "shadow");
+    let mapped = mapping::file_event_to_sensor(&DirFdIndex::new(), &relative)
+        .expect("descriptor-relative paths should map");
+    match mapped.payload {
+        RawPayload::File(fields) => {
+            assert_eq!(fields.source_filename.as_deref(), Some("/etc/shadow"));
+            assert_eq!(fields.target_filename.as_deref(), Some("/tmp/shadow.bak"));
+        }
+        _ => panic!("expected file payload"),
+    }
+
+    // PID 0 is never a real process, so nothing can be resolved against it and
+    // the relative name is dropped rather than reported as a path.
+    let mut orphan = FileEvent {
+        event_time_ns: 0,
+        source_seq: 0,
+        kind: 1,
+        pid: 0,
+        uid: 1000,
+        flags: 0,
+        dfd: AT_FDCWD,
+        aux_dfd: AT_FDCWD,
+        dfd_token: 0,
+        aux_dfd_token: 0,
+        inode: 0,
+        device: 0,
+        _identity_pad: 0,
+        path: [0; FILE_PATH_LEN],
+        aux_path: [0; FILE_PATH_LEN],
+        comm: [0; 16],
+        process_start_time: 123_456,
+    };
+    write_cstr(&mut orphan.path, "payload.sh");
+    assert!(mapping::file_event_to_sensor(&DirFdIndex::new(), &orphan).is_none());
+
+    // A response to an A query for example.test with one answer.
+    let mut message = vec![0x2a, 0x2a, 0x81, 0x80, 0, 1, 0, 1, 0, 0, 0, 0];
+    message.extend_from_slice(b"\x07example\x04test\x00\x00\x01\x00\x01");
+    message.extend_from_slice(&[0xc0, 12, 0, 1, 0, 1, 0, 0, 0, 60, 0, 4, 198, 51, 100, 10]);
+    let mut dns = DnsEvent {
+        event_time_ns: 0,
+        source_seq: 0,
+        kind: DNS_EVENT_RESPONSE,
+        pid: 42,
+        uid: 1000,
+        fd: 3,
+        payload_len: message.len() as u16,
+        flags: 0,
+        _pad1: 0,
+        process_start_time: 123_456,
+        payload: [0; DNS_PAYLOAD_CAPACITY],
+    };
+    dns.payload[..message.len()].copy_from_slice(&message);
+    let mapped = mapping::dns_event_to_sensor(&dns).expect("dns response should map");
+    match mapped.payload {
+        RawPayload::Dns(fields) => {
+            assert_eq!(fields.query_name.as_deref(), Some("example.test"));
+            assert_eq!(fields.query_results.as_deref(), Some("198.51.100.10;"));
+            assert_eq!(fields.record_type.as_deref(), Some("A"));
+        }
+        _ => panic!("expected dns payload"),
+    }
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_etw_compatibility_mapping_uses_sysmon_ids() {
+    use rustinel::{models::EventCategory, sensor::windows::mapper::map_to_sysmon_id};
+
+    assert_eq!(map_to_sysmon_id(EventCategory::Process, 1, 999), 1);
+    assert_eq!(map_to_sysmon_id(EventCategory::Process, 2, 999), 5);
+    assert_eq!(map_to_sysmon_id(EventCategory::ImageLoad, 10, 999), 7);
+    assert_eq!(map_to_sysmon_id(EventCategory::File, 64, 999), 11);
+    assert_eq!(map_to_sysmon_id(EventCategory::File, 70, 999), 23);
+    assert_eq!(map_to_sysmon_id(EventCategory::Registry, 36, 999), 12);
+    assert_eq!(map_to_sysmon_id(EventCategory::Registry, 39, 999), 13);
+    assert_eq!(map_to_sysmon_id(EventCategory::Network, 12, 999), 3);
+}
+
+#[test]
+fn equivalent_windows_and_linux_events_normalize_to_shared_sigma_fields() {
+    for build in [
+        process_start_event,
+        network_connect_event,
+        file_create_event,
+        dns_query_event,
+    ] {
+        let harness = TestNormalizer::new();
+        let windows = harness
+            .normalizer
+            .normalize(&build(Platform::Windows))
+            .expect("windows event normalizes");
+        let linux = harness
+            .normalizer
+            .normalize(&build(Platform::Linux))
+            .expect("linux event normalizes");
+
+        assert_eq!(windows.category, linux.category);
+        assert_ne!(windows.provider, linux.provider);
+        match (&windows.fields, &linux.fields) {
+            (EventFields::ProcessCreation(w), EventFields::ProcessCreation(l)) => {
+                assert!(w.image.is_some());
+                assert!(l.image.is_some());
+                assert_eq!(w.process_id, l.process_id);
+            }
+            (EventFields::NetworkConnection(w), EventFields::NetworkConnection(l)) => {
+                assert_eq!(w.destination_ip, l.destination_ip);
+                assert_eq!(w.destination_port, l.destination_port);
+                // A Windows Connect and a Linux `connect()` are the same
+                // observation and must present the same direction to a rule.
+                assert_eq!(w.initiated, Some(true));
+                assert_eq!(w.initiated, l.initiated);
+            }
+            (EventFields::FileEvent(w), EventFields::FileEvent(l)) => {
+                assert!(w.target_filename.is_some());
+                assert!(l.target_filename.is_some());
+            }
+            (EventFields::DnsQuery(w), EventFields::DnsQuery(l)) => {
+                assert_eq!(w.query_name, l.query_name);
+                assert_eq!(w.record_type, None);
+                assert_eq!(l.record_type.as_deref(), Some("A"));
+            }
+            _ => panic!("event shape mismatch"),
+        }
+    }
+}
+
+#[test]
+fn replayed_file_events_keep_the_action_of_the_live_event() {
+    for platform in [Platform::Windows, Platform::Linux, Platform::MacOS] {
+        for row in rows_for(EventCategory::File) {
+            let normalized = TestNormalizer::new()
+                .normalizer
+                .normalize(&file_event(
+                    platform,
+                    row.action,
+                    None,
+                    Some(test_file_path(platform)),
+                ))
+                .expect("file event normalizes");
+            let replayed = CanonicalEvent::from_normalized(normalized);
+            assert_eq!(
+                replayed.action, row.action,
+                "{:?} on {platform:?}",
+                row.action
+            );
+        }
+    }
+}
+
+/// Every Sigma file category the engine can route an event into.
+const ALL_FILE_CATEGORIES: &[&str] = &[
+    "file_event",
+    "file_create",
+    "file_change",
+    "file_delete",
+    "file_rename",
+];
+
+/// The single table for the file action to Sigma category mapping.
+///
+/// Sensors used to carry a private copy of the numbering behind this and had
+/// drifted apart on `Modify` (issue #239): macOS reported it under FileCreate
+/// (11), so macOS writes were evaluated against `file_create` rules while the
+/// same operation on Linux matched `file_change`. Asserting the mapping here,
+/// for every platform from one table, is what stops that recurring.
+///
+/// `Set` — the file's timestamps or attributes were changed — is what Sigma's
+/// `file_change` denotes (Sysmon Event ID 2). A plain `Modify` is a write and
+/// stays in the base family only (issue #238).
+const FILE_ACTION_CATEGORIES: &[(SensorAction, &[&str])] = &[
+    (SensorAction::Create, &["file_event", "file_create"]),
+    (SensorAction::Set, &["file_event", "file_change"]),
+    (SensorAction::Modify, &["file_event"]),
+    (SensorAction::Delete, &["file_delete"]),
+    (SensorAction::Rename, &["file_event", "file_rename"]),
+];
+
+/// An engine holding exactly one rule, in `category`, that matches any file
+/// event carrying a `.txt` target. Membership in `category` is then simply
+/// whether the rule fires.
+fn engine_for_category(fixture: &common::SigmaFixture, category: &str) -> Engine {
+    fixture.write_rule(
+        "category-probe.yml",
+        &format!(
+            r#"title: File Category Probe
+logsource:
+  category: {category}
+detection:
+  selection:
+    TargetFilename|endswith: ".txt"
+  condition: selection
+level: medium
+"#
+        ),
+    );
+
+    let mut engine = Engine::new_for_platform(Platform::Linux);
+    engine
+        .load_rules(fixture.rules_dir())
+        .expect("load category probe rule");
+    engine
+}
+
+#[test]
+fn file_actions_carry_the_shared_normalization_on_every_platform() {
+    for platform in [Platform::Windows, Platform::Linux, Platform::MacOS] {
+        for row in rows_for(EventCategory::File) {
+            let (action, expected) = (row.action, row.normalization());
+            let event = file_event(platform, action, None, Some(test_file_path(platform)));
+            assert_eq!(
+                event.normalization, expected,
+                "{action:?} normalization on {platform:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn same_file_action_yields_same_sigma_categories_on_every_platform() {
+    // The category table and the sensor numbering table must cover the same
+    // actions, or an action could gain a normalization without ever having its
+    // category pinned down.
+    assert_eq!(
+        FILE_ACTION_CATEGORIES.len(),
+        rows_for(EventCategory::File).count(),
+        "every normalized file action needs a category expectation"
+    );
+
+    for (action, expected_categories) in FILE_ACTION_CATEGORIES {
+        assert!(
+            SensorNormalization::for_file_action(*action).is_some(),
+            "{action:?} has a category expectation but no shared normalization"
+        );
+
+        for category in ALL_FILE_CATEGORIES {
+            let should_match = expected_categories.contains(category);
+
+            for platform in [Platform::Windows, Platform::Linux, Platform::MacOS] {
+                let fixture = common::SigmaFixture::new();
+                let engine = engine_for_category(&fixture, category);
+                let normalized = TestNormalizer::new()
+                    .normalizer
+                    .normalize(&file_event(
+                        platform,
+                        *action,
+                        None,
+                        Some(test_file_path(platform)),
+                    ))
+                    .expect("file event normalizes");
+
+                assert_eq!(
+                    !engine.check_event(&normalized).is_empty(),
+                    should_match,
+                    "{action:?} on {platform:?} should {} match `{category}`",
+                    if should_match { "" } else { "not" },
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn generic_sigma_rule_matches_equivalent_linux_and_windows_process_events() {
+    let fixture = common::SigmaFixture::new();
+    fixture.write_rule(
+        "generic-process.yml",
+        r#"title: Generic Curl Process
+logsource:
+  category: process_creation
+detection:
+  selection:
+    CommandLine|contains: "example.test"
+  condition: selection
+level: medium
+"#,
+    );
+
+    for platform in [Platform::Windows, Platform::Linux, Platform::MacOS] {
+        let mut engine = Engine::new_for_platform(platform);
+        engine
+            .load_rules(fixture.rules_dir())
+            .expect("load generic rule");
+        let event = TestNormalizer::new()
+            .normalizer
+            .normalize(&process_start_event(platform))
+            .expect("normalize process");
+        assert!(!engine.check_event(&event).is_empty());
+    }
+}

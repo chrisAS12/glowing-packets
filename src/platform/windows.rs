@@ -1,0 +1,572 @@
+use std::ffi::OsString;
+use std::time::{Duration, Instant};
+
+use anyhow::{bail, Context};
+use windows_service::service::ServiceAccess;
+
+use crate::cli::ServiceAction;
+use crate::service::{
+    execute_backend_action, run_backend_action, ManagedServicePaths, ServiceBackend,
+    ServiceCommandResult, ServiceStatus, SERVICE_DESCRIPTION, WINDOWS_SERVICE_DISPLAY_NAME,
+    WINDOWS_SERVICE_NAME,
+};
+use crate::state::{HostState, InventorySnapshot};
+use crate::vocab::ProcessStartKey;
+
+pub const SERVICE_NAME: &str = WINDOWS_SERVICE_NAME;
+
+const SERVICE_STOP_TIMEOUT: Duration = Duration::from_secs(30);
+const SERVICE_STATUS_POLL_INTERVAL: Duration = Duration::from_millis(100);
+// Windows requires START access when configuring SC_ACTION_RESTART recovery.
+const SERVICE_INSTALL_ACCESS: ServiceAccess = ServiceAccess::QUERY_CONFIG
+    .union(ServiceAccess::CHANGE_CONFIG)
+    .union(ServiceAccess::START);
+
+pub fn handle_service_command(action: ServiceAction) -> anyhow::Result<()> {
+    let backend = WindowsServiceBackend::new();
+    execute_backend_action(&backend, action)
+}
+
+pub fn run_service_action(action: ServiceAction) -> anyhow::Result<ServiceCommandResult> {
+    let backend = WindowsServiceBackend::new();
+    run_backend_action(&backend, action)
+}
+
+struct WindowsServiceBackend {
+    paths: ManagedServicePaths,
+}
+
+impl WindowsServiceBackend {
+    fn new() -> Self {
+        Self {
+            paths: ManagedServicePaths::current(),
+        }
+    }
+
+    fn service_info(&self) -> windows_service::service::ServiceInfo {
+        use windows_service::service::{
+            ServiceErrorControl, ServiceInfo, ServiceStartType, ServiceType,
+        };
+
+        ServiceInfo {
+            name: OsString::from(SERVICE_NAME),
+            display_name: OsString::from(WINDOWS_SERVICE_DISPLAY_NAME),
+            service_type: ServiceType::OWN_PROCESS,
+            start_type: ServiceStartType::AutoStart,
+            error_control: ServiceErrorControl::Normal,
+            executable_path: self.paths.binary_path.clone(),
+            launch_arguments: vec![
+                OsString::from("run"),
+                OsString::from("--config"),
+                self.paths.config_path.as_os_str().to_os_string(),
+                OsString::from("--no-console"),
+            ],
+            dependencies: vec![],
+            account_name: None,
+            account_password: None,
+        }
+    }
+
+    fn is_not_installed(err: &windows_service::Error) -> bool {
+        match err {
+            windows_service::Error::Winapi(io_err) => io_err.raw_os_error() == Some(1060),
+            _ => false,
+        }
+    }
+
+    fn configure_recovery(service: &windows_service::service::Service) -> anyhow::Result<()> {
+        use windows_service::service::{
+            ServiceAction, ServiceActionType, ServiceFailureActions, ServiceFailureResetPeriod,
+        };
+
+        service.update_failure_actions(ServiceFailureActions {
+            reset_period: ServiceFailureResetPeriod::After(Duration::from_secs(86_400)),
+            reboot_msg: None,
+            command: None,
+            actions: Some(vec![
+                ServiceAction {
+                    action_type: ServiceActionType::Restart,
+                    delay: Duration::from_secs(5),
+                };
+                3
+            ]),
+        })?;
+        service.set_failure_actions_on_non_crash_failures(true)?;
+        Ok(())
+    }
+}
+
+impl ServiceBackend for WindowsServiceBackend {
+    fn name(&self) -> &'static str {
+        SERVICE_NAME
+    }
+
+    fn install(&self) -> anyhow::Result<()> {
+        use windows_service::service_manager::{ServiceManager, ServiceManagerAccess};
+
+        self.paths.validate_install_inputs()?;
+
+        let manager = ServiceManager::local_computer(
+            None::<&str>,
+            ServiceManagerAccess::CONNECT | ServiceManagerAccess::CREATE_SERVICE,
+        )?;
+        let service_info = self.service_info();
+        let access = SERVICE_INSTALL_ACCESS;
+
+        match manager.open_service(SERVICE_NAME, access) {
+            Ok(service) => {
+                service.change_config(&service_info)?;
+                service.set_description(SERVICE_DESCRIPTION)?;
+                Self::configure_recovery(&service)?;
+            }
+            Err(err) if Self::is_not_installed(&err) => {
+                let service = manager.create_service(&service_info, access)?;
+                service.set_description(SERVICE_DESCRIPTION)?;
+                Self::configure_recovery(&service)?;
+            }
+            Err(err) => return Err(err.into()),
+        }
+
+        Ok(())
+    }
+
+    fn uninstall(&self) -> anyhow::Result<()> {
+        use windows_service::service::ServiceAccess;
+        use windows_service::service_manager::{ServiceManager, ServiceManagerAccess};
+
+        let manager = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)?;
+        let access = ServiceAccess::QUERY_STATUS | ServiceAccess::STOP | ServiceAccess::DELETE;
+        let service = match manager.open_service(SERVICE_NAME, access) {
+            Ok(service) => service,
+            Err(err) if Self::is_not_installed(&err) => return Ok(()),
+            Err(err) => return Err(err.into()),
+        };
+
+        let status = service.query_status()?;
+        if windows_status(status.current_state) == ServiceStatus::Running {
+            let _ = service.stop();
+        }
+        service.delete()?;
+        Ok(())
+    }
+
+    fn start(&self) -> anyhow::Result<()> {
+        use windows_service::service::ServiceAccess;
+        use windows_service::service_manager::{ServiceManager, ServiceManagerAccess};
+
+        let manager = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)?;
+        let service = manager.open_service(SERVICE_NAME, ServiceAccess::START)?;
+        service.start(&[] as &[OsString])?;
+        Ok(())
+    }
+
+    fn stop(&self) -> anyhow::Result<()> {
+        use windows_service::service::ServiceAccess;
+        use windows_service::service_manager::{ServiceManager, ServiceManagerAccess};
+
+        let manager = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)?;
+        let service = manager.open_service(
+            SERVICE_NAME,
+            ServiceAccess::STOP | ServiceAccess::QUERY_STATUS,
+        )?;
+        service.stop()?;
+
+        wait_for_service_state(
+            SERVICE_NAME,
+            windows_service::service::ServiceState::Stopped,
+            SERVICE_STOP_TIMEOUT,
+            SERVICE_STATUS_POLL_INTERVAL,
+            || Ok(service.query_status()?.current_state),
+        )
+    }
+
+    fn status(&self) -> anyhow::Result<ServiceStatus> {
+        use windows_service::service::ServiceAccess;
+        use windows_service::service_manager::{ServiceManager, ServiceManagerAccess};
+
+        let manager = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)?;
+        let service = match manager.open_service(SERVICE_NAME, ServiceAccess::QUERY_STATUS) {
+            Ok(service) => service,
+            Err(err) if Self::is_not_installed(&err) => return Ok(ServiceStatus::NotInstalled),
+            Err(err) => return Err(err.into()),
+        };
+
+        Ok(windows_status(service.query_status()?.current_state))
+    }
+}
+
+fn wait_for_service_state<F>(
+    service_name: &str,
+    expected_state: windows_service::service::ServiceState,
+    timeout: Duration,
+    poll_interval: Duration,
+    mut query_status: F,
+) -> anyhow::Result<()>
+where
+    F: FnMut() -> anyhow::Result<windows_service::service::ServiceState>,
+{
+    let deadline = Instant::now() + timeout;
+
+    loop {
+        let state = query_status()
+            .with_context(|| format!("failed to query status of service '{service_name}'"))?;
+        if state == expected_state {
+            return Ok(());
+        }
+
+        if Instant::now() >= deadline {
+            bail!(
+                "timed out after {timeout:?} waiting for service '{service_name}' to reach {expected_state:?}; last state was {state:?}"
+            );
+        }
+
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        std::thread::sleep(poll_interval.min(remaining));
+    }
+}
+
+fn windows_status(state: windows_service::service::ServiceState) -> ServiceStatus {
+    use windows_service::service::{
+        ServiceState::ContinuePending, ServiceState::PausePending, ServiceState::Paused,
+        ServiceState::Running, ServiceState::StartPending, ServiceState::StopPending,
+        ServiceState::Stopped,
+    };
+
+    match state {
+        Stopped | Paused => ServiceStatus::Stopped,
+        StartPending | ContinuePending => ServiceStatus::Starting,
+        Running => ServiceStatus::Running,
+        StopPending => ServiceStatus::Stopping,
+        PausePending => ServiceStatus::Stopped,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    #[ignore = "requires Administrator privileges and creates a temporary SCM service"]
+    fn configures_recovery_on_created_and_existing_services() {
+        use windows_service::service::{
+            Service, ServiceActionType, ServiceFailureResetPeriod, ServiceStartType,
+        };
+        use windows_service::service_manager::{ServiceManager, ServiceManagerAccess};
+
+        struct TemporaryService(Service);
+        impl Drop for TemporaryService {
+            fn drop(&mut self) {
+                let _ = self.0.delete();
+            }
+        }
+
+        fn check_recovery(service: &Service) {
+            let recovery = service.get_failure_actions().expect("query recovery");
+            assert_eq!(
+                recovery.reset_period,
+                ServiceFailureResetPeriod::After(Duration::from_secs(86_400))
+            );
+            let actions = recovery.actions.expect("restart actions");
+            assert_eq!(actions.len(), 3);
+            for action in actions {
+                assert_eq!(action.action_type, ServiceActionType::Restart);
+                assert_eq!(action.delay, Duration::from_secs(5));
+            }
+            assert!(service
+                .get_failure_actions_on_non_crash_failures()
+                .expect("query non-crash recovery flag"));
+        }
+
+        let manager = ServiceManager::local_computer(
+            None::<&str>,
+            ServiceManagerAccess::CONNECT | ServiceManagerAccess::CREATE_SERVICE,
+        )
+        .expect("connect to SCM as Administrator");
+        let mut info = WindowsServiceBackend::new().service_info();
+        info.name = OsString::from(format!("RustinelRecoveryTest-{}", std::process::id()));
+        info.display_name = info.name.clone();
+        info.start_type = ServiceStartType::OnDemand;
+        info.executable_path = std::env::current_exe().expect("test executable");
+        info.launch_arguments.clear();
+        let service = TemporaryService(
+            manager
+                .create_service(&info, SERVICE_INSTALL_ACCESS | ServiceAccess::DELETE)
+                .expect("create temporary service"),
+        );
+        WindowsServiceBackend::configure_recovery(&service.0).expect("configure created service");
+        check_recovery(&service.0);
+
+        let existing = manager
+            .open_service(&info.name, SERVICE_INSTALL_ACCESS)
+            .expect("open existing service");
+        existing
+            .set_failure_actions_on_non_crash_failures(false)
+            .expect("clear non-crash recovery flag");
+        WindowsServiceBackend::configure_recovery(&existing).expect("configure existing service");
+        check_recovery(&existing);
+    }
+
+    #[test]
+    fn waits_until_service_reaches_expected_state() {
+        use windows_service::service::ServiceState;
+
+        let mut states = [
+            ServiceState::StopPending,
+            ServiceState::StopPending,
+            ServiceState::Stopped,
+        ]
+        .into_iter();
+
+        wait_for_service_state(
+            SERVICE_NAME,
+            ServiceState::Stopped,
+            Duration::from_secs(1),
+            Duration::ZERO,
+            || Ok(states.next().expect("test state")),
+        )
+        .expect("service should reach stopped state");
+    }
+
+    #[test]
+    fn reports_timeout_with_last_state() {
+        use windows_service::service::ServiceState;
+
+        let error = wait_for_service_state(
+            SERVICE_NAME,
+            ServiceState::Stopped,
+            Duration::ZERO,
+            Duration::ZERO,
+            || Ok(ServiceState::StopPending),
+        )
+        .expect_err("service should time out");
+
+        let message = error.to_string();
+        assert!(message.contains("timed out after"));
+        assert!(message.contains("waiting for service 'Rustinel'"));
+        assert!(message.contains("last state was StopPending"));
+    }
+}
+
+mod native_snapshot {
+    use crate::utils::query_process_command_line_from_handle;
+    use windows::Win32::Foundation::{CloseHandle, UNICODE_STRING};
+    use windows::Win32::System::ProcessStatus::K32GetProcessImageFileNameW;
+    use windows::Win32::System::Threading::{OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
+
+    const SYSTEM_PROCESS_INFORMATION: u32 = 5;
+    const STATUS_INFO_LENGTH_MISMATCH: i32 = -1073741820;
+
+    #[link(name = "ntdll")]
+    extern "system" {
+        fn NtQuerySystemInformation(
+            SystemInformationClass: u32,
+            SystemInformation: *mut u8,
+            SystemInformationLength: u32,
+            ReturnLength: *mut u32,
+        ) -> i32;
+    }
+
+    #[repr(C)]
+    #[allow(non_snake_case)]
+    struct SystemProcessInformationFull {
+        NextEntryOffset: u32,
+        NumberOfThreads: u32,
+        WorkingSetPrivateSize: i64,
+        HardFaultCount: u32,
+        NumberOfThreadsHighWatermark: u32,
+        CycleTime: u64,
+        CreateTime: i64,
+        UserTime: i64,
+        KernelTime: i64,
+        ImageName: UNICODE_STRING,
+        BasePriority: i32,
+        UniqueProcessId: usize,
+        InheritedFromUniqueProcessId: usize,
+        HandleCount: u32,
+        SessionId: u32,
+    }
+
+    pub struct ProcessSnapshot {
+        pub pid: u32,
+        pub parent_pid: u32,
+        pub creation_time: u64,
+        pub image_name: String,
+        pub full_path: Option<String>,
+        pub command_line: Option<String>,
+    }
+
+    pub fn query_system_processes() -> Result<Vec<ProcessSnapshot>, Box<dyn std::error::Error>> {
+        // SAFETY: each NtQuerySystemInformation call gets a buffer and length that
+        // match, and the buffer is regrown when the kernel reports a larger size.
+        // On success the buffer holds a chain of SYSTEM_PROCESS_INFORMATION
+        // entries linked by NextEntryOffset; the offsets come from the kernel and
+        // are trusted to stay inside the buffer. The image name pointer of each
+        // entry points into that same buffer, and process handles are closed
+        // before the next entry.
+        unsafe {
+            let mut buffer_size: u32 = 1024 * 1024;
+            let mut buffer: Vec<u8>;
+            let mut return_length: u32 = 0;
+
+            loop {
+                buffer = vec![0u8; buffer_size as usize];
+                let status = NtQuerySystemInformation(
+                    SYSTEM_PROCESS_INFORMATION,
+                    buffer.as_mut_ptr(),
+                    buffer_size,
+                    &mut return_length,
+                );
+
+                if status == 0 {
+                    break;
+                } else if status == STATUS_INFO_LENGTH_MISMATCH {
+                    buffer_size = return_length + 4096;
+                    continue;
+                } else {
+                    return Err(format!(
+                        "NtQuerySystemInformation failed with status: {:#x}",
+                        status
+                    )
+                    .into());
+                }
+            }
+
+            let mut processes = Vec::new();
+            let mut offset = 0usize;
+
+            loop {
+                let entry_ptr = buffer.as_ptr().add(offset) as *const SystemProcessInformationFull;
+                let entry = &*entry_ptr;
+
+                let pid = entry.UniqueProcessId as u32;
+                let parent_pid = entry.InheritedFromUniqueProcessId as u32;
+                let creation_time = if entry.CreateTime > 0 {
+                    entry.CreateTime as u64
+                } else {
+                    0
+                };
+
+                let image_name = if !entry.ImageName.Buffer.is_null() && entry.ImageName.Length > 0
+                {
+                    let slice = std::slice::from_raw_parts(
+                        entry.ImageName.Buffer.as_ptr(),
+                        (entry.ImageName.Length / 2) as usize,
+                    );
+                    String::from_utf16_lossy(slice)
+                } else {
+                    String::from("System Idle Process")
+                };
+
+                let (full_path, command_line) = if pid > 4 {
+                    match OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) {
+                        Ok(handle) if !handle.is_invalid() => {
+                            let mut path_buffer = [0u16; 1024];
+                            let len = K32GetProcessImageFileNameW(handle, &mut path_buffer);
+                            let full_path = if len > 0 {
+                                Some(String::from_utf16_lossy(&path_buffer[..len as usize]))
+                            } else {
+                                None
+                            };
+
+                            let command_line = query_process_command_line_from_handle(handle);
+                            let _ = CloseHandle(handle);
+
+                            (full_path, command_line)
+                        }
+                        _ => (None, None),
+                    }
+                } else {
+                    (None, None)
+                };
+
+                processes.push(ProcessSnapshot {
+                    pid,
+                    parent_pid,
+                    creation_time,
+                    image_name: image_name.clone(),
+                    full_path,
+                    command_line,
+                });
+
+                if entry.NextEntryOffset == 0 {
+                    break;
+                }
+                offset += entry.NextEntryOffset as usize;
+            }
+
+            Ok(processes)
+        }
+    }
+}
+
+/// Snapshot stable identities for processes that predate the ETW sessions.
+pub fn snapshot_process_start_keys() -> anyhow::Result<Vec<ProcessStartKey>> {
+    let processes = native_snapshot::query_system_processes()
+        .map_err(|e| anyhow::anyhow!("Failed to query system processes: {}", e))?;
+
+    Ok(processes
+        .into_iter()
+        .filter(|process| process.creation_time != 0)
+        .map(|process| ProcessStartKey {
+            pid: process.pid,
+            start_time: process.creation_time,
+        })
+        .collect())
+}
+
+/// Snapshot all running processes using Native API (NtQuerySystemInformation).
+pub fn snapshot_processes(host: &HostState) -> anyhow::Result<usize> {
+    let started = std::time::Instant::now();
+    let mut snapshot = InventorySnapshot::default();
+    let result = snapshot_processes_inner(host, &mut snapshot);
+    snapshot.duration_ms = started.elapsed().as_millis() as u64;
+    snapshot.skipped = snapshot.scanned.saturating_sub(snapshot.seeded);
+    snapshot.error = result.as_ref().err().map(|error| format!("{error:#}"));
+    host.record_inventory(snapshot);
+    result
+}
+
+fn snapshot_processes_inner(
+    host: &HostState,
+    snapshot: &mut InventorySnapshot,
+) -> anyhow::Result<usize> {
+    let cache = &host.processes;
+    use crate::utils::pe;
+    use crate::utils::{convert_nt_to_dos, parse_metadata};
+
+    let processes = native_snapshot::query_system_processes()
+        .map_err(|e| anyhow::anyhow!("Failed to query system processes: {}", e))?;
+
+    let mut count = 0;
+    snapshot.scanned = processes.len();
+    let capacity = host.limits().processes;
+    for proc in processes.into_iter().take(capacity) {
+        let raw_image = proc.full_path.unwrap_or_else(|| proc.image_name.clone());
+        let image = convert_nt_to_dos(&raw_image);
+
+        let (original_filename, product, description, company, file_version) =
+            pe::version_fields(parse_metadata(&image));
+
+        cache.add(
+            proc.pid,
+            proc.creation_time,
+            image,
+            proc.command_line,
+            None,
+            Some(proc.parent_pid),
+            None,
+            None,
+            original_filename,
+            product,
+            description,
+            company,
+            file_version,
+            None,
+            None,
+        );
+        count += 1;
+    }
+
+    snapshot.seeded = count;
+    Ok(count)
+}

@@ -1,0 +1,64 @@
+//! Data models module
+//!
+//! Defines core data structures like NormalizedEvent and Alert.
+
+pub mod ecs;
+
+pub mod event_actions;
+
+mod alert;
+mod canonical;
+pub(crate) mod dns_name;
+mod event;
+pub(crate) mod field_view;
+mod fields;
+mod match_details;
+
+pub use alert::*;
+pub use canonical::*;
+pub use event::*;
+pub use field_view::*;
+pub use fields::*;
+pub use match_details::*;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::vocab::Platform;
+    use std::collections::HashMap;
+
+    #[test]
+    fn test_event_category() {
+        assert_eq!(EventCategory::Process, EventCategory::Process);
+    }
+
+    #[test]
+    fn test_alert_serialization() {
+        let event = NormalizedEvent {
+            timestamp: "2025-01-01T00:00:00Z".to_string(),
+            source_seq: None,
+            ingest_seq: 0,
+            platform: Platform::Windows,
+            provider: "etw".to_string(),
+            category: EventCategory::Process,
+            event_id: 1,
+            event_id_string: "1".to_string(),
+            opcode: 1,
+            fields: EventFields::Generic(HashMap::new()),
+            process_name: None,
+            provenance: Default::default(),
+            process_context: None,
+        };
+        let alert = Alert {
+            severity: AlertSeverity::High,
+            rule_name: "test_rule".to_string(),
+            rule_description: None,
+            rule_id: None,
+            sigma_metadata: None,
+            engine: DetectionEngine::Sigma,
+            event,
+            match_details: None,
+        };
+        let _json = serde_json::to_string(&alert).unwrap();
+    }
+}

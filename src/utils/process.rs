@@ -1,0 +1,1045 @@
+//! Process utilities.
+
+use digest::Digest;
+use sha2::Sha256;
+
+use super::path::normalize_path_for_comparison;
+
+/// Linux executable names that must be resolved in the subject's process context.
+/// Use its executable link rather than its fd table: close-on-exec descriptors
+/// can already be gone when background scanning starts.
+pub(crate) fn linux_exec_uses_proc(image: &str) -> bool {
+    if is_memfd_image(image)
+        || image.starts_with("/proc/self/fd/")
+        || image.starts_with("/proc/thread-self/fd/")
+        || image.starts_with("/dev/fd/")
+        || matches!(image, "/proc/self/exe" | "/proc/thread-self/exe")
+    {
+        return true;
+    }
+    let Some((pid, rest)) = image.strip_prefix("/proc/").and_then(|p| p.split_once('/')) else {
+        return false;
+    };
+    pid.parse::<u32>().is_ok() && (rest.starts_with("fd/") || rest == "exe")
+}
+
+pub(crate) fn is_memfd_image(image: &str) -> bool {
+    image.starts_with("/memfd:") || image.starts_with("memfd:")
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProcessIdentity {
+    pub pid: u32,
+    pub image: String,
+    pub start_time: Option<u64>,
+    pub command_line_hash: Option<String>,
+}
+
+impl ProcessIdentity {
+    /// Compare two identities, allowing metadata that is unavailable on one side.
+    pub fn matches(&self, current: &Self) -> Result<(), String> {
+        if self.pid != current.pid {
+            return Err(format!("pid changed from {} to {}", self.pid, current.pid));
+        }
+
+        if !same_process_image(&self.image, &current.image) {
+            return Err(format!(
+                "image changed from '{}' to '{}'",
+                self.image, current.image
+            ));
+        }
+
+        if let (Some(expected_start), Some(current_start)) = (self.start_time, current.start_time) {
+            if expected_start != current_start {
+                return Err(format!(
+                    "start time changed from {} to {}",
+                    expected_start, current_start
+                ));
+            }
+        }
+
+        if let (Some(expected_hash), Some(current_hash)) = (
+            self.command_line_hash.as_deref(),
+            current.command_line_hash.as_deref(),
+        ) {
+            if expected_hash != current_hash {
+                return Err("command line hash changed".to_string());
+            }
+        }
+
+        Ok(())
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ProcessDetails {
+    pub image: Option<String>,
+    pub command_line: Option<String>,
+    pub parent_process_id: Option<u32>,
+    pub parent_image: Option<String>,
+    pub parent_command_line: Option<String>,
+    pub current_directory: Option<String>,
+    /// Audit login UID from `/proc/<pid>/loginuid`; `u32::MAX` means unset.
+    pub login_uid: Option<u32>,
+    /// Linux `/proc/<pid>/stat` start time in clock ticks since boot.
+    pub start_time: Option<u64>,
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Debug, Clone, Copy)]
+struct ProcStat {
+    parent_process_id: Option<u32>,
+    start_time: Option<u64>,
+}
+
+#[cfg(target_os = "linux")]
+use std::fs;
+
+#[cfg(windows)]
+use windows::Win32::Foundation::{CloseHandle, HANDLE, UNICODE_STRING};
+#[cfg(windows)]
+use windows::Win32::System::Threading::{OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
+
+#[cfg(windows)]
+const PROCESS_COMMAND_LINE_INFORMATION: u32 = 60;
+#[cfg(windows)]
+const STATUS_INFO_LENGTH_MISMATCH: i32 = -1073741820; // 0xC0000004
+
+#[cfg(windows)]
+#[link(name = "ntdll")]
+extern "system" {
+    fn NtQueryInformationProcess(
+        ProcessHandle: HANDLE,
+        ProcessInformationClass: u32,
+        ProcessInformation: *mut u8,
+        ProcessInformationLength: u32,
+        ReturnLength: *mut u32,
+    ) -> i32;
+}
+
+/// Query a process command line from a process handle.
+/// Returns None if the command line is unavailable or the process exits.
+#[cfg(windows)]
+pub fn query_process_command_line_from_handle(handle: HANDLE) -> Option<String> {
+    // SAFETY: `handle` is a live process handle with query access, owned by the
+    // caller. Each NtQueryInformationProcess call gets a buffer and length that
+    // match, and a null buffer only on the zero-length sizing call. The
+    // UNICODE_STRING is read only after the buffer is known to hold one, and its
+    // character pointer is checked to lie inside that buffer before the slice
+    // is built from it.
+    unsafe {
+        let mut return_length = 0u32;
+        let status = NtQueryInformationProcess(
+            handle,
+            PROCESS_COMMAND_LINE_INFORMATION,
+            std::ptr::null_mut(),
+            0,
+            &mut return_length,
+        );
+
+        if status != STATUS_INFO_LENGTH_MISMATCH || return_length == 0 {
+            return None;
+        }
+
+        let mut buffer = vec![0u8; return_length as usize];
+        let status = NtQueryInformationProcess(
+            handle,
+            PROCESS_COMMAND_LINE_INFORMATION,
+            buffer.as_mut_ptr(),
+            return_length,
+            &mut return_length,
+        );
+        if status != 0 {
+            return None;
+        }
+
+        if buffer.len() < std::mem::size_of::<UNICODE_STRING>() {
+            return None;
+        }
+
+        let unicode = &*(buffer.as_ptr() as *const UNICODE_STRING);
+        if unicode.Length == 0 || unicode.Buffer.is_null() {
+            return None;
+        }
+
+        let len = (unicode.Length / 2) as usize;
+        let buffer_start = buffer.as_ptr() as usize;
+        let buffer_end = buffer_start + buffer.len();
+        let cmd_ptr = unicode.Buffer.0 as usize;
+        let cmd_end = cmd_ptr.saturating_add(len.saturating_mul(2));
+        if cmd_ptr < buffer_start || cmd_end > buffer_end {
+            return None;
+        }
+
+        let slice = std::slice::from_raw_parts(unicode.Buffer.0, len);
+        let cmd = String::from_utf16_lossy(slice)
+            .trim_end_matches('\0')
+            .to_string();
+        if cmd.is_empty() {
+            None
+        } else {
+            Some(cmd)
+        }
+    }
+}
+
+/// Query a process command line by PID (best-effort).
+#[cfg(windows)]
+pub fn query_process_command_line(pid: u32) -> Option<String> {
+    if pid == 0 {
+        return None;
+    }
+
+    // SAFETY: OpenProcess takes a PID and access flags, with no pointer arguments.
+    let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) }.ok()?;
+    if handle.is_invalid() {
+        return None;
+    }
+
+    let cmd = query_process_command_line_from_handle(handle);
+    // SAFETY: `handle` was opened above, is closed only here, and is not used
+    // afterwards.
+    let _ = unsafe { CloseHandle(handle) };
+    cmd
+}
+
+/// Live facts read from one process handle after its lifetime was verified.
+#[cfg(windows)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct LiveProcessFacts {
+    pub command_line: Option<String>,
+    /// Token `AuthenticationId`, formatted as Sysmon prints `LogonId` (`0x3e7`).
+    pub logon_id: Option<String>,
+    /// Working directory read from the process parameters, when readable.
+    pub current_directory: Option<String>,
+}
+
+/// Format a logon session LUID the way Sysmon renders `LogonId`.
+#[cfg(any(windows, test))]
+pub(crate) fn format_logon_id(low_part: u32, high_part: i32) -> String {
+    format!(
+        "0x{:x}",
+        (u64::from(high_part as u32) << 32) | u64::from(low_part)
+    )
+}
+
+/// Read the logon session of a process token. Needs only
+/// `PROCESS_QUERY_LIMITED_INFORMATION` on the process handle.
+#[cfg(windows)]
+fn query_process_logon_id_from_handle(handle: HANDLE) -> Option<String> {
+    use windows::Win32::Security::{
+        GetTokenInformation, TokenStatistics, TOKEN_QUERY, TOKEN_STATISTICS,
+    };
+    use windows::Win32::System::Threading::OpenProcessToken;
+
+    let mut token = HANDLE::default();
+    // SAFETY: `handle` is a live process handle with query access and `token`
+    // is a live out-pointer.
+    unsafe { OpenProcessToken(handle, TOKEN_QUERY, &mut token) }.ok()?;
+    let mut statistics = TOKEN_STATISTICS::default();
+    let mut returned = 0u32;
+    // SAFETY: the buffer is a live TOKEN_STATISTICS and the length passed is
+    // its size.
+    let ok = unsafe {
+        GetTokenInformation(
+            token,
+            TokenStatistics,
+            Some(&mut statistics as *mut TOKEN_STATISTICS as *mut _),
+            std::mem::size_of::<TOKEN_STATISTICS>() as u32,
+            &mut returned,
+        )
+    }
+    .is_ok();
+    // SAFETY: `token` was opened above, is closed only here, and is not used
+    // afterwards.
+    let _ = unsafe { CloseHandle(token) };
+    ok.then(|| {
+        format_logon_id(
+            statistics.AuthenticationId.LowPart,
+            statistics.AuthenticationId.HighPart,
+        )
+    })
+}
+
+/// Read live process facts only from the expected process lifetime.
+/// Creation time, command line and token use the same handle, so PID reuse
+/// cannot change the process between the identity check and the queries.
+#[cfg(windows)]
+pub fn query_live_process_at_start(pid: u32, start_time: u64) -> LiveProcessFacts {
+    use windows::Win32::System::Threading::PROCESS_VM_READ;
+    // The working directory needs read access to the target's memory, which a
+    // protected process refuses; it is then absent and the rest is still read.
+    // SAFETY: OpenProcess takes a PID and access flags, with no pointer arguments.
+    let (handle, can_read_memory) = match unsafe {
+        OpenProcess(
+            PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_VM_READ,
+            false,
+            pid,
+        )
+    } {
+        Ok(handle) => (handle, true),
+        // SAFETY: as above.
+        Err(_) => match unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) } {
+            Ok(handle) => (handle, false),
+            Err(_) => return LiveProcessFacts::default(),
+        },
+    };
+    let facts = if process_created_at(handle, start_time) {
+        LiveProcessFacts {
+            command_line: query_process_command_line_from_handle(handle),
+            logon_id: query_process_logon_id_from_handle(handle),
+            current_directory: if can_read_memory {
+                query_process_current_directory_from_handle(handle)
+            } else {
+                None
+            },
+        }
+    } else {
+        LiveProcessFacts::default()
+    };
+    // SAFETY: `handle` was opened above, is closed only here, and is not used
+    // afterwards.
+    let _ = unsafe { CloseHandle(handle) };
+    facts
+}
+
+/// Read a live command line only from the expected process lifetime.
+#[cfg(windows)]
+pub fn query_process_command_line_at_start(pid: u32, start_time: u64) -> Option<String> {
+    query_live_process_at_start(pid, start_time).command_line
+}
+
+#[cfg(windows)]
+fn process_created_at(handle: HANDLE, start_time: u64) -> bool {
+    use windows::Win32::Foundation::FILETIME;
+    use windows::Win32::System::Threading::GetProcessTimes;
+    let mut created = FILETIME::default();
+    let mut exited = FILETIME::default();
+    let mut kernel = FILETIME::default();
+    let mut user = FILETIME::default();
+    // SAFETY: `handle` is a live process handle owned by the caller, and the
+    // four FILETIME out-pointers refer to live locals.
+    unsafe { GetProcessTimes(handle, &mut created, &mut exited, &mut kernel, &mut user) }.is_ok()
+        && ((u64::from(created.dwHighDateTime) << 32) | u64::from(created.dwLowDateTime))
+            == start_time
+}
+
+/// Longest working directory read from a target, in UTF-16 units.
+/// Windows caps a path at 32,767 units.
+#[cfg(windows)]
+const MAX_CURRENT_DIRECTORY_UNITS: usize = 32_768;
+
+#[cfg(windows)]
+fn read_remote<T: Copy + Default>(handle: HANDLE, address: usize) -> Option<T> {
+    use windows::Win32::System::Diagnostics::Debug::ReadProcessMemory;
+    let mut value = T::default();
+    let mut read = 0usize;
+    // SAFETY: the destination is a live local of exactly `size_of::<T>()`
+    // bytes, and `T` is a plain integer or pointer-sized value for which any
+    // bit pattern is valid. A bad remote address fails the call.
+    unsafe {
+        ReadProcessMemory(
+            handle,
+            address as *const _,
+            &mut value as *mut T as *mut _,
+            std::mem::size_of::<T>(),
+            Some(&mut read),
+        )
+    }
+    .ok()?;
+    (read == std::mem::size_of::<T>()).then_some(value)
+}
+
+#[cfg(windows)]
+fn read_remote_utf16(handle: HANDLE, address: usize, units: usize) -> Option<String> {
+    use windows::Win32::System::Diagnostics::Debug::ReadProcessMemory;
+    let mut buffer = vec![0u16; units];
+    let mut read = 0usize;
+    // SAFETY: the destination is a live buffer of exactly `units * 2` bytes. A
+    // bad remote address fails the call.
+    unsafe {
+        ReadProcessMemory(
+            handle,
+            address as *const _,
+            buffer.as_mut_ptr() as *mut _,
+            units * 2,
+            Some(&mut read),
+        )
+    }
+    .ok()?;
+    if read != units * 2 {
+        return None;
+    }
+    Some(String::from_utf16_lossy(&buffer))
+}
+
+/// Read the working directory from the target's `RTL_USER_PROCESS_PARAMETERS`.
+/// Returns None when the process exited, the memory is unreadable, or the path
+/// is empty or not absolute.
+/// A 32-bit target on 64-bit Windows keeps a separate 32-bit PEB, which is read
+/// with its own offsets.
+#[cfg(windows)]
+pub fn query_process_current_directory_from_handle(handle: HANDLE) -> Option<String> {
+    const PROCESS_BASIC_INFORMATION: u32 = 0;
+    const PROCESS_WOW64_INFORMATION: u32 = 26;
+
+    let mut wow64_peb = 0usize;
+    let mut returned = 0u32;
+    // SAFETY: the output is a live `usize` and the length passed is its size.
+    let status = unsafe {
+        NtQueryInformationProcess(
+            handle,
+            PROCESS_WOW64_INFORMATION,
+            &mut wow64_peb as *mut usize as *mut u8,
+            std::mem::size_of::<usize>() as u32,
+            &mut returned,
+        )
+    };
+    if status != 0 {
+        return None;
+    }
+
+    // (address of the string buffer, length in bytes) of CurrentDirectory.DosPath.
+    let (buffer, length) = if wow64_peb != 0 {
+        // PEB32.ProcessParameters at 0x10; CurrentDirectory at 0x24 in the
+        // 32-bit RTL_USER_PROCESS_PARAMETERS, as {u16 Length, u16 Max, u32 Buffer}.
+        let params: u32 = read_remote(handle, wow64_peb + 0x10)?;
+        let length: u16 = read_remote(handle, params as usize + 0x24)?;
+        let buffer: u32 = read_remote(handle, params as usize + 0x28)?;
+        (buffer as usize, length)
+    } else {
+        // PROCESS_BASIC_INFORMATION is six pointers; PebBaseAddress is the
+        // second. PEB.ProcessParameters at 0x20; CurrentDirectory at 0x38 in
+        // RTL_USER_PROCESS_PARAMETERS, as {u16 Length, u16 Max, pad, u64 Buffer}.
+        let mut basic = [0usize; 6];
+        // SAFETY: the output is a live array and the length passed is its size.
+        let status = unsafe {
+            NtQueryInformationProcess(
+                handle,
+                PROCESS_BASIC_INFORMATION,
+                basic.as_mut_ptr() as *mut u8,
+                std::mem::size_of_val(&basic) as u32,
+                &mut returned,
+            )
+        };
+        if status != 0 || basic[1] == 0 {
+            return None;
+        }
+        let params: usize = read_remote(handle, basic[1] + 0x20)?;
+        let length: u16 = read_remote(handle, params + 0x38)?;
+        let buffer: usize = read_remote(handle, params + 0x40)?;
+        (buffer, length)
+    };
+
+    let units = usize::from(length) / 2;
+    if units == 0 || units > MAX_CURRENT_DIRECTORY_UNITS || buffer == 0 {
+        return None;
+    }
+    let path = read_remote_utf16(handle, buffer, units)?;
+    let path = path.trim_end_matches('\0').to_string();
+    is_absolute_windows_path(&path).then_some(path)
+}
+
+/// A drive-letter or UNC path, which is all a process can have as its working
+/// directory.
+#[cfg(any(windows, test))]
+#[cfg_attr(not(windows), allow(dead_code))]
+fn is_absolute_windows_path(path: &str) -> bool {
+    let bytes = path.as_bytes();
+    path.starts_with("\\\\")
+        || (bytes.len() >= 3
+            && bytes[0].is_ascii_alphabetic()
+            && bytes[1] == b':'
+            && matches!(bytes[2], b'\\' | b'/'))
+}
+
+#[cfg(target_os = "linux")]
+pub fn query_process_command_line(pid: u32) -> Option<String> {
+    read_proc_cmdline(pid)
+}
+
+#[cfg(not(any(windows, target_os = "linux")))]
+pub fn query_process_command_line(_pid: u32) -> Option<String> {
+    None
+}
+
+/// Resolve a process's executable path by PID (best-effort) on macOS.
+///
+/// Used to enrich events that only carry a PID (for example a parent process
+/// referenced by an exec event, or a flow attributed via socket inspection).
+#[cfg(target_os = "macos")]
+pub fn process_image_path(pid: u32) -> Option<String> {
+    if pid == 0 {
+        return None;
+    }
+    libproc::proc_pid::pidpath(i32::try_from(pid).ok()?)
+        .ok()
+        .filter(|path| !path.is_empty())
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn unix_timeval_nanos(seconds: u64, microseconds: u64) -> Option<u64> {
+    if microseconds >= 1_000_000 {
+        return None;
+    }
+
+    seconds
+        .checked_mul(1_000_000_000)?
+        .checked_add(microseconds.checked_mul(1_000)?)
+}
+
+/// Query the Unix-epoch nanosecond process start time exposed by libproc.
+///
+/// Endpoint Security reports the same `timeval` value and the macOS sensor
+/// stores it as nanoseconds, so this representation can be compared directly
+/// with the identity captured from an exec event.
+#[cfg(target_os = "macos")]
+fn macos_process_start_time(pid: i32) -> Option<u64> {
+    use libproc::bsd_info::BSDInfo;
+
+    let info = libproc::proc_pid::pidinfo::<BSDInfo>(pid, 0).ok()?;
+    if info.pbi_pid != u32::try_from(pid).ok()? {
+        return None;
+    }
+
+    unix_timeval_nanos(info.pbi_start_tvsec, info.pbi_start_tvusec)
+}
+
+#[cfg(target_os = "linux")]
+fn read_proc_login_uid(pid: u32) -> Option<u32> {
+    fs::read_to_string(format!("/proc/{pid}/loginuid"))
+        .ok()?
+        .trim()
+        .parse()
+        .ok()
+}
+
+#[cfg(target_os = "linux")]
+pub fn query_process_details(pid: u32) -> Option<ProcessDetails> {
+    query_process_details_with(pid, ProcessReads::FULL)
+}
+
+/// Which `/proc` files a process query reads.
+#[cfg(target_os = "linux")]
+#[derive(Debug, Clone, Copy)]
+pub struct ProcessReads {
+    /// The process's own `exe` link, read before and after to detect an exec.
+    pub image: bool,
+    /// The parent's `exe` and `cmdline`.
+    pub parent: bool,
+}
+
+#[cfg(target_os = "linux")]
+impl ProcessReads {
+    pub const FULL: Self = Self {
+        image: true,
+        parent: true,
+    };
+}
+
+#[cfg(target_os = "linux")]
+pub fn query_process_details_with(pid: u32, reads: ProcessReads) -> Option<ProcessDetails> {
+    if pid == 0 {
+        return None;
+    }
+
+    // Read the lifetime before and after the links. A process can exit, be
+    // replaced through PID reuse, or exec again while /proc is being read.
+    // Returning a mixed snapshot would defeat downstream identity checks.
+    let proc_stat = read_proc_stat(pid)?;
+    let parent_process_id = proc_stat.parent_process_id;
+    let parent =
+        |read: fn(u32) -> Option<String>| parent_process_id.filter(|_| reads.parent).and_then(read);
+    let details = ProcessDetails {
+        image: reads.image.then(|| read_proc_link(pid, "exe")).flatten(),
+        command_line: read_proc_cmdline(pid),
+        parent_process_id,
+        parent_image: parent(|ppid| read_proc_link(ppid, "exe")),
+        parent_command_line: parent(read_proc_cmdline),
+        current_directory: read_proc_link(pid, "cwd"),
+        login_uid: read_proc_login_uid(pid),
+        start_time: proc_stat.start_time,
+    };
+
+    let current_stat = read_proc_stat(pid)?;
+    if current_stat.start_time != details.start_time
+        || (reads.image && read_proc_link(pid, "exe") != details.image)
+    {
+        return None;
+    }
+
+    if details == ProcessDetails::default() {
+        None
+    } else {
+        Some(details)
+    }
+}
+
+#[cfg(target_os = "linux")]
+pub fn query_process_identity(pid: u32) -> Option<ProcessIdentity> {
+    let details = query_process_details(pid)?;
+    Some(ProcessIdentity {
+        pid,
+        image: details.image?,
+        start_time: details.start_time,
+        command_line_hash: details.command_line.as_deref().map(hash_command_line),
+    })
+}
+
+#[cfg(target_os = "macos")]
+pub fn query_process_identity(pid: u32) -> Option<ProcessIdentity> {
+    if pid == 0 {
+        return None;
+    }
+
+    let native_pid = i32::try_from(pid).ok()?;
+    let start_time = macos_process_start_time(native_pid)?;
+    let image = process_image_path(pid)?;
+
+    // `pidpath` and `pidinfo` are separate syscalls. Re-read the process birth
+    // time after resolving the path so a PID recycled between them cannot
+    // produce an identity assembled from two different processes.
+    if macos_process_start_time(native_pid)? != start_time {
+        return None;
+    }
+
+    Some(ProcessIdentity {
+        pid,
+        image,
+        start_time: Some(start_time),
+        // libproc does not provide a command-line query. The start time and
+        // executable path still preserve the PID-reuse protection needed by
+        // memory scanning.
+        command_line_hash: None,
+    })
+}
+
+/// Convert a Linux `CLOCK_BOOTTIME` nanosecond timestamp to the clock-tick
+/// representation exposed by `/proc/<pid>/stat`.
+///
+/// `/proc` truncates process start times to tick precision. Do the conversion
+/// before retaining an eBPF birth timestamp so later identity validation
+/// compares values in the same clock domain and units.
+#[cfg(target_os = "linux")]
+pub(crate) fn linux_boot_time_ns_to_start_ticks(start_time_ns: u64) -> Option<u64> {
+    static CLOCK_TICKS_PER_SECOND: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    let hz = *CLOCK_TICKS_PER_SECOND.get_or_init(|| {
+        // SAFETY: sysconf takes an integer name and has no pointer arguments.
+        let value = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
+        (1..=1_000_000).contains(&value).then_some(value as u64)
+    });
+
+    boot_time_ns_to_start_ticks_at_hz(start_time_ns, hz?)
+}
+
+#[cfg(target_os = "linux")]
+fn boot_time_ns_to_start_ticks_at_hz(start_time_ns: u64, hz: u64) -> Option<u64> {
+    let ticks = u128::from(start_time_ns).checked_mul(u128::from(hz))? / 1_000_000_000_u128;
+    ticks.try_into().ok()
+}
+
+#[cfg(windows)]
+pub fn query_process_identity(pid: u32) -> Option<ProcessIdentity> {
+    if pid == 0 {
+        return None;
+    }
+
+    // SAFETY: OpenProcess takes a PID and access flags, with no pointer arguments.
+    let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) }.ok()?;
+    if handle.is_invalid() {
+        return None;
+    }
+
+    let identity = query_process_identity_from_handle(pid, handle);
+    // SAFETY: `handle` was opened above, is closed only here, and is not used
+    // afterwards.
+    let _ = unsafe { CloseHandle(handle) };
+    identity
+}
+
+/// Query identity using an already-open process handle without closing it.
+#[cfg(windows)]
+pub(crate) fn query_process_identity_from_handle(
+    pid: u32,
+    handle: HANDLE,
+) -> Option<ProcessIdentity> {
+    use windows::Win32::Foundation::FILETIME;
+    use windows::Win32::System::Threading::{
+        GetProcessTimes, QueryFullProcessImageNameW, PROCESS_NAME_FORMAT,
+    };
+
+    let mut buffer = vec![0u16; 32_768];
+    let mut len = buffer.len() as u32;
+    // SAFETY: `handle` is a live process handle supplied by the caller, `buffer`
+    // is writable for the `len` UTF-16 units passed, and `len` is a valid
+    // in/out pointer.
+    let image = unsafe {
+        QueryFullProcessImageNameW(
+            handle,
+            PROCESS_NAME_FORMAT(0),
+            windows::core::PWSTR(buffer.as_mut_ptr()),
+            &mut len,
+        )
+    }
+    .ok()
+    .and_then(|_| {
+        let value = String::from_utf16_lossy(&buffer[..len as usize]);
+        if value.is_empty() {
+            None
+        } else {
+            Some(value)
+        }
+    });
+
+    let mut creation = FILETIME::default();
+    let mut exit = FILETIME::default();
+    let mut kernel = FILETIME::default();
+    let mut user = FILETIME::default();
+    // SAFETY: `handle` is a live process handle supplied by the caller, and the
+    // four FILETIME out-pointers refer to live locals.
+    let start_time =
+        unsafe { GetProcessTimes(handle, &mut creation, &mut exit, &mut kernel, &mut user) }
+            .ok()
+            .map(|_| ((creation.dwHighDateTime as u64) << 32) | creation.dwLowDateTime as u64);
+
+    let command_line_hash = query_process_command_line_from_handle(handle)
+        .as_deref()
+        .map(hash_command_line);
+
+    Some(ProcessIdentity {
+        pid,
+        image: image?,
+        start_time,
+        command_line_hash,
+    })
+}
+
+#[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
+pub fn query_process_identity(_pid: u32) -> Option<ProcessIdentity> {
+    None
+}
+
+/// Query and validate the process currently using the expected PID.
+pub fn validate_process_identity(expected: &ProcessIdentity) -> Result<ProcessIdentity, String> {
+    let current = query_process_identity(expected.pid)
+        .ok_or_else(|| "process no longer exists or identity could not be queried".to_string())?;
+    expected.matches(&current)?;
+    Ok(current)
+}
+
+pub fn hash_command_line(command_line: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(command_line.as_bytes());
+    hex::encode(hasher.finalize())
+}
+
+fn same_process_image(expected: &str, current: &str) -> bool {
+    if normalize_path_for_comparison(expected) == normalize_path_for_comparison(current) {
+        return true;
+    }
+
+    let expected = std::fs::canonicalize(expected).ok();
+    let current = std::fs::canonicalize(current).ok();
+    match (expected, current) {
+        (Some(expected), Some(current)) => {
+            normalize_path_for_comparison(&expected.to_string_lossy())
+                == normalize_path_for_comparison(&current.to_string_lossy())
+        }
+        _ => false,
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn read_proc_cmdline(pid: u32) -> Option<String> {
+    let raw = fs::read(format!("/proc/{pid}/cmdline")).ok()?;
+    let parts: Vec<String> = raw
+        .split(|byte| *byte == 0)
+        .filter(|segment| !segment.is_empty())
+        .map(|segment| String::from_utf8_lossy(segment).into_owned())
+        .collect();
+
+    if parts.is_empty() {
+        None
+    } else {
+        Some(parts.join(" "))
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn read_proc_link(pid: u32, name: &str) -> Option<String> {
+    let path = fs::read_link(format!("/proc/{pid}/{name}")).ok()?;
+    let path = path.to_string_lossy();
+    Some(strip_deleted_suffix(&path).to_string())
+}
+
+/// Drop the ` (deleted)` marker the kernel appends to `/proc/<pid>` links when
+/// the target has been unlinked. Detections match on the path the process was
+/// started from, so keeping the marker would break `endswith` rules and hand
+/// the scanner a path it can never open.
+#[cfg(target_os = "linux")]
+fn strip_deleted_suffix(path: &str) -> &str {
+    path.strip_suffix(" (deleted)").unwrap_or(path)
+}
+
+#[cfg(target_os = "linux")]
+fn read_proc_stat(pid: u32) -> Option<ProcStat> {
+    let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let end = stat.rfind(')')?;
+    let rest = stat.get(end + 2..)?;
+    let fields: Vec<&str> = rest.split_whitespace().collect();
+    if fields.len() <= 19 {
+        return None;
+    }
+
+    Some(ProcStat {
+        parent_process_id: fields.get(1).and_then(|value| value.parse::<u32>().ok()),
+        start_time: fields.get(19).and_then(|value| value.parse::<u64>().ok()),
+    })
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn working_directory_must_be_an_absolute_windows_path() {
+        for path in [r"C:\Windows\System32\", r"d:/work", r"\\server\share\dir"] {
+            assert!(is_absolute_windows_path(path), "{path}");
+        }
+        for path in ["", "relative", r"C:", r"C:dir", r"\temp"] {
+            assert!(!is_absolute_windows_path(path), "{path}");
+        }
+    }
+
+    #[test]
+    fn query_current_process_details_returns_linux_proc_metadata() {
+        let pid = std::process::id();
+        let details = query_process_details(pid).expect("current process details should exist");
+
+        assert!(details.image.is_some());
+        assert!(details.command_line.is_some());
+        assert!(details.parent_process_id.is_some());
+        assert!(details.current_directory.is_some());
+        assert!(details.login_uid.is_some());
+        assert!(details.start_time.is_some());
+    }
+
+    #[test]
+    fn lean_query_skips_parent_and_optionally_image_reads() {
+        let pid = std::process::id();
+        let full = query_process_details(pid).unwrap();
+        let lean = query_process_details_with(
+            pid,
+            ProcessReads {
+                image: false,
+                parent: false,
+            },
+        )
+        .unwrap();
+        assert!(lean.image.is_none());
+        assert!(lean.parent_image.is_none() && lean.parent_command_line.is_none());
+        assert_eq!(lean.current_directory, full.current_directory);
+        assert_eq!(lean.command_line, full.command_line);
+        assert_eq!(lean.start_time, full.start_time);
+
+        let with_image = query_process_details_with(
+            pid,
+            ProcessReads {
+                image: true,
+                parent: false,
+            },
+        )
+        .unwrap();
+        assert_eq!(with_image.image, full.image);
+        assert!(with_image.parent_image.is_none());
+    }
+
+    #[test]
+    fn strip_deleted_suffix_only_trims_the_kernel_marker() {
+        assert_eq!(
+            strip_deleted_suffix("/tmp/malware (deleted)"),
+            "/tmp/malware"
+        );
+        assert_eq!(strip_deleted_suffix("/tmp/malware"), "/tmp/malware");
+        assert_eq!(strip_deleted_suffix("/tmp/(deleted)"), "/tmp/(deleted)");
+    }
+
+    #[test]
+    fn query_current_process_command_line_returns_non_empty_string() {
+        let pid = std::process::id();
+        let command_line =
+            query_process_command_line(pid).expect("current process command line should exist");
+        assert!(!command_line.is_empty());
+    }
+
+    #[test]
+    fn boot_nanoseconds_convert_to_proc_clock_ticks() {
+        assert_eq!(
+            boot_time_ns_to_start_ticks_at_hz(325_827_924_504_916, 100),
+            Some(32_582_792)
+        );
+    }
+
+    #[test]
+    fn boot_nanoseconds_use_proc_tick_precision() {
+        assert_eq!(boot_time_ns_to_start_ticks_at_hz(9_999_999, 100), Some(0));
+        assert_eq!(boot_time_ns_to_start_ticks_at_hz(10_000_000, 100), Some(1));
+        assert_eq!(boot_time_ns_to_start_ticks_at_hz(19_999_999, 100), Some(1));
+    }
+}
+
+#[cfg(test)]
+mod identity_tests {
+    use super::*;
+
+    fn identity() -> ProcessIdentity {
+        ProcessIdentity {
+            pid: 42,
+            image: "/usr/bin/example".to_string(),
+            start_time: Some(100),
+            command_line_hash: Some("hash".to_string()),
+        }
+    }
+
+    #[test]
+    fn matching_identity_is_accepted() {
+        assert!(identity().matches(&identity()).is_ok());
+    }
+
+    #[test]
+    fn image_mismatch_is_rejected() {
+        let mut current = identity();
+        current.image = "/usr/bin/other".to_string();
+
+        assert_eq!(
+            identity().matches(&current),
+            Err("image changed from '/usr/bin/example' to '/usr/bin/other'".to_string())
+        );
+    }
+
+    #[test]
+    fn start_time_mismatch_is_rejected_when_both_are_available() {
+        let mut current = identity();
+        current.start_time = Some(101);
+
+        assert_eq!(
+            identity().matches(&current),
+            Err("start time changed from 100 to 101".to_string())
+        );
+    }
+
+    #[test]
+    fn command_line_hash_mismatch_is_rejected_when_both_are_available() {
+        let mut current = identity();
+        current.command_line_hash = Some("other-hash".to_string());
+
+        assert_eq!(
+            identity().matches(&current),
+            Err("command line hash changed".to_string())
+        );
+    }
+
+    #[test]
+    fn unavailable_optional_metadata_does_not_reject_identity() {
+        let mut current = identity();
+        current.start_time = None;
+        current.command_line_hash = None;
+
+        assert!(identity().matches(&current).is_ok());
+    }
+
+    #[test]
+    fn missing_current_identity_is_rejected() {
+        let expected = ProcessIdentity {
+            pid: 0,
+            image: "/usr/bin/example".to_string(),
+            start_time: None,
+            command_line_hash: None,
+        };
+
+        assert_eq!(
+            validate_process_identity(&expected),
+            Err("process no longer exists or identity could not be queried".to_string())
+        );
+    }
+
+    #[test]
+    fn macos_timeval_matches_endpoint_security_nanoseconds() {
+        assert_eq!(
+            unix_timeval_nanos(1_725_897_600, 123_456),
+            Some(1_725_897_600_123_456_000)
+        );
+        assert_eq!(unix_timeval_nanos(0, 999_999), Some(999_999_000));
+    }
+
+    #[test]
+    fn invalid_or_overflowing_timeval_is_rejected() {
+        assert_eq!(unix_timeval_nanos(1, 1_000_000), None);
+        assert_eq!(unix_timeval_nanos(u64::MAX, 0), None);
+    }
+}
+
+#[cfg(all(test, windows))]
+mod windows_command_line_tests {
+    use super::*;
+
+    #[test]
+    fn fallback_requires_the_exact_lifetime_on_the_opened_handle() {
+        let pid = std::process::id();
+        let start = query_process_identity(pid).unwrap().start_time.unwrap();
+        assert!(query_process_command_line_at_start(pid, start).is_some());
+        assert!(query_process_command_line_at_start(pid, start + 1).is_none());
+        assert!(query_process_command_line_at_start(4, 1).is_none());
+    }
+
+    #[test]
+    fn logon_id_is_read_only_for_the_exact_lifetime() {
+        let pid = std::process::id();
+        let start = query_process_identity(pid).unwrap().start_time.unwrap();
+        let logon_id = query_live_process_at_start(pid, start).logon_id.unwrap();
+        assert!(logon_id.starts_with("0x"), "{logon_id}");
+        assert_eq!(query_live_process_at_start(pid, start + 1).logon_id, None);
+    }
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod macos_identity_tests {
+    use super::*;
+
+    #[test]
+    fn current_process_identity_is_queryable_and_validates() {
+        let pid = std::process::id();
+        let identity = query_process_identity(pid).expect("current process identity");
+
+        assert_eq!(identity.pid, pid);
+        assert!(!identity.image.is_empty());
+        assert!(identity.start_time.is_some());
+        assert_eq!(identity.command_line_hash, None);
+        assert_eq!(validate_process_identity(&identity), Ok(identity));
+    }
+
+    #[test]
+    fn exited_process_identity_is_rejected() {
+        let mut child = std::process::Command::new("/bin/sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn sleep");
+        let identity = query_process_identity(child.id()).expect("child process identity");
+
+        child.kill().expect("kill sleep");
+        child.wait().expect("reap sleep");
+
+        assert!(validate_process_identity(&identity).is_err());
+    }
+}
+
+#[cfg(test)]
+mod logon_id_tests {
+    #[test]
+    fn logon_id_is_formatted_like_sysmon() {
+        assert_eq!(super::format_logon_id(0x3e7, 0), "0x3e7");
+        assert_eq!(super::format_logon_id(0x1a2b3c, 0), "0x1a2b3c");
+        assert_eq!(super::format_logon_id(1, 2), "0x200000001");
+    }
+}

@@ -1,0 +1,1207 @@
+//! File event eBPF programs.
+//!
+//! We split create/delete handling across syscall entry and exit:
+//!
+//! - `syscalls/sys_enter_open`, `openat`, `openat2`, and `creat` queue create
+//!   candidates when `O_CREAT` is set or implied.
+//! - The matching exit tracepoint emits create events only when the syscall succeeds.
+//! - `syscalls/sys_enter_unlink`, `unlinkat`, and `rmdir` queue delete
+//!   candidates, then emit them only on successful exit.
+//! - `syscalls/sys_enter_rename`, `renameat`, and `renameat2` queue rename
+//!   candidates, then emit them only on successful exit.
+//! - `syscalls/sys_enter_mkdir` and `mkdirat` queue directory creates, then emit
+//!   them only on successful exit.
+//!
+//! This avoids false positives from failed syscalls or open-with-create calls
+//! that never complete successfully.
+//!
+//! The `*at` syscalls take their pathname as a directory descriptor plus a name
+//! that may be relative to it. The descriptor is captured alongside the name so
+//! userspace can rebuild the absolute path. Legacy path-only syscalls are
+//! represented with `AT_FDCWD`, since their relative names use the current
+//! working directory.
+//!
+//! Successful directory opens are reported too, under a kind the drain loop
+//! consumes rather than forwarding. They are what lets a descriptor be named at
+//! the moment it is created; reading it back from `/proc` when the event is
+//! drained answers for whatever the number points at then, and a process
+//! walking a tree recycles fd numbers faster than that. The filter is
+//! `O_DIRECTORY | O_PATH` rather than every read-only open: measured on a lab
+//! VM, indexing every read-only open costs 20-29% on a file-read-heavy
+//! workload against ~0% for this one.
+//! Indexed descriptors carry a kernel token. `close`, `dup2`, and `dup3`
+//! invalidate it, while exec, exit, and `close_range` invalidate the process
+//! epoch.
+//! A userspace path is eligible only when the file event captured the same
+//! token, so an untracked reopen cannot consume an older `(pid, fd)` entry.
+//!
+//! Example sys_enter_openat tracepoint format (x86_64, 64-bit ABI). These
+//! offsets are documentation only; the loader supplies this kernel's values:
+//!   offset  0: common_type         (u16)
+//!   offset  2: common_flags        (u8)
+//!   offset  3: common_preempt_count(u8)
+//!   offset  4: common_pid          (i32)
+//!   offset  8: __syscall_nr        (i32)
+//!   offset 12: _padding            (4 bytes)
+//!   offset 16: dfd                 (i64  — directory file descriptor)
+//!   offset 24: filename            (u64  — user pointer to path string)
+//!   offset 32: flags               (i64  — open flags)
+//!   offset 40: mode                (i64  — creation mode)
+//!
+//! sys_enter_unlinkat tracepoint format (same structure):
+//!   offset 16: dfd                 (i64)
+//!   offset 24: pathname            (u64  — user pointer to path string)
+//!   offset 32: flag                (i64)
+//!
+//! sys_enter_renameat tracepoint format (x86_64, 64-bit ABI):
+//!   offset 16: olddfd              (i64)
+//!   offset 24: oldname             (u64  — user pointer to old path string)
+//!   offset 32: newdfd              (i64)
+//!   offset 40: newname             (u64  — user pointer to new path string)
+//!
+//! sys_exit_* tracepoint format (x86_64, 64-bit ABI):
+//!   offset  0: common_type         (u16)
+//!   offset  2: common_flags        (u8)
+//!   offset  3: common_preempt_count(u8)
+//!   offset  4: common_pid          (i32)
+//!   offset  8: __syscall_nr        (i32)
+//!   offset 12: _padding            (4 bytes)
+//!   offset 16: ret                 (i64)
+
+use aya_ebpf::{
+    helpers::{
+        bpf_get_current_comm, bpf_get_current_pid_tgid, bpf_get_current_task, bpf_ktime_get_ns,
+        bpf_probe_read_kernel, bpf_probe_read_user, bpf_probe_read_user_str_bytes,
+    },
+    macros::{kprobe, kretprobe, map, tracepoint},
+    maps::{Array, HashMap, LruHashMap, PerCpuArray, RingBuf},
+    programs::{ProbeContext, RetProbeContext, TracePointContext},
+};
+
+use crate::events::{
+    event_metadata, FileEvent, FileIndexEvent, FILE_FLAG_AUX_PATH_TRUNCATED,
+    FILE_FLAG_PATH_TRUNCATED, FILE_PATH_LEN,
+};
+use crate::file_identity_abi::FileIdentityOffsets;
+use crate::process::current_process_start_time;
+use crate::telemetry::{record_map_full, record_ring_full, record_submitted, FILE_FAMILY};
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct FileTracepointOffsets {
+    pub openat_dfd: u32,
+    pub openat_path: u32,
+    pub openat_flags: u32,
+    pub openat_ret: u32,
+    pub open_path: u32,
+    pub open_flags: u32,
+    pub open_ret: u32,
+    pub creat_path: u32,
+    pub creat_ret: u32,
+    pub openat2_dfd: u32,
+    pub openat2_path: u32,
+    pub openat2_how: u32,
+    pub openat2_ret: u32,
+    pub unlinkat_dfd: u32,
+    pub unlinkat_path: u32,
+    pub unlinkat_ret: u32,
+    pub unlink_path: u32,
+    pub unlink_ret: u32,
+    pub renameat_old_dfd: u32,
+    pub renameat_old_path: u32,
+    pub renameat_new_dfd: u32,
+    pub renameat_new_path: u32,
+    pub renameat_ret: u32,
+    pub renameat2_old_dfd: u32,
+    pub renameat2_old_path: u32,
+    pub renameat2_new_dfd: u32,
+    pub renameat2_new_path: u32,
+    pub renameat2_ret: u32,
+    pub rename_old_path: u32,
+    pub rename_new_path: u32,
+    pub rename_ret: u32,
+    pub mkdir_path: u32,
+    pub mkdir_ret: u32,
+    pub mkdirat_dfd: u32,
+    pub mkdirat_path: u32,
+    pub mkdirat_ret: u32,
+    pub rmdir_path: u32,
+    pub rmdir_ret: u32,
+    pub close_fd: u32,
+    pub dup2_old_fd: u32,
+    pub dup2_new_fd: u32,
+    pub dup3_old_fd: u32,
+    pub dup3_new_fd: u32,
+}
+
+#[no_mangle]
+pub static FILE_TRACEPOINT_OFFSETS: FileTracepointOffsets = unsafe { core::mem::zeroed() };
+
+#[inline(always)]
+unsafe fn tracepoint_offset(value: *const u32) -> usize {
+    core::ptr::read_volatile(value) as usize
+}
+
+/// O_CREAT flag — create file if it does not exist.
+const O_CREAT: u64 = 0x40;
+const O_WRONLY: u64 = 0x1;
+const O_RDWR: u64 = 0x2;
+const O_TRUNC: u64 = 0x200;
+const O_APPEND: u64 = 0x400;
+/// The caller requires the target to be a directory. `opendir(3)` sets it, so
+/// it covers how libc, Go, Rust, and Python obtain the descriptors that later
+/// appear as a `dfd`.
+const O_DIRECTORY: u64 = 0x1_0000;
+/// The caller wants a handle to the location, not the contents. `O_PATH`
+/// descriptors are legal `*at` directory descriptors.
+const O_PATH: u64 = 0x20_0000;
+/// Relative paths used by legacy path-only syscalls resolve against the CWD.
+const AT_FDCWD: i32 = -100;
+
+const FILE_KIND_CREATE: u32 = 1;
+const FILE_KIND_DELETE: u32 = 2;
+const FILE_KIND_RENAME: u32 = 3;
+const FILE_KIND_CHANGE: u32 = 4;
+/// Not a file event: a directory descriptor being opened, reported so userspace
+/// can name the `dfd` of later `*at` calls. Never reaches the engine.
+const FILE_KIND_DIR_OPEN: u32 = 5;
+/// Not a file event: discard every cached directory owned by this process.
+const FILE_KIND_INDEX_RESET: u32 = 6;
+
+/// Ring buffer shared with the userspace loader for file events.
+///
+/// Sized to hold roughly a thousand `FileEvent`s, the same burst headroom the
+/// 96-byte-path layout had at 256 KiB.
+#[map]
+pub static FILE_RING: RingBuf = RingBuf::with_byte_size(1024 * 1024, 0);
+
+/// Per-thread pending file operation, keyed by TID.
+///
+/// A thread is inside exactly one syscall at a time, so all tracked file syscall
+/// variants share one slot per thread instead of one map per operation. At a
+/// `FileEvent` of ~1 KiB, each additional map would cost roughly 17 MiB of
+/// kernel memory.
+#[map]
+static FILE_PENDING: HashMap<u32, FileEvent> = HashMap::with_max_entries(16_384, 0);
+
+/// Per-CPU staging area for the event under construction.
+///
+/// A `FileEvent` is far larger than the 512-byte BPF stack, so it is built in
+/// map memory and copied straight from there into the pending map or the ring
+/// buffer.
+///
+/// The slot is held for the handful of instructions between filling it and
+/// `insert`ing it, so a tracepoint that nests on the same CPU in that window
+/// can overwrite it — the same exposure `DNS_SCRATCH` carries. The cost is a
+/// garbled path on a rare event, not a memory error, and the alternative
+/// (per-thread scratch) would cost another map the size of `FILE_PENDING`.
+#[map]
+static FILE_SCRATCH: PerCpuArray<FileEvent> = PerCpuArray::with_max_entries(1, 0);
+
+/// Offsets validated against the running kernel's BTF before any identity
+/// enrichment hook is attached.
+#[map]
+pub static FILE_IDENTITY_OFFSETS: Array<FileIdentityOffsets> = Array::with_max_entries(1, 0);
+
+/// The mkdir dentry has no inode at function entry. Hold it until the matching
+/// return probe, then read the inode before the syscall exit emits the event.
+#[map]
+static PENDING_MKDIR_DENTRY: HashMap<u32, u64> = HashMap::with_max_entries(16_384, 0);
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct TrackedDirFd {
+    token: u64,
+    epoch: u64,
+}
+
+/// Kernel-side validity state for directory descriptors reported to userspace.
+///
+/// The userspace index may contain an old `(pid, fd)` entry, but a file event
+/// carries this map's token and may use the entry only when the tokens match.
+/// A close or descriptor replacement invalidates the token before a later
+/// syscall can capture it. The map is twice the userspace index capacity so
+/// every entry userspace can retain also remains represented here.
+#[map]
+static DIR_FD_TOKENS: LruHashMap<u64, TrackedDirFd> = LruHashMap::with_max_entries(16_384, 0);
+
+/// Process epoch used to invalidate every descriptor after exec, exit, or
+/// `close_range` without walking [`DIR_FD_TOKENS`] in a BPF program.
+#[map]
+static DIR_FD_EPOCHS: LruHashMap<u32, u64> = LruHashMap::with_max_entries(16_384, 0);
+
+/// Queue a potential file-create event for `openat(O_CREAT)`.
+#[tracepoint]
+pub fn handle_openat(ctx: TracePointContext) -> u32 {
+    unsafe { try_handle_openat(&ctx) }.unwrap_or(1)
+}
+
+/// Queue a potential file event for legacy `open`.
+#[tracepoint]
+pub fn handle_open(ctx: TracePointContext) -> u32 {
+    unsafe { try_handle_open(&ctx) }.unwrap_or(1)
+}
+
+/// Queue a potential file-create event for legacy `creat`.
+#[tracepoint]
+pub fn handle_creat(ctx: TracePointContext) -> u32 {
+    unsafe { try_handle_creat(&ctx) }.unwrap_or(1)
+}
+
+/// Queue a potential file event for `openat2`.
+#[tracepoint]
+pub fn handle_openat2(ctx: TracePointContext) -> u32 {
+    unsafe { try_handle_openat2(&ctx) }.unwrap_or(1)
+}
+
+#[kprobe]
+pub fn handle_vfs_unlink_identity1(ctx: ProbeContext) -> u32 {
+    unsafe { try_capture_dentry_identity(ctx.arg::<u64>(1).unwrap_or(0), FILE_KIND_DELETE) }
+        .unwrap_or(1)
+}
+
+#[kprobe]
+pub fn handle_vfs_unlink_identity2(ctx: ProbeContext) -> u32 {
+    unsafe { try_capture_dentry_identity(ctx.arg::<u64>(2).unwrap_or(0), FILE_KIND_DELETE) }
+        .unwrap_or(1)
+}
+
+#[kprobe]
+pub fn handle_vfs_rmdir_identity1(ctx: ProbeContext) -> u32 {
+    unsafe { try_capture_dentry_identity(ctx.arg::<u64>(1).unwrap_or(0), FILE_KIND_DELETE) }
+        .unwrap_or(1)
+}
+
+#[kprobe]
+pub fn handle_vfs_rmdir_identity2(ctx: ProbeContext) -> u32 {
+    unsafe { try_capture_dentry_identity(ctx.arg::<u64>(2).unwrap_or(0), FILE_KIND_DELETE) }
+        .unwrap_or(1)
+}
+
+#[kprobe]
+pub fn handle_vfs_rename_identity(ctx: ProbeContext) -> u32 {
+    unsafe { try_capture_rename_identity(ctx.arg::<u64>(0).unwrap_or(0)) }.unwrap_or(1)
+}
+
+#[kprobe]
+pub fn handle_vfs_mkdir_identity1(ctx: ProbeContext) -> u32 {
+    unsafe { try_remember_mkdir_dentry(ctx.arg::<u64>(1).unwrap_or(0)) }.unwrap_or(1)
+}
+
+#[kprobe]
+pub fn handle_vfs_mkdir_identity2(ctx: ProbeContext) -> u32 {
+    unsafe { try_remember_mkdir_dentry(ctx.arg::<u64>(2).unwrap_or(0)) }.unwrap_or(1)
+}
+
+#[kretprobe]
+pub fn handle_vfs_mkdir_identity_exit(ctx: RetProbeContext) -> u32 {
+    unsafe { try_capture_mkdir_identity(&ctx) }.unwrap_or(1)
+}
+
+/// Emit a file-create event only after `openat` succeeds.
+#[tracepoint]
+pub fn handle_openat_exit(ctx: TracePointContext) -> u32 {
+    unsafe {
+        try_handle_open_exit(
+            &ctx,
+            tracepoint_offset(core::ptr::addr_of!(FILE_TRACEPOINT_OFFSETS.openat_ret)),
+        )
+    }
+    .unwrap_or(1)
+}
+
+/// Emit a legacy `open` file event only after the syscall succeeds.
+#[tracepoint]
+pub fn handle_open_exit(ctx: TracePointContext) -> u32 {
+    unsafe {
+        try_handle_open_exit(
+            &ctx,
+            tracepoint_offset(core::ptr::addr_of!(FILE_TRACEPOINT_OFFSETS.open_ret)),
+        )
+    }
+    .unwrap_or(1)
+}
+
+/// Emit a legacy `creat` event only after the syscall succeeds.
+#[tracepoint]
+pub fn handle_creat_exit(ctx: TracePointContext) -> u32 {
+    unsafe {
+        try_handle_open_exit(
+            &ctx,
+            tracepoint_offset(core::ptr::addr_of!(FILE_TRACEPOINT_OFFSETS.creat_ret)),
+        )
+    }
+    .unwrap_or(1)
+}
+
+/// Emit an `openat2` file event only after the syscall succeeds.
+#[tracepoint]
+pub fn handle_openat2_exit(ctx: TracePointContext) -> u32 {
+    unsafe {
+        try_handle_open_exit(
+            &ctx,
+            tracepoint_offset(core::ptr::addr_of!(FILE_TRACEPOINT_OFFSETS.openat2_ret)),
+        )
+    }
+    .unwrap_or(1)
+}
+
+/// Queue a potential file-delete event for `unlinkat`.
+#[tracepoint]
+pub fn handle_unlinkat(ctx: TracePointContext) -> u32 {
+    unsafe { try_handle_unlinkat(&ctx) }.unwrap_or(1)
+}
+
+/// Emit a file-delete event only after `unlinkat` succeeds.
+#[tracepoint]
+pub fn handle_unlinkat_exit(ctx: TracePointContext) -> u32 {
+    unsafe {
+        try_handle_file_operation_exit(
+            &ctx,
+            FILE_KIND_DELETE,
+            tracepoint_offset(core::ptr::addr_of!(FILE_TRACEPOINT_OFFSETS.unlinkat_ret)),
+        )
+    }
+    .unwrap_or(1)
+}
+
+/// Queue a potential file-delete event for legacy `unlink`.
+#[tracepoint]
+pub fn handle_unlink(ctx: TracePointContext) -> u32 {
+    unsafe {
+        try_handle_legacy_file_event(
+            &ctx,
+            FILE_KIND_DELETE,
+            tracepoint_offset(core::ptr::addr_of!(FILE_TRACEPOINT_OFFSETS.unlink_path)),
+        )
+    }
+    .unwrap_or(1)
+}
+
+/// Emit a file-delete event only after legacy `unlink` succeeds.
+#[tracepoint]
+pub fn handle_unlink_exit(ctx: TracePointContext) -> u32 {
+    unsafe {
+        try_handle_file_operation_exit(
+            &ctx,
+            FILE_KIND_DELETE,
+            tracepoint_offset(core::ptr::addr_of!(FILE_TRACEPOINT_OFFSETS.unlink_ret)),
+        )
+    }
+    .unwrap_or(1)
+}
+
+/// Queue a potential file-rename event for `renameat`.
+#[tracepoint]
+pub fn handle_renameat(ctx: TracePointContext) -> u32 {
+    unsafe { try_handle_renameat(&ctx) }.unwrap_or(1)
+}
+
+/// Emit a file-rename event only after `renameat` succeeds.
+#[tracepoint]
+pub fn handle_renameat_exit(ctx: TracePointContext) -> u32 {
+    unsafe {
+        try_handle_file_operation_exit(
+            &ctx,
+            FILE_KIND_RENAME,
+            tracepoint_offset(core::ptr::addr_of!(FILE_TRACEPOINT_OFFSETS.renameat_ret)),
+        )
+    }
+    .unwrap_or(1)
+}
+
+/// Queue a potential file-rename event for `renameat2`.
+#[tracepoint]
+pub fn handle_renameat2(ctx: TracePointContext) -> u32 {
+    unsafe { try_handle_renameat2(&ctx) }.unwrap_or(1)
+}
+
+/// Emit a file-rename event only after `renameat2` succeeds.
+#[tracepoint]
+pub fn handle_renameat2_exit(ctx: TracePointContext) -> u32 {
+    unsafe {
+        try_handle_file_operation_exit(
+            &ctx,
+            FILE_KIND_RENAME,
+            tracepoint_offset(core::ptr::addr_of!(FILE_TRACEPOINT_OFFSETS.renameat2_ret)),
+        )
+    }
+    .unwrap_or(1)
+}
+
+/// Queue a potential file-rename event for legacy `rename`.
+#[tracepoint]
+pub fn handle_rename(ctx: TracePointContext) -> u32 {
+    unsafe { try_handle_rename(&ctx) }.unwrap_or(1)
+}
+
+/// Emit a file-rename event only after legacy `rename` succeeds.
+#[tracepoint]
+pub fn handle_rename_exit(ctx: TracePointContext) -> u32 {
+    unsafe {
+        try_handle_file_operation_exit(
+            &ctx,
+            FILE_KIND_RENAME,
+            tracepoint_offset(core::ptr::addr_of!(FILE_TRACEPOINT_OFFSETS.rename_ret)),
+        )
+    }
+    .unwrap_or(1)
+}
+
+/// Queue a potential directory-create event for legacy `mkdir`.
+#[tracepoint]
+pub fn handle_mkdir(ctx: TracePointContext) -> u32 {
+    unsafe {
+        try_handle_legacy_file_event(
+            &ctx,
+            FILE_KIND_CREATE,
+            tracepoint_offset(core::ptr::addr_of!(FILE_TRACEPOINT_OFFSETS.mkdir_path)),
+        )
+    }
+    .unwrap_or(1)
+}
+
+/// Emit a directory-create event only after legacy `mkdir` succeeds.
+#[tracepoint]
+pub fn handle_mkdir_exit(ctx: TracePointContext) -> u32 {
+    unsafe {
+        try_handle_file_operation_exit(
+            &ctx,
+            FILE_KIND_CREATE,
+            tracepoint_offset(core::ptr::addr_of!(FILE_TRACEPOINT_OFFSETS.mkdir_ret)),
+        )
+    }
+    .unwrap_or(1)
+}
+
+/// Queue a potential directory-create event for `mkdirat`.
+#[tracepoint]
+pub fn handle_mkdirat(ctx: TracePointContext) -> u32 {
+    unsafe { try_handle_mkdirat(&ctx) }.unwrap_or(1)
+}
+
+/// Emit a directory-create event only after `mkdirat` succeeds.
+#[tracepoint]
+pub fn handle_mkdirat_exit(ctx: TracePointContext) -> u32 {
+    unsafe {
+        try_handle_file_operation_exit(
+            &ctx,
+            FILE_KIND_CREATE,
+            tracepoint_offset(core::ptr::addr_of!(FILE_TRACEPOINT_OFFSETS.mkdirat_ret)),
+        )
+    }
+    .unwrap_or(1)
+}
+
+/// Queue a potential directory-delete event for `rmdir`.
+#[tracepoint]
+pub fn handle_rmdir(ctx: TracePointContext) -> u32 {
+    unsafe {
+        try_handle_legacy_file_event(
+            &ctx,
+            FILE_KIND_DELETE,
+            tracepoint_offset(core::ptr::addr_of!(FILE_TRACEPOINT_OFFSETS.rmdir_path)),
+        )
+    }
+    .unwrap_or(1)
+}
+
+/// Emit a directory-delete event only after `rmdir` succeeds.
+#[tracepoint]
+pub fn handle_rmdir_exit(ctx: TracePointContext) -> u32 {
+    unsafe {
+        try_handle_file_operation_exit(
+            &ctx,
+            FILE_KIND_DELETE,
+            tracepoint_offset(core::ptr::addr_of!(FILE_TRACEPOINT_OFFSETS.rmdir_ret)),
+        )
+    }
+    .unwrap_or(1)
+}
+
+/// Invalidate an indexed descriptor before it can be closed and reused.
+#[tracepoint]
+pub fn handle_file_close(ctx: TracePointContext) -> u32 {
+    unsafe { try_invalidate_close(&ctx) }.unwrap_or(1)
+}
+
+/// Invalidate the destination descriptor that `dup2` may replace.
+#[tracepoint]
+pub fn handle_file_dup2(ctx: TracePointContext) -> u32 {
+    unsafe { try_invalidate_dup_target(&ctx) }.unwrap_or(1)
+}
+
+/// Invalidate the destination descriptor that `dup3` may replace.
+#[tracepoint]
+pub fn handle_file_dup3(ctx: TracePointContext) -> u32 {
+    unsafe { try_invalidate_dup3_target(&ctx) }.unwrap_or(1)
+}
+
+/// Reset a process index before `close_range` can recycle many descriptors.
+#[tracepoint]
+pub fn handle_file_close_range(ctx: TracePointContext) -> u32 {
+    unsafe { try_reset_dir_index(&ctx) }.unwrap_or(1)
+}
+
+/// Reset descriptor state after a successful exec.
+#[tracepoint]
+pub fn handle_file_exec(ctx: TracePointContext) -> u32 {
+    unsafe { try_reset_dir_index(&ctx) }.unwrap_or(1)
+}
+
+/// Reset descriptor state when any thread exits.
+///
+/// Clearing on every thread exit is conservative for a shared descriptor
+/// table, but it guarantees a final reset even when the group leader exits
+/// before another thread. Remaining threads fall back to `/proc` until their
+/// next tracked directory open.
+#[tracepoint]
+pub fn handle_file_exit(ctx: TracePointContext) -> u32 {
+    unsafe { try_reset_dir_index(&ctx) }.unwrap_or(1)
+}
+
+#[inline(always)]
+fn dir_fd_key(pid: u32, fd: i32) -> u64 {
+    ((pid as u64) << 32) | (fd as u32 as u64)
+}
+
+#[inline(always)]
+unsafe fn current_dir_epoch(pid: u32) -> u64 {
+    match DIR_FD_EPOCHS.get(&pid) {
+        Some(epoch) => *epoch,
+        None => 0,
+    }
+}
+
+#[inline(always)]
+unsafe fn current_dir_token(pid: u32, fd: i32) -> u64 {
+    if fd < 0 {
+        return 0;
+    }
+    let key = dir_fd_key(pid, fd);
+    let Some(state) = DIR_FD_TOKENS.get(&key) else {
+        return 0;
+    };
+    if state.epoch == current_dir_epoch(pid) {
+        state.token
+    } else {
+        0
+    }
+}
+
+/// Invalidate every per-descriptor index entry `fd` owns before the number can
+/// be recycled.
+///
+#[inline(always)]
+unsafe fn invalidate_fd(pid: u32, fd: i32) {
+    invalidate_dir_token(pid, fd);
+    crate::dns::forget_socket(pid, fd);
+}
+
+#[inline(always)]
+unsafe fn try_invalidate_close(ctx: &TracePointContext) -> Result<u32, i64> {
+    let fd = ctx.read_at::<i64>(tracepoint_offset(core::ptr::addr_of!(
+        FILE_TRACEPOINT_OFFSETS.close_fd
+    )))? as i32;
+    let pid = (bpf_get_current_pid_tgid() >> 32) as u32;
+    invalidate_fd(pid, fd);
+    Ok(0)
+}
+
+#[inline(always)]
+unsafe fn invalidate_dir_token(pid: u32, fd: i32) {
+    if fd < 0 {
+        return;
+    }
+    let key = dir_fd_key(pid, fd);
+    if let Some(state) = DIR_FD_TOKENS.get_ptr_mut(&key) {
+        // Keep the LRU slot and invalidate its value. Removing a tracked key
+        // performs substantially more LRU maintenance on directory walks.
+        // A later tracked open overwrites the slot; an untracked reuse captures
+        // token zero and therefore cannot consume the old userspace path.
+        (*state).token = 0;
+    }
+}
+
+#[inline(always)]
+unsafe fn try_invalidate_dup_target(ctx: &TracePointContext) -> Result<u32, i64> {
+    let old_fd = ctx.read_at::<i64>(tracepoint_offset(core::ptr::addr_of!(
+        FILE_TRACEPOINT_OFFSETS.dup2_old_fd
+    )))? as i32;
+    let new_fd = ctx.read_at::<i64>(tracepoint_offset(core::ptr::addr_of!(
+        FILE_TRACEPOINT_OFFSETS.dup2_new_fd
+    )))? as i32;
+    if old_fd == new_fd {
+        return Ok(0);
+    }
+    let pid = (bpf_get_current_pid_tgid() >> 32) as u32;
+    // `dup2`/`dup3` close whatever `new_fd` held without a `close` syscall.
+    invalidate_fd(pid, new_fd);
+    Ok(0)
+}
+
+#[inline(always)]
+unsafe fn try_invalidate_dup3_target(ctx: &TracePointContext) -> Result<u32, i64> {
+    let old_fd = ctx.read_at::<i64>(tracepoint_offset(core::ptr::addr_of!(
+        FILE_TRACEPOINT_OFFSETS.dup3_old_fd
+    )))? as i32;
+    let new_fd = ctx.read_at::<i64>(tracepoint_offset(core::ptr::addr_of!(
+        FILE_TRACEPOINT_OFFSETS.dup3_new_fd
+    )))? as i32;
+    if old_fd == new_fd {
+        return Ok(0);
+    }
+    let pid = (bpf_get_current_pid_tgid() >> 32) as u32;
+    invalidate_fd(pid, new_fd);
+    Ok(0)
+}
+
+#[inline(always)]
+unsafe fn try_reset_dir_index(_ctx: &TracePointContext) -> Result<u32, i64> {
+    let pid = (bpf_get_current_pid_tgid() >> 32) as u32;
+    if pid == 0 {
+        return Ok(0);
+    }
+
+    // A time-derived epoch invalidates all older fd tokens without a map walk.
+    // Setting the low bit keeps zero reserved for "not indexed".
+    let epoch = bpf_ktime_get_ns() | 1;
+    let _ = DIR_FD_EPOCHS.insert(&pid, &epoch, 0);
+
+    let Some(mut entry) = FILE_RING.reserve::<FileIndexEvent>(0) else {
+        record_ring_full(FILE_FAMILY);
+        return Ok(0);
+    };
+    let event = entry.as_mut_ptr();
+    (*event).kind = FILE_KIND_INDEX_RESET;
+    (*event).pid = pid;
+    (*event).fd = -1;
+    (*event)._pad = 0;
+    entry.submit(0);
+    record_submitted(FILE_FAMILY);
+    Ok(0)
+}
+
+#[inline(always)]
+unsafe fn read_kernel<T: Copy>(pointer: u64, offset: u32) -> Option<T> {
+    if pointer == 0 {
+        return None;
+    }
+    bpf_probe_read_kernel((pointer + (offset & 0xffff) as u64) as *const T).ok()
+}
+
+#[inline(always)]
+unsafe fn set_pending_identity(inode: u64, expected_kind: u32) -> Result<u32, i64> {
+    if inode == 0 {
+        return Ok(0);
+    }
+    let Some(offsets) = FILE_IDENTITY_OFFSETS.get(0) else {
+        return Ok(0);
+    };
+    if offsets.enabled == 0 {
+        return Ok(0);
+    }
+    let Some(number) = read_kernel::<u64>(inode, offsets.inode_ino) else {
+        return Ok(0);
+    };
+    let Some(super_block) = read_kernel::<u64>(inode, offsets.inode_sb) else {
+        return Ok(0);
+    };
+    let Some(device) = read_kernel::<u32>(super_block, offsets.super_block_dev) else {
+        return Ok(0);
+    };
+    if number == 0 {
+        return Ok(0);
+    }
+    let tid = bpf_get_current_pid_tgid() as u32;
+    let Some(pending) = FILE_PENDING.get_ptr_mut(&tid) else {
+        return Ok(0);
+    };
+    if (*pending).kind != expected_kind {
+        return Ok(0);
+    }
+    (*pending).inode = number;
+    (*pending).device = device;
+    Ok(0)
+}
+
+#[inline(always)]
+unsafe fn try_capture_dentry_identity(dentry: u64, expected_kind: u32) -> Result<u32, i64> {
+    let Some(offsets) = FILE_IDENTITY_OFFSETS.get(0) else {
+        return Ok(0);
+    };
+    if offsets.enabled == 0 {
+        return Ok(0);
+    }
+    let Some(inode) = read_kernel::<u64>(dentry, offsets.dentry_inode) else {
+        return Ok(0);
+    };
+    set_pending_identity(inode, expected_kind)
+}
+
+#[inline(always)]
+unsafe fn try_capture_rename_identity(rename_data: u64) -> Result<u32, i64> {
+    let Some(offsets) = FILE_IDENTITY_OFFSETS.get(0) else {
+        return Ok(0);
+    };
+    if offsets.enabled == 0 {
+        return Ok(0);
+    }
+    let Some(dentry) = read_kernel::<u64>(rename_data, offsets.renamedata_old_dentry) else {
+        return Ok(0);
+    };
+    try_capture_dentry_identity(dentry, FILE_KIND_RENAME)
+}
+
+#[inline(always)]
+unsafe fn try_remember_mkdir_dentry(dentry: u64) -> Result<u32, i64> {
+    if dentry == 0 {
+        return Ok(0);
+    }
+    let tid = bpf_get_current_pid_tgid() as u32;
+    let Some(pending) = FILE_PENDING.get(&tid) else {
+        return Ok(0);
+    };
+    if pending.kind == FILE_KIND_CREATE {
+        let _ = PENDING_MKDIR_DENTRY.insert(&tid, &dentry, 0);
+    }
+    Ok(0)
+}
+
+#[inline(always)]
+unsafe fn try_capture_mkdir_identity(_ctx: &RetProbeContext) -> Result<u32, i64> {
+    let tid = bpf_get_current_pid_tgid() as u32;
+    let Some(dentry) = PENDING_MKDIR_DENTRY.get(&tid).copied() else {
+        return Ok(0);
+    };
+    let result = try_capture_dentry_identity(dentry, FILE_KIND_CREATE);
+    let _ = PENDING_MKDIR_DENTRY.remove(&tid);
+    result
+}
+
+#[inline(always)]
+unsafe fn try_capture_open_identity(fd: i32, kind: u32) -> Result<u32, i64> {
+    if fd < 0 || fd >= 1_048_576 {
+        return Ok(0);
+    }
+    let Some(offsets) = FILE_IDENTITY_OFFSETS.get(0) else {
+        return Ok(0);
+    };
+    if offsets.enabled == 0 {
+        return Ok(0);
+    }
+    let task = bpf_get_current_task();
+    let Some(files) = read_kernel::<u64>(task, offsets.task_files) else {
+        return Ok(0);
+    };
+    let Some(fdtable) = read_kernel::<u64>(files, offsets.files_fdt) else {
+        return Ok(0);
+    };
+    let Some(max_fds) = read_kernel::<u32>(fdtable, offsets.fdtable_max_fds) else {
+        return Ok(0);
+    };
+    if fd as u32 >= max_fds {
+        return Ok(0);
+    }
+    let Some(entries) = read_kernel::<u64>(fdtable, offsets.fdtable_fd) else {
+        return Ok(0);
+    };
+    let slot = entries + ((fd as u64 & 0x000f_ffff) * 8);
+    let Some(file) = bpf_probe_read_kernel(slot as *const u64).ok() else {
+        return Ok(0);
+    };
+    let Some(inode) = read_kernel::<u64>(file, offsets.file_inode) else {
+        return Ok(0);
+    };
+    set_pending_identity(inode, kind)
+}
+
+#[inline(always)]
+unsafe fn try_handle_openat(ctx: &TracePointContext) -> Result<u32, i64> {
+    let flags: u64 = ctx.read_at::<u64>(tracepoint_offset(core::ptr::addr_of!(
+        FILE_TRACEPOINT_OFFSETS.openat_flags
+    )))?;
+    let dfd = ctx.read_at::<i64>(tracepoint_offset(core::ptr::addr_of!(
+        FILE_TRACEPOINT_OFFSETS.openat_dfd
+    )))? as i32;
+    let path_ptr = ctx.read_at::<u64>(tracepoint_offset(core::ptr::addr_of!(
+        FILE_TRACEPOINT_OFFSETS.openat_path
+    )))?;
+    try_queue_open(flags, dfd, path_ptr)
+}
+
+#[inline(always)]
+unsafe fn try_handle_open(ctx: &TracePointContext) -> Result<u32, i64> {
+    let path_ptr = ctx.read_at::<u64>(tracepoint_offset(core::ptr::addr_of!(
+        FILE_TRACEPOINT_OFFSETS.open_path
+    )))?;
+    let flags = ctx.read_at::<u64>(tracepoint_offset(core::ptr::addr_of!(
+        FILE_TRACEPOINT_OFFSETS.open_flags
+    )))?;
+    try_queue_open(flags, AT_FDCWD, path_ptr)
+}
+
+#[inline(always)]
+unsafe fn try_handle_creat(ctx: &TracePointContext) -> Result<u32, i64> {
+    let path_ptr = ctx.read_at::<u64>(tracepoint_offset(core::ptr::addr_of!(
+        FILE_TRACEPOINT_OFFSETS.creat_path
+    )))?;
+    queue_file_event_from_args(AT_FDCWD, path_ptr, FILE_KIND_CREATE)
+}
+
+#[inline(always)]
+unsafe fn try_handle_openat2(ctx: &TracePointContext) -> Result<u32, i64> {
+    let dfd = ctx.read_at::<i64>(tracepoint_offset(core::ptr::addr_of!(
+        FILE_TRACEPOINT_OFFSETS.openat2_dfd
+    )))? as i32;
+    let path_ptr = ctx.read_at::<u64>(tracepoint_offset(core::ptr::addr_of!(
+        FILE_TRACEPOINT_OFFSETS.openat2_path
+    )))?;
+    let how_ptr = ctx.read_at::<u64>(tracepoint_offset(core::ptr::addr_of!(
+        FILE_TRACEPOINT_OFFSETS.openat2_how
+    )))?;
+    if how_ptr == 0 {
+        return Ok(0);
+    }
+    // `flags` is the first u64 in `struct open_how`.
+    let flags = bpf_probe_read_user::<u64>(how_ptr as *const u64)?;
+    try_queue_open(flags, dfd, path_ptr)
+}
+
+#[inline(always)]
+unsafe fn try_queue_open(flags: u64, dfd: i32, path_ptr: u64) -> Result<u32, i64> {
+    let tid = bpf_get_current_pid_tgid() as u32;
+    if flags & O_CREAT != 0 {
+        return queue_file_event_from_args(dfd, path_ptr, FILE_KIND_CREATE);
+    }
+
+    if flags & (O_WRONLY | O_RDWR | O_TRUNC | O_APPEND) != 0 {
+        return queue_file_event_from_args(dfd, path_ptr, FILE_KIND_CHANGE);
+    }
+
+    // A directory open is not a file event, but it is the only moment at which
+    // the descriptor a later `openat(dfd, "name")` refers to can be named
+    // reliably. Reading it back from `/proc/<pid>/fd/<dfd>` when the event is
+    // drained answers for whatever the number points at *then*, and a process
+    // that walks a tree recycles fd numbers faster than that.
+    if flags & (O_DIRECTORY | O_PATH) != 0 {
+        return queue_file_event_from_args(dfd, path_ptr, FILE_KIND_DIR_OPEN);
+    }
+
+    // A read-only open queues nothing, and the thread cannot be inside another
+    // tracked syscall while it enters this one, so anything still pending is a
+    // leftover from a task that was killed mid-syscall and never reached its
+    // exit tracepoint. Drop it here so this open variant cannot leave a stale
+    // path.
+    let _ = FILE_PENDING.remove(&tid);
+    Ok(0)
+}
+
+#[inline(always)]
+unsafe fn try_handle_open_exit(ctx: &TracePointContext, ret_offset: usize) -> Result<u32, i64> {
+    let ret: i64 = ctx.read_at::<i64>(ret_offset)?;
+    let tid = bpf_get_current_pid_tgid() as u32;
+    // Emit for any successful open-with-create. This matches Sysmon Event ID 11
+    // semantics, which fire on any open-with-create, not only brand-new inodes.
+    if ret >= 0 {
+        let fd = ret as i32;
+        // Check the existing pending map first so ordinary read-only opens do
+        // not pay for the task -> fdtable -> file -> inode pointer walk.
+        let pending_kind = FILE_PENDING.get(&tid).map(|pending| pending.kind);
+        if matches!(
+            pending_kind,
+            Some(FILE_KIND_CREATE) | Some(FILE_KIND_CHANGE)
+        ) {
+            let _ = try_capture_open_identity(fd, pending_kind.unwrap_or(0));
+        }
+        let pid = (bpf_get_current_pid_tgid() >> 32) as u32;
+        if matches!(pending_kind, Some(FILE_KIND_DIR_OPEN)) {
+            if let Some(pending) = FILE_PENDING.get_ptr_mut(&tid) {
+                let token = bpf_ktime_get_ns() | 1;
+                let state = TrackedDirFd {
+                    token,
+                    epoch: current_dir_epoch(pid),
+                };
+                let _ = DIR_FD_TOKENS.insert(&dir_fd_key(pid, fd), &state, 0);
+                (*pending).dfd = fd;
+                (*pending).dfd_token = token;
+            }
+        }
+    }
+    emit_pending_file_event(
+        FILE_KIND_CREATE,
+        FILE_KIND_CHANGE,
+        FILE_KIND_DIR_OPEN,
+        ret >= 0,
+    )
+}
+
+#[inline(always)]
+unsafe fn try_handle_unlinkat(ctx: &TracePointContext) -> Result<u32, i64> {
+    queue_file_event(
+        ctx,
+        FILE_KIND_DELETE,
+        tracepoint_offset(core::ptr::addr_of!(FILE_TRACEPOINT_OFFSETS.unlinkat_dfd)),
+        tracepoint_offset(core::ptr::addr_of!(FILE_TRACEPOINT_OFFSETS.unlinkat_path)),
+    )
+}
+
+#[inline(always)]
+unsafe fn try_handle_legacy_file_event(
+    ctx: &TracePointContext,
+    kind: u32,
+    path_offset: usize,
+) -> Result<u32, i64> {
+    let path_ptr = ctx.read_at::<u64>(path_offset)?;
+    queue_file_event_from_args(AT_FDCWD, path_ptr, kind)
+}
+
+#[inline(always)]
+unsafe fn try_handle_file_operation_exit(
+    ctx: &TracePointContext,
+    kind: u32,
+    ret_offset: usize,
+) -> Result<u32, i64> {
+    let ret: i64 = ctx.read_at::<i64>(ret_offset)?;
+    emit_pending_file_event(kind, kind, kind, ret == 0)
+}
+
+#[inline(always)]
+unsafe fn try_handle_renameat(ctx: &TracePointContext) -> Result<u32, i64> {
+    queue_rename_event(ctx)
+}
+
+#[inline(always)]
+unsafe fn try_handle_rename(ctx: &TracePointContext) -> Result<u32, i64> {
+    let old_path_ptr = ctx.read_at::<u64>(tracepoint_offset(core::ptr::addr_of!(
+        FILE_TRACEPOINT_OFFSETS.rename_old_path
+    )))?;
+    let new_path_ptr = ctx.read_at::<u64>(tracepoint_offset(core::ptr::addr_of!(
+        FILE_TRACEPOINT_OFFSETS.rename_new_path
+    )))?;
+    queue_rename_event_from_args(AT_FDCWD, old_path_ptr, AT_FDCWD, new_path_ptr)
+}
+
+#[inline(always)]
+unsafe fn try_handle_mkdirat(ctx: &TracePointContext) -> Result<u32, i64> {
+    queue_file_event(
+        ctx,
+        FILE_KIND_CREATE,
+        tracepoint_offset(core::ptr::addr_of!(FILE_TRACEPOINT_OFFSETS.mkdirat_dfd)),
+        tracepoint_offset(core::ptr::addr_of!(FILE_TRACEPOINT_OFFSETS.mkdirat_path)),
+    )
+}
+
+/// Copy a NUL-terminated user path into `dst`.
+///
+/// `Some(truncated)` on success. `None` means the string was unreadable or
+/// empty — the per-CPU scratch buffer still holds the previous event's bytes in
+/// that case, so the caller must abandon the event rather than emit whatever is
+/// left there.
+#[inline(always)]
+unsafe fn read_user_path(ptr: u64, dst: &mut [u8; FILE_PATH_LEN]) -> Option<bool> {
+    let Ok(read) = bpf_probe_read_user_str_bytes(ptr as *const u8, dst) else {
+        return None;
+    };
+    if read.is_empty() {
+        return None;
+    }
+    // The helper returns the byte count including the NUL, capped at the
+    // destination size, so filling the buffer means the path was cut short. A
+    // path that is exactly `FILE_PATH_LEN - 1` bytes long is flagged as well;
+    // over-reporting truncation is the safe direction, since the flag only ever
+    // tells a consumer not to trust the path as complete.
+    Some(read.len() >= FILE_PATH_LEN - 1)
+}
+
+#[inline(always)]
+unsafe fn queue_file_event(
+    ctx: &TracePointContext,
+    kind: u32,
+    dfd_offset: usize,
+    path_offset: usize,
+) -> Result<u32, i64> {
+    let dfd = ctx.read_at::<i64>(dfd_offset)? as i32;
+    let path_ptr: u64 = ctx.read_at::<u64>(path_offset)?;
+    queue_file_event_from_args(dfd, path_ptr, kind)
+}
+
+#[inline(always)]
+unsafe fn queue_file_event_from_args(dfd: i32, path_ptr: u64, kind: u32) -> Result<u32, i64> {
+    if path_ptr == 0 {
+        return Ok(0);
+    }
+
+    let Some(event) = FILE_SCRATCH.get_ptr_mut(0) else {
+        return Ok(0);
+    };
+
+    let Some(truncated) = read_user_path(path_ptr, &mut (*event).path) else {
+        return Ok(0);
+    };
+
+    let pid_tgid = bpf_get_current_pid_tgid();
+    (*event).kind = kind;
+    (*event).pid = (pid_tgid >> 32) as u32;
+    (*event).uid = crate::task_identity::effective_uid().unwrap_or(u32::MAX);
+    (*event).flags = if truncated {
+        FILE_FLAG_PATH_TRUNCATED
+    } else {
+        0
+    };
+    (*event).dfd = dfd;
+    // `path` may itself be relative to `dfd`, and for a directory open the exit
+    // overwrites `dfd` with the descriptor the open produced, so the base is
+    // kept here as well. For the other kinds `aux_path` is empty and nothing
+    // reads it.
+    (*event).aux_dfd = dfd;
+    let dfd_token = current_dir_token((*event).pid, dfd);
+    (*event).dfd_token = dfd_token;
+    (*event).aux_dfd_token = dfd_token;
+    (*event).inode = 0;
+    (*event).device = 0;
+    (*event)._identity_pad = 0;
+    (*event).aux_path[0] = 0;
+    (*event).comm = bpf_get_current_comm().unwrap_or([0u8; 16]);
+    (*event).process_start_time = current_process_start_time((*event).pid);
+
+    let tid = pid_tgid as u32;
+    if FILE_PENDING.insert(&tid, &*event, 0).is_err() {
+        record_map_full(FILE_FAMILY);
+    }
+    Ok(0)
+}
+
+#[inline(always)]
+unsafe fn queue_rename_event(ctx: &TracePointContext) -> Result<u32, i64> {
+    let old_dfd = ctx.read_at::<i64>(tracepoint_offset(core::ptr::addr_of!(
+        FILE_TRACEPOINT_OFFSETS.renameat_old_dfd
+    )))? as i32;
+    let old_path_ptr: u64 = ctx.read_at::<u64>(tracepoint_offset(core::ptr::addr_of!(
+        FILE_TRACEPOINT_OFFSETS.renameat_old_path
+    )))?;
+    let new_dfd = ctx.read_at::<i64>(tracepoint_offset(core::ptr::addr_of!(
+        FILE_TRACEPOINT_OFFSETS.renameat_new_dfd
+    )))? as i32;
+    let new_path_ptr: u64 = ctx.read_at::<u64>(tracepoint_offset(core::ptr::addr_of!(
+        FILE_TRACEPOINT_OFFSETS.renameat_new_path
+    )))?;
+    queue_rename_event_from_args(old_dfd, old_path_ptr, new_dfd, new_path_ptr)
+}
+
+#[inline(always)]
+unsafe fn try_handle_renameat2(ctx: &TracePointContext) -> Result<u32, i64> {
+    let old_dfd = ctx.read_at::<i64>(tracepoint_offset(core::ptr::addr_of!(
+        FILE_TRACEPOINT_OFFSETS.renameat2_old_dfd
+    )))? as i32;
+    let old_path_ptr: u64 = ctx.read_at::<u64>(tracepoint_offset(core::ptr::addr_of!(
+        FILE_TRACEPOINT_OFFSETS.renameat2_old_path
+    )))?;
+    let new_dfd = ctx.read_at::<i64>(tracepoint_offset(core::ptr::addr_of!(
+        FILE_TRACEPOINT_OFFSETS.renameat2_new_dfd
+    )))? as i32;
+    let new_path_ptr: u64 = ctx.read_at::<u64>(tracepoint_offset(core::ptr::addr_of!(
+        FILE_TRACEPOINT_OFFSETS.renameat2_new_path
+    )))?;
+    queue_rename_event_from_args(old_dfd, old_path_ptr, new_dfd, new_path_ptr)
+}
+
+#[inline(always)]
+unsafe fn queue_rename_event_from_args(
+    old_dfd: i32,
+    old_path_ptr: u64,
+    new_dfd: i32,
+    new_path_ptr: u64,
+) -> Result<u32, i64> {
+    if old_path_ptr == 0 || new_path_ptr == 0 {
+        return Ok(0);
+    }
+
+    let Some(event) = FILE_SCRATCH.get_ptr_mut(0) else {
+        return Ok(0);
+    };
+
+    // Source and destination are resolved against different descriptors —
+    // `renameat(olddfd, "a", newdfd, "b")` is legal and common — so each name
+    // keeps its own.
+    let Some(target_truncated) = read_user_path(new_path_ptr, &mut (*event).path) else {
+        return Ok(0);
+    };
+    let Some(source_truncated) = read_user_path(old_path_ptr, &mut (*event).aux_path) else {
+        return Ok(0);
+    };
+
+    let mut flags = 0u32;
+    if target_truncated {
+        flags |= FILE_FLAG_PATH_TRUNCATED;
+    }
+    if source_truncated {
+        flags |= FILE_FLAG_AUX_PATH_TRUNCATED;
+    }
+
+    let pid_tgid = bpf_get_current_pid_tgid();
+    (*event).kind = FILE_KIND_RENAME;
+    (*event).pid = (pid_tgid >> 32) as u32;
+    (*event).uid = crate::task_identity::effective_uid().unwrap_or(u32::MAX);
+    (*event).flags = flags;
+    (*event).dfd = new_dfd;
+    (*event).aux_dfd = old_dfd;
+    (*event).dfd_token = current_dir_token((*event).pid, new_dfd);
+    (*event).aux_dfd_token = current_dir_token((*event).pid, old_dfd);
+    (*event).inode = 0;
+    (*event).device = 0;
+    (*event)._identity_pad = 0;
+    (*event).comm = bpf_get_current_comm().unwrap_or([0u8; 16]);
+    (*event).process_start_time = current_process_start_time((*event).pid);
+
+    let tid = pid_tgid as u32;
+    if FILE_PENDING.insert(&tid, &*event, 0).is_err() {
+        record_map_full(FILE_FAMILY);
+    }
+    Ok(0)
+}
+
+/// Emit the entry queued by this thread's syscall entry, if it is still the
+/// entry this exit is responsible for.
+///
+/// `kind_a`..`kind_c` are the kinds this exit tracepoint queues; a syscall that
+/// only queues one passes it three times. A pending entry of any other kind
+/// belongs to a syscall whose own exit never ran — a task killed mid-syscall —
+/// and is dropped rather than emitted under this syscall's identity.
+#[inline(always)]
+unsafe fn emit_pending_file_event(
+    kind_a: u32,
+    kind_b: u32,
+    kind_c: u32,
+    should_emit: bool,
+) -> Result<u32, i64> {
+    let tid = bpf_get_current_pid_tgid() as u32;
+    let Some(pending) = FILE_PENDING.get_ptr_mut(&tid) else {
+        return Ok(0);
+    };
+
+    let kind = (*pending).kind;
+    if should_emit && (kind == kind_a || kind == kind_b || kind == kind_c) {
+        if matches!(
+            kind,
+            FILE_KIND_CREATE | FILE_KIND_DELETE | FILE_KIND_RENAME | FILE_KIND_CHANGE
+        ) {
+            ((*pending).event_time_ns, (*pending).source_seq) = event_metadata();
+        }
+        // `output` hands the kernel the map value pointer and a constant length,
+        // so the whole emit is one helper call the verifier checks by argument
+        // type. `reserve` + `write` would instead round-trip a ~1 KiB value
+        // through the 512-byte BPF stack, and reserve + `copy_nonoverlapping`
+        // lowers to a byte-at-a-time loop between two pointer types whose
+        // bounds the verifier has to re-derive on every iteration.
+        if FILE_RING.output::<FileEvent>(&*pending, 0).is_err() {
+            record_ring_full(FILE_FAMILY);
+        } else {
+            record_submitted(FILE_FAMILY);
+        }
+    }
+
+    let _ = FILE_PENDING.remove(&tid);
+    let _ = PENDING_MKDIR_DENTRY.remove(&tid);
+    Ok(0)
+}

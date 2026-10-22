@@ -1,0 +1,681 @@
+use super::*;
+use std::io::{Cursor, Write};
+
+use zip::{write::SimpleFileOptions, ZipWriter};
+
+#[test]
+fn catalog_requires_valid_release_signature() {
+    let catalog = include_bytes!("../../tests/fixtures/rules-index.json");
+    let signature = include_bytes!("../../tests/fixtures/rules-index.json.minisig");
+    let wrong_key = include_bytes!("../../tests/fixtures/update-checksums-wrong-key.minisig");
+
+    assert!(parse_verified_catalog(catalog, signature).is_ok());
+    assert!(parse_verified_catalog(catalog, b"").is_err());
+    assert!(parse_verified_catalog(catalog, wrong_key).is_err());
+    let mut modified = catalog.to_vec();
+    modified.push(b' ');
+    assert!(parse_verified_catalog(&modified, signature).is_err());
+}
+
+#[test]
+fn install_pack_replaces_current_and_writes_state() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let archive = pack_zip(current_os(), "demo-pack");
+    let catalog = catalog_for("demo-pack", current_os(), &archive);
+
+    let outcome = install_pack_archive_bytes(&catalog, "demo-pack", temp.path(), &archive).unwrap();
+
+    assert_eq!(outcome.pack_id, "demo-pack");
+    assert!(temp.path().join("current").join("pack.yml").is_file());
+    assert!(temp
+        .path()
+        .join("current")
+        .join("sigma")
+        .join("demo.yml")
+        .is_file());
+    let state = read_state(temp.path()).expect("state");
+    assert_eq!(state.pack_id, "demo-pack");
+}
+
+#[test]
+fn install_rejects_wrong_os() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let wrong_os = if current_os() == "linux" {
+        "windows"
+    } else {
+        "linux"
+    };
+    let archive = pack_zip(wrong_os, "wrong-pack");
+    let catalog = catalog_for("wrong-pack", wrong_os, &archive);
+
+    let err = install_pack_archive_bytes(&catalog, "wrong-pack", temp.path(), &archive)
+        .expect_err("wrong os should fail");
+
+    assert!(err.to_string().contains("targets"));
+}
+
+#[test]
+fn install_accepts_released_schema_v1_manifest() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let archive = pack_zip_with_schema(current_os(), "schema-one-pack", 1);
+    let catalog = catalog_for("schema-one-pack", current_os(), &archive);
+
+    let outcome = install_pack_archive_bytes(&catalog, "schema-one-pack", temp.path(), &archive)
+        .expect("schema v1 should install");
+
+    assert_eq!(outcome.pack_id, "schema-one-pack");
+}
+
+#[test]
+fn unsafe_zip_entry_is_rejected_before_current_is_replaced() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    fs::create_dir_all(temp.path().join("current").join("sigma")).unwrap();
+    fs::write(
+        temp.path().join("current").join("pack.yml"),
+        b"previous: true\n",
+    )
+    .unwrap();
+    let archive = unsafe_pack_zip();
+    let catalog = catalog_for("demo-pack", current_os(), &archive);
+
+    let err = install_pack_archive_bytes(&catalog, "demo-pack", temp.path(), &archive)
+        .expect_err("unsafe zip should fail");
+
+    assert!(err.to_string().contains("unsafe zip entry"));
+    assert_eq!(
+        fs::read(temp.path().join("current").join("pack.yml")).unwrap(),
+        b"previous: true\n"
+    );
+}
+
+fn single_entry_zip(name: &str, options: SimpleFileOptions, content: &[u8]) -> Vec<u8> {
+    let mut cursor = Cursor::new(Vec::new());
+    {
+        let mut zip = ZipWriter::new(&mut cursor);
+        zip.start_file(name, options).unwrap();
+        zip.write_all(content).unwrap();
+        zip.finish().unwrap();
+    }
+    cursor.into_inner()
+}
+
+fn assert_install_rejects(archive: &[u8], expected: &str) {
+    let temp = tempfile::tempdir().expect("tempdir");
+    fs::create_dir_all(temp.path().join("current").join("sigma")).unwrap();
+    fs::write(
+        temp.path().join("current").join("pack.yml"),
+        b"previous: true\n",
+    )
+    .unwrap();
+    let catalog = catalog_for("demo-pack", current_os(), archive);
+
+    let err = install_pack_archive_bytes(&catalog, "demo-pack", temp.path(), archive)
+        .expect_err("archive should be rejected");
+
+    assert!(
+        format!("{err:#}").contains(expected),
+        "unexpected error: {err:#}"
+    );
+    assert_eq!(
+        fs::read(temp.path().join("current").join("pack.yml")).unwrap(),
+        b"previous: true\n"
+    );
+}
+
+#[test]
+fn symlink_zip_entry_is_rejected_and_previous_pack_stays() {
+    let mut cursor = Cursor::new(Vec::new());
+    {
+        let mut zip = ZipWriter::new(&mut cursor);
+        zip.add_symlink("link", "/etc/passwd", SimpleFileOptions::default())
+            .unwrap();
+        zip.finish().unwrap();
+    }
+    let archive = cursor.into_inner();
+    assert_install_rejects(&archive, "is a symlink");
+}
+
+#[test]
+fn absolute_zip_entry_is_rejected_and_previous_pack_stays() {
+    let archive = single_entry_zip("/pack.yml", SimpleFileOptions::default(), b"x");
+    assert_install_rejects(&archive, "unsafe zip entry");
+}
+
+#[test]
+fn backslash_zip_entry_is_rejected_and_previous_pack_stays() {
+    let archive = single_entry_zip("sigma\\..\\pack.yml", SimpleFileOptions::default(), b"x");
+    assert_install_rejects(&archive, "unsafe zip entry");
+}
+
+#[test]
+fn empty_zip_entry_name_is_rejected() {
+    assert!(safe_zip_path("").is_err());
+    assert!(safe_zip_path("./").is_err());
+    assert!(safe_zip_path("a/../b").is_err());
+    assert_eq!(safe_zip_path("a/b.yml").unwrap(), PathBuf::from("a/b.yml"));
+}
+
+#[test]
+fn symlink_mode_detection_matches_only_symlinks() {
+    assert!(is_symlink_entry(Some(0o120777)));
+    assert!(!is_symlink_entry(Some(0o100644)));
+    assert!(!is_symlink_entry(Some(0o040755)));
+    assert!(!is_symlink_entry(None));
+}
+
+#[test]
+fn size_caps_keep_their_documented_values() {
+    assert_eq!(MAX_CATALOG_BYTES, 2 * 1024 * 1024);
+    assert_eq!(MAX_ARTIFACT_BYTES, 50 * 1024 * 1024);
+    assert_eq!(MAX_EXTRACTED_BYTES, 250 * 1024 * 1024);
+}
+
+#[test]
+fn oversized_artifact_is_rejected_before_verification() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let archive = vec![0u8; MAX_ARTIFACT_BYTES as usize + 1];
+    let catalog = catalog_for("demo-pack", current_os(), &archive);
+
+    let err = install_pack_archive_bytes(&catalog, "demo-pack", temp.path(), &archive)
+        .expect_err("oversized artifact should fail");
+
+    assert!(err.to_string().contains("maximum download size"));
+}
+
+fn write_zip(dir: &Path, bytes: &[u8]) -> PathBuf {
+    let path = dir.join("pack.zip");
+    fs::write(&path, bytes).unwrap();
+    path
+}
+
+#[test]
+fn extraction_cap_allows_exact_limit_and_rejects_one_byte_over() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let archive = single_entry_zip("a.txt", SimpleFileOptions::default(), &[7u8; 100]);
+    let zip_path = write_zip(temp.path(), &archive);
+
+    extract_zip_with_limit(&zip_path, &temp.path().join("ok"), 100).expect("at the limit");
+    let err = extract_zip_with_limit(&zip_path, &temp.path().join("over"), 99)
+        .expect_err("over the limit");
+    assert!(err.to_string().contains("maximum extracted size"));
+}
+
+#[test]
+fn extraction_cap_sums_across_entries() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let mut cursor = Cursor::new(Vec::new());
+    {
+        let mut zip = ZipWriter::new(&mut cursor);
+        for name in ["a", "b"] {
+            zip.start_file(name, SimpleFileOptions::default()).unwrap();
+            zip.write_all(&[1u8; 60]).unwrap();
+        }
+        zip.finish().unwrap();
+    }
+    let zip_path = write_zip(temp.path(), cursor.get_ref());
+
+    assert!(extract_zip_with_limit(&zip_path, &temp.path().join("o"), 119).is_err());
+    extract_zip_with_limit(&zip_path, &temp.path().join("p"), 120).expect("sum fits");
+}
+
+#[test]
+fn extraction_cap_counts_bytes_copied_when_header_understates_size() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let options = SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
+    let mut archive = single_entry_zip("big.bin", options, &vec![0u8; 1 << 20]);
+    // Central directory header: signature PK\x01\x02, uncompressed size at offset 24.
+    let central = archive
+        .windows(4)
+        .position(|w| w == b"PK\x01\x02")
+        .expect("central directory");
+    archive[central + 24..central + 28].copy_from_slice(&10u32.to_le_bytes());
+    let zip_path = write_zip(temp.path(), &archive);
+    let out = temp.path().join("out");
+
+    let result = extract_zip_with_limit(&zip_path, &out, 1000);
+
+    assert!(result.is_err(), "understated header bypassed the cap");
+    let written = fs::metadata(out.join("big.bin"))
+        .map(|m| m.len())
+        .unwrap_or(0);
+    assert!(written <= 1001, "wrote {written} bytes past the cap");
+}
+
+#[test]
+fn catalog_filters_compatible_packs() {
+    let archive = pack_zip(current_os(), "demo-pack");
+    let mut catalog = catalog_for("demo-pack", current_os(), &archive);
+    catalog.packs.push(CatalogPack {
+        os: if current_os() == "linux" {
+            "windows".to_string()
+        } else {
+            "linux".to_string()
+        },
+        id: "other-pack".to_string(),
+        name: "Other Pack".to_string(),
+        level: "essential".to_string(),
+        version: "0.1.0".to_string(),
+        default: false,
+        requires_rustinel: ">=1.0.0".to_string(),
+        status: "test".to_string(),
+        rule_count: 1,
+        ioc_count: 0,
+        artifact: "other.zip".to_string(),
+        sha256: sha256_hex(&archive),
+        engine: None,
+    });
+
+    let packs = catalog.compatible_packs();
+
+    assert_eq!(packs.len(), 1);
+    assert_eq!(packs[0].id, "demo-pack");
+}
+
+#[test]
+fn catalog_accepts_pack_relative_engine_paths() {
+    let archive = pack_zip(current_os(), "demo-pack");
+    let catalog = catalog_for("demo-pack", current_os(), &archive);
+
+    catalog.validate().expect("catalog should validate");
+}
+
+#[test]
+fn prerelease_version_satisfies_release_floor_requirement() {
+    let req = VersionReq::parse(">=1.0.0").unwrap();
+    let current = Version::parse("1.2.0-rc.1").unwrap();
+
+    assert!(rustinel_version_matches_requirement(&req, &current));
+}
+
+#[test]
+fn prerelease_version_rejects_future_release_requirement() {
+    let req = VersionReq::parse(">1.2.0").unwrap();
+    let current = Version::parse("1.2.0-rc.1").unwrap();
+
+    assert!(!rustinel_version_matches_requirement(&req, &current));
+}
+
+fn catalog_for(id: &str, os: &str, archive: &[u8]) -> Catalog {
+    Catalog {
+        schema: INDEX_SCHEMA.to_string(),
+        release_version: "0.1.0".to_string(),
+        packs: vec![CatalogPack {
+            id: id.to_string(),
+            name: "Demo Pack".to_string(),
+            os: os.to_string(),
+            level: "essential".to_string(),
+            version: "0.1.0".to_string(),
+            default: true,
+            requires_rustinel: ">=1.0.0".to_string(),
+            status: "test".to_string(),
+            rule_count: 1,
+            ioc_count: 4,
+            artifact: "demo.zip".to_string(),
+            sha256: sha256_hex(archive),
+            engine: Some(CatalogEngine {
+                sigma_rules_path: format!("{id}/sigma"),
+                yara_rules_path: format!("{id}/yara"),
+                hashes_path: format!("{id}/ioc/hashes.txt"),
+                ips_path: format!("{id}/ioc/ips.txt"),
+                domains_path: format!("{id}/ioc/domains.txt"),
+                paths_regex_path: format!("{id}/ioc/paths_regex.txt"),
+            }),
+        }],
+    }
+}
+
+fn pack_zip(os: &str, id: &str) -> Vec<u8> {
+    pack_zip_with_schema(os, id, 2)
+}
+
+fn pack_zip_with_schema(os: &str, id: &str, schema_version: u32) -> Vec<u8> {
+    let mut cursor = Cursor::new(Vec::new());
+    {
+        let mut zip = ZipWriter::new(&mut cursor);
+        let options = SimpleFileOptions::default();
+        zip.start_file("pack.yml", options).unwrap();
+        zip.write_all(manifest(os, id, schema_version).as_bytes())
+            .unwrap();
+        zip.start_file("sigma/demo.yml", options).unwrap();
+        zip.write_all(b"title: Demo\n").unwrap();
+        zip.start_file("yara/demo.yar", options).unwrap();
+        zip.write_all(b"rule demo { condition: true }\n").unwrap();
+        for file in ["hashes.txt", "ips.txt", "domains.txt", "paths_regex.txt"] {
+            zip.start_file(format!("ioc/{file}"), options).unwrap();
+            zip.write_all(b"\n").unwrap();
+        }
+        zip.finish().unwrap();
+    }
+    cursor.into_inner()
+}
+
+fn unsafe_pack_zip() -> Vec<u8> {
+    let mut cursor = Cursor::new(Vec::new());
+    {
+        let mut zip = ZipWriter::new(&mut cursor);
+        let options = SimpleFileOptions::default();
+        zip.start_file("../pack.yml", options).unwrap();
+        zip.write_all(b"bad: true\n").unwrap();
+        zip.finish().unwrap();
+    }
+    cursor.into_inner()
+}
+
+fn manifest(os: &str, id: &str, schema_version: u32) -> String {
+    format!(
+        r#"name: Demo Pack
+id: {id}
+description: Demo rules
+os: {os}
+level: essential
+pack_schema_version: {schema_version}
+requires_rustinel: ">=1.0.0"
+default: true
+status: test
+extends: []
+"#
+    )
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    hex::encode(Sha256::digest(bytes))
+}
+
+#[test]
+fn update_current_or_older_catalog_skips_download_and_restart() {
+    let temp = tempfile::tempdir().unwrap();
+    let archive = pack_zip(current_os(), "demo-pack");
+    let mut catalog = catalog_for("demo-pack", current_os(), &archive);
+    install_pack_archive_bytes(&catalog, "demo-pack", temp.path(), &archive).unwrap();
+    let state = load_update_state(temp.path()).unwrap();
+    let before = fs::read(temp.path().join("state.json")).unwrap();
+    for version in ["0.1.0", "0.0.9", "0.1.0+build.2"] {
+        catalog.packs[0].version = version.into();
+        let result = update_active_pack(&catalog, &state, &test_catalog_url(), temp.path(), |_| {
+            panic!("no-op must not download")
+        })
+        .unwrap();
+        assert_eq!(result, None);
+        let message = update_message(&state, result.as_ref());
+        assert!(message.contains("up to date"));
+        assert!(message.contains("No restart required"));
+        assert_eq!(fs::read(temp.path().join("state.json")).unwrap(), before);
+    }
+}
+
+#[test]
+fn update_installs_active_pack_and_requires_restart() {
+    let temp = tempfile::tempdir().unwrap();
+    let archive = pack_zip(current_os(), "demo-pack");
+    let mut catalog = catalog_for("demo-pack", current_os(), &archive);
+    install_pack_archive_bytes(&catalog, "demo-pack", temp.path(), &archive).unwrap();
+    let state = load_update_state(temp.path()).unwrap();
+    fs::write(temp.path().join("current/obsolete.yml"), b"old").unwrap();
+    catalog.packs[0].version = "v0.2.0".into();
+    let outcome = update_active_pack(&catalog, &state, &test_catalog_url(), temp.path(), |pack| {
+        assert_eq!(pack.id, state.pack_id);
+        Ok(archive.clone())
+    })
+    .unwrap()
+    .unwrap();
+    assert_eq!(read_state(temp.path()).unwrap().version, "v0.2.0");
+    assert!(!temp.path().join("current/obsolete.yml").exists());
+    assert!(temp.path().join("current/sigma/demo.yml").is_file());
+    let message = update_message(&state, Some(&outcome));
+    assert!(message.contains("rustinel service restart"));
+    assert!(message.contains("even when hot reload is enabled"));
+}
+
+#[test]
+fn install_and_update_leave_local_rule_directories_untouched() {
+    let temp = tempfile::tempdir().unwrap();
+    let archive = pack_zip(current_os(), "demo-pack");
+    let mut catalog = catalog_for("demo-pack", current_os(), &archive);
+    install_pack_archive_bytes(&catalog, "demo-pack", temp.path(), &archive).unwrap();
+    let local_rule = temp.path().join("local/sigma/mine.yml");
+    fs::create_dir_all(local_rule.parent().unwrap()).unwrap();
+    fs::write(&local_rule, b"title: Mine\n").unwrap();
+
+    let state = load_update_state(temp.path()).unwrap();
+    catalog.packs[0].version = "v0.2.0".into();
+    update_active_pack(&catalog, &state, &test_catalog_url(), temp.path(), |_| {
+        Ok(archive.clone())
+    })
+    .unwrap()
+    .unwrap();
+    install_pack_archive_bytes(&catalog, "demo-pack", temp.path(), &archive).unwrap();
+
+    assert_eq!(fs::read(&local_rule).unwrap(), b"title: Mine\n");
+}
+
+#[test]
+fn update_rejects_incompatible_missing_or_invalid_versions_before_download() {
+    let temp = tempfile::tempdir().unwrap();
+    let archive = pack_zip(current_os(), "demo-pack");
+    let catalog = catalog_for("demo-pack", current_os(), &archive);
+    install_pack_archive_bytes(&catalog, "demo-pack", temp.path(), &archive).unwrap();
+    let state = load_update_state(temp.path()).unwrap();
+    for case in ["os", "engine", "missing", "version"] {
+        let mut candidate = catalog_for("demo-pack", current_os(), &archive);
+        candidate.packs[0].version = "0.2.0".into();
+        match case {
+            "os" => candidate.packs[0].os = "unsupported".into(),
+            "engine" => candidate.packs[0].requires_rustinel = ">=999.0.0".into(),
+            "missing" => candidate.packs[0].id = "other-pack".into(),
+            "version" => candidate.packs[0].version = "invalid".into(),
+            _ => unreachable!(),
+        }
+        assert!(
+            update_active_pack(&candidate, &state, &test_catalog_url(), temp.path(), |_| {
+                panic!("invalid candidate must not download")
+            })
+            .is_err()
+        );
+        assert_eq!(read_state(temp.path()).unwrap(), state);
+    }
+}
+
+#[test]
+fn failed_updates_preserve_previous_pack_and_state() {
+    let temp = tempfile::tempdir().unwrap();
+    let archive = pack_zip(current_os(), "demo-pack");
+    let catalog = catalog_for("demo-pack", current_os(), &archive);
+    install_pack_archive_bytes(&catalog, "demo-pack", temp.path(), &archive).unwrap();
+    let state = load_update_state(temp.path()).unwrap();
+    let state_bytes = fs::read(temp.path().join("state.json")).unwrap();
+    let manifest = fs::read(temp.path().join("current/pack.yml")).unwrap();
+    for case in ["download", "checksum", "unsafe", "manifest"] {
+        let candidate_archive = match case {
+            "unsafe" => unsafe_pack_zip(),
+            "manifest" => pack_zip_with_schema(current_os(), "demo-pack", 999),
+            _ => archive.clone(),
+        };
+        let mut candidate = catalog_for("demo-pack", current_os(), &candidate_archive);
+        candidate.packs[0].version = "0.2.0".into();
+        if case == "checksum" {
+            candidate.packs[0].sha256 = "00".repeat(32);
+        }
+        assert!(
+            update_active_pack(&candidate, &state, &test_catalog_url(), temp.path(), |_| {
+                if case == "download" {
+                    bail!("simulated download failure");
+                }
+                Ok(candidate_archive)
+            })
+            .is_err()
+        );
+        assert_eq!(
+            fs::read(temp.path().join("state.json")).unwrap(),
+            state_bytes
+        );
+        assert_eq!(
+            fs::read(temp.path().join("current/pack.yml")).unwrap(),
+            manifest
+        );
+    }
+}
+
+#[test]
+fn update_requires_readable_state_and_installed_pack() {
+    let temp = tempfile::tempdir().unwrap();
+    assert!(load_update_state(temp.path()).is_err());
+    fs::write(temp.path().join("state.json"), b"invalid").unwrap();
+    assert!(load_update_state(temp.path()).is_err());
+    let archive = pack_zip(current_os(), "demo-pack");
+    let catalog = catalog_for("demo-pack", current_os(), &archive);
+    install_pack_archive_bytes(&catalog, "demo-pack", temp.path(), &archive).unwrap();
+    fs::remove_dir_all(temp.path().join("current")).unwrap();
+    assert!(load_update_state(temp.path()).is_err());
+}
+
+#[test]
+fn activation_failures_restore_previous_pack_and_state() {
+    for fail_state in [false, true] {
+        let temp = tempfile::tempdir().unwrap();
+        let archive = pack_zip(current_os(), "demo-pack");
+        let catalog = catalog_for("demo-pack", current_os(), &archive);
+        install_pack_archive_bytes(&catalog, "demo-pack", temp.path(), &archive).unwrap();
+        let previous_state = fs::read(temp.path().join("state.json")).unwrap();
+        let next = temp.path().join("next");
+        if fail_state {
+            fs::create_dir(&next).unwrap();
+        }
+        assert!(atomic_replace_active(
+            temp.path(),
+            &temp.path().join("staging"),
+            &next,
+            &temp.path().join("missing-state"),
+        )
+        .is_err());
+        assert!(temp.path().join("current/sigma/demo.yml").is_file());
+        assert_eq!(
+            fs::read(temp.path().join("state.json")).unwrap(),
+            previous_state
+        );
+    }
+}
+
+#[test]
+fn state_backup_failure_restores_current_directory() {
+    let temp = tempfile::tempdir().unwrap();
+    let archive = pack_zip(current_os(), "demo-pack");
+    let catalog = catalog_for("demo-pack", current_os(), &archive);
+    install_pack_archive_bytes(&catalog, "demo-pack", temp.path(), &archive).unwrap();
+    let previous_state = fs::read(temp.path().join("state.json")).unwrap();
+    // A nonempty directory cannot be removed as a file or replaced by state.json.
+    let blocked = temp.path().join("staging/previous-state.json");
+    fs::create_dir(&blocked).unwrap();
+    fs::write(blocked.join("blocker"), b"blocker").unwrap();
+    let error = install_pack_archive_bytes(&catalog, "demo-pack", temp.path(), &archive)
+        .expect_err("state backup must fail");
+    assert!(error.to_string().contains("move current rules state"));
+    assert!(temp.path().join("current/sigma/demo.yml").is_file());
+    assert!(temp.path().join("state.json").is_file());
+    assert_eq!(fs::read(blocked.join("blocker")).unwrap(), b"blocker");
+    assert_eq!(
+        fs::read(temp.path().join("state.json")).unwrap(),
+        previous_state
+    );
+}
+
+#[test]
+fn rules_operations_reject_concurrent_writers_and_stale_update_state() {
+    let temp = tempfile::tempdir().unwrap();
+    let archive = pack_zip(current_os(), "demo-pack");
+    let mut catalog = catalog_for("demo-pack", current_os(), &archive);
+    install_pack_archive_bytes(&catalog, "demo-pack", temp.path(), &archive).unwrap();
+    let state = load_update_state(temp.path()).unwrap();
+    let lock = lock_rules_dir(temp.path()).unwrap();
+    assert!(install_pack_archive_bytes(&catalog, "demo-pack", temp.path(), &archive).is_err());
+    assert!(update_active_pack(
+        &catalog,
+        &state,
+        &test_catalog_url(),
+        temp.path(),
+        |_| panic!("locked")
+    )
+    .is_err());
+    drop(lock);
+    catalog.packs[0].version = "0.2.0".into();
+    install_pack_archive_bytes(&catalog, "demo-pack", temp.path(), &archive).unwrap();
+    let error = update_active_pack(&catalog, &state, &test_catalog_url(), temp.path(), |_| {
+        panic!("stale")
+    })
+    .unwrap_err();
+    assert!(error.to_string().contains("state changed"), "{error:#}");
+}
+
+fn test_catalog_url() -> Url {
+    Url::parse("https://github.com/example/rules/releases/download/v1/index.json").unwrap()
+}
+
+fn state_with_url(url: Option<&str>) -> RulesState {
+    RulesState {
+        pack_id: "demo-pack".into(),
+        version: "0.1.0".into(),
+        sha256: "00".into(),
+        installed_at: "now".into(),
+        catalog_url: url.map(String::from),
+    }
+}
+
+#[test]
+fn install_records_catalog_url_and_update_preserves_it() {
+    let temp = tempfile::tempdir().unwrap();
+    let archive = pack_zip(current_os(), "demo-pack");
+    let mut catalog = catalog_for("demo-pack", current_os(), &archive);
+    let url = test_catalog_url();
+    let guard = lock_rules_dir(temp.path()).unwrap();
+    install_pack_archive_bytes_locked(&catalog, "demo-pack", Some(&url), temp.path(), &archive)
+        .unwrap();
+    drop(guard);
+    let state = load_update_state(temp.path()).unwrap();
+    assert_eq!(state.catalog_url.as_deref(), Some(url.as_str()));
+
+    catalog.packs[0].version = "v0.2.0".into();
+    update_active_pack(&catalog, &state, &url, temp.path(), |_| Ok(archive.clone()))
+        .unwrap()
+        .unwrap();
+    let updated = read_state(temp.path()).unwrap();
+    assert_eq!(updated.version, "v0.2.0");
+    assert_eq!(updated.catalog_url.as_deref(), Some(url.as_str()));
+}
+
+#[test]
+fn state_without_catalog_url_still_loads_and_uses_default() {
+    let old = r#"{"pack_id":"demo-pack","version":"0.1.0","sha256":"00","installed_at":"now"}"#;
+    let state: RulesState = serde_json::from_str(old).unwrap();
+    assert_eq!(state.catalog_url, None);
+    assert_eq!(
+        update_catalog_url(None, &state).unwrap().as_str(),
+        DEFAULT_CATALOG_URL
+    );
+    assert!(!serde_json::to_string(&state)
+        .unwrap()
+        .contains("catalog_url"));
+}
+
+#[test]
+fn update_catalog_url_prefers_explicit_then_recorded() {
+    let recorded = test_catalog_url();
+    let state = state_with_url(Some(recorded.as_str()));
+    assert_eq!(update_catalog_url(None, &state).unwrap(), recorded);
+    let explicit = "https://github.com/other/rules/releases/download/v2/index.json";
+    assert_eq!(
+        update_catalog_url(Some(explicit), &state).unwrap().as_str(),
+        explicit
+    );
+}
+
+#[test]
+fn update_rejects_untrusted_recorded_catalog_url() {
+    for bad in [
+        "http://github.com/a/b/releases/download/v1/index.json",
+        "https://evil.example/index.json",
+    ] {
+        assert!(
+            update_catalog_url(None, &state_with_url(Some(bad))).is_err(),
+            "{bad}"
+        );
+    }
+}

@@ -1,0 +1,484 @@
+//! Shared construction of live detection workers and event routing.
+
+use std::path::PathBuf;
+use std::sync::Arc;
+
+use arc_swap::ArcSwap;
+use tokio::sync::mpsc;
+use tokio::task::JoinHandle;
+use tracing::{info, warn};
+
+use crate::alerts::AlertSink;
+use crate::artifact::{spawn_artifact_resolver, ArtifactRuntime};
+use crate::config::{AppConfig, ResponseConfig};
+use crate::engine::{CanonicalEventDispatcher, DetectionPipeline, DetectorStore, Engine};
+use crate::ioc::IocEngine;
+use crate::memory::MemoryScanConfig;
+use crate::response::ResponseEngine;
+use crate::runtime::logging::TARGET_CONSOLE;
+use crate::runtime::yara as runtime_yara;
+use crate::scanner::{YaraMemoryEventHandler, YaraMemoryJob};
+use crate::sensor::{Platform, SensorEventRouter};
+use crate::state::HostState;
+use crate::telemetry::PipelineProbes;
+use crate::{reload, scanner};
+
+pub(super) struct SharedState {
+    pub host: Arc<HostState>,
+    /// What this runtime's telemetry snapshots read; the pipeline attaches
+    /// its own stores to it.
+    pub probes: PipelineProbes,
+}
+impl SharedState {
+    pub fn new(cfg: &AppConfig, probes: PipelineProbes) -> Self {
+        let host = HostState::for_runtime(cfg.process.max_entries);
+        probes.attach_host(&host);
+        Self { host, probes }
+    }
+}
+
+pub(super) struct LivePipeline {
+    pub router: Arc<SensorEventRouter>,
+    pub host_state: Arc<HostState>,
+    pub artifact_worker_handle: JoinHandle<()>,
+    pub artifact_resolver_handle: crate::artifact::ArtifactResolverHandle,
+    pub yara_memory_worker_handle: Option<JoinHandle<()>>,
+    pub reload_poller: Option<reload::ReloadPoller>,
+    pub reload_worker_handle: Option<JoinHandle<()>>,
+    pub reload_tx: Option<mpsc::UnboundedSender<reload::ReloadTarget>>,
+}
+
+impl LivePipeline {
+    pub fn new(
+        cfg: &AppConfig,
+        resolved_config_path: Option<PathBuf>,
+        platform: Platform,
+        state: SharedState,
+        alert_sink: AlertSink,
+        response_config: Arc<ArcSwap<ResponseConfig>>,
+        response_engine: ResponseEngine,
+    ) -> Self {
+        // Sigma engine
+        let mut sigma_engine =
+            Engine::new_for_platform_with_match_debug(platform, cfg.alerts.match_debug)
+                .with_sigma_match_mode(cfg.scanner.sigma_match_mode);
+
+        if cfg.scanner.sigma_enabled {
+            info!(rules_path = ?cfg.scanner.sigma_rules_path, "Loading Sigma rules");
+            if let Err(e) = sigma_engine.load_rule_dirs_with_trust(
+                &cfg.scanner.sigma_rules_path,
+                &cfg.scanner.sigma_local_rules_paths,
+                cfg.security.rules(),
+            ) {
+                warn!(
+                    target: TARGET_CONSOLE,
+                    error = format!("{e:#}"),
+                    "Failed to load Sigma rules; Sigma detection has no rules"
+                );
+            } else {
+                let stats = sigma_engine.stats();
+                if stats.total_rules == 0 {
+                    warn!(
+                        target: TARGET_CONSOLE,
+                        path = ?cfg.scanner.sigma_rules_path,
+                        rule_files_found = stats.rule_files_found,
+                        diagnostics = stats.failed_rules.len(),
+                        unsupported_rules = stats.unsupported_rules.len(),
+                        "Sigma detection is enabled but no active rules were loaded"
+                    );
+                } else {
+                    info!(
+                        target: TARGET_CONSOLE,
+                        total_rules = stats.total_rules,
+                        skipped_deferred_rules = stats.skipped_deferred_rules,
+                        skipped_unknown_logsource_rules = stats.skipped_unknown_logsource_rules,
+                        skipped_product_rules = stats.skipped_product_rules,
+                        inactive_collector_rules = stats.inactive_collector_rules,
+                        unsupported_rules = stats.unsupported_rules.len(),
+                        "Sigma engine initialized"
+                    );
+                }
+                if let Some(categories) = stats.inactive_collector_summary() {
+                    warn!(
+                        target: TARGET_CONSOLE,
+                        inert_rules = stats.inactive_collector_rules,
+                        categories = %categories,
+                        "Sigma rules loaded without a backing collector and cannot fire"
+                    );
+                }
+                for (logsource, count) in stats.rules_by_logsource {
+                    info!(logsource = %logsource, count, "Sigma rules loaded");
+                }
+                for directory in &stats.directories {
+                    info!(
+                        target: TARGET_CONSOLE,
+                        directory = %directory.summary(),
+                        "Sigma rules directory"
+                    );
+                }
+                for collision in &stats.collisions {
+                    warn!(
+                        target: TARGET_CONSOLE,
+                        collision = %collision.summary(),
+                        "Local Sigma rule replaces a pack rule"
+                    );
+                }
+            }
+        } else {
+            info!(target: TARGET_CONSOLE, "Sigma detection disabled by configuration");
+        }
+        let sigma_engine = Arc::new(sigma_engine);
+
+        // YARA scanner
+        let yara_scanner = if cfg.scanner.yara_enabled {
+            match scanner::Scanner::new_with_dirs_and_trust(
+                &cfg.scanner.yara_rules_path,
+                &cfg.scanner.yara_local_rules_paths,
+                cfg.security.rules(),
+            )
+            .map(|s| s.with_limits(cfg.scanner.yara_scan_limits()))
+            {
+                Ok(s) => {
+                    if s.compiled_files() == 0 {
+                        warn!(
+                            target: TARGET_CONSOLE,
+                            path = ?cfg.scanner.yara_rules_path,
+                            files_found = s.files_found(),
+                            failed_files = s.failed_files(),
+                            "YARA scanning is enabled but no rule files compiled successfully"
+                        );
+                    } else {
+                        info!(
+                            target: TARGET_CONSOLE,
+                            compiled_files = s.compiled_files(),
+                            failed_files = s.failed_files(),
+                            "YARA scanner initialized"
+                        );
+                    }
+                    for directory in s.directories() {
+                        info!(
+                            target: TARGET_CONSOLE,
+                            directory = %directory.summary(),
+                            "YARA rules directory"
+                        );
+                    }
+                    for collision in s.collisions() {
+                        warn!(
+                            target: TARGET_CONSOLE,
+                            collision = %collision.summary(),
+                            "Local YARA rule replaces a pack rule"
+                        );
+                    }
+                    Arc::new(s)
+                }
+                Err(e) => {
+                    warn!(
+                        target: TARGET_CONSOLE,
+                        error = format!("{e:#}"),
+                        "Failed to load YARA rules; YARA scanning disabled"
+                    );
+                    Arc::new(scanner::Scanner::empty())
+                }
+            }
+        } else {
+            info!(target: TARGET_CONSOLE, "YARA scanning disabled by configuration");
+            Arc::new(scanner::Scanner::empty())
+        };
+
+        let yara_allowlist_paths =
+            scanner::normalize_allowlist_paths(&cfg.scanner.yara_allowlist_paths);
+
+        // IOC engine
+        let ioc_engine = Arc::new(
+            IocEngine::try_load_with_trust(&cfg.ioc, cfg.security.rules()).unwrap_or_else(|e| {
+                warn!(
+                    target: TARGET_CONSOLE,
+                    error = format!("{e:#}"),
+                    "Failed to load IOC indicators; IOC detection disabled"
+                );
+                IocEngine::disabled()
+            }),
+        );
+        if ioc_engine.is_enabled() {
+            let stats = ioc_engine.stats();
+            if stats.total() == 0 {
+                warn!(
+                    target: TARGET_CONSOLE,
+                    "IOC detection is enabled but no indicators were loaded"
+                );
+            } else {
+                info!(
+                    target: TARGET_CONSOLE,
+                    md5 = stats.md5,
+                    sha1 = stats.sha1,
+                    sha256 = stats.sha256,
+                    ip = stats.ip,
+                    cidr = stats.cidr,
+                    domain_exact = stats.domain_exact,
+                    domain_suffix = stats.domain_suffix,
+                    path_regex = stats.path_regex,
+                    "IOC engine initialized"
+                );
+            }
+        } else {
+            info!(target: TARGET_CONSOLE, "IOC detection disabled by configuration");
+        }
+
+        // Detector store + hot-reload
+        let detectors = DetectorStore::new(
+            Arc::clone(&sigma_engine),
+            Arc::clone(&yara_scanner),
+            Arc::clone(&ioc_engine),
+        );
+
+        let mut reload_poller = None;
+        let mut reload_worker_handle = None;
+        let mut reload_tx = None;
+        if cfg.reload.enabled {
+            let (tx, rx) = mpsc::unbounded_channel();
+            reload_worker_handle = Some(reload::spawn_reload_worker(
+                Arc::clone(&detectors),
+                cfg.scanner.clone(),
+                cfg.ioc.clone(),
+                cfg.reload.clone(),
+                cfg.alerts.match_debug,
+                cfg.security.rules().cloned(),
+                resolved_config_path.clone(),
+                response_config.clone(),
+                Some(reload::ReloadAlertContext {
+                    host_state: Arc::clone(&state.host),
+                    alert_sink: alert_sink.clone(),
+                    response_engine: response_engine.clone(),
+                }),
+                rx,
+            ));
+            reload_poller = Some(reload::spawn_reload_poller(
+                cfg.scanner.clone(),
+                cfg.ioc.clone(),
+                cfg.reload.clone(),
+                resolved_config_path.clone(),
+                tx.clone(),
+            ));
+            reload_tx = Some(tx);
+        }
+
+        let (yara_memory_tx, yara_memory_rx) = if cfg.scanner.yara_enabled
+            && (cfg.scanner.yara_memory_enabled || platform == Platform::Linux)
+        {
+            let capacity = cfg.scanner.yara_memory_queue_capacity.max(1);
+            let (tx, rx) = mpsc::channel::<YaraMemoryJob>(capacity);
+            (Some(tx), Some(rx))
+        } else {
+            (None, None)
+        };
+
+        // Spawn the optional YARA memory scanning worker.
+        let yara_memory_worker_handle = if let Some(mem_rx) = yara_memory_rx {
+            let mem_cfg = MemoryScanConfig {
+                max_process_bytes: (cfg.scanner.yara_memory_max_process_mb * 1024 * 1024) as usize,
+                max_region_bytes: (cfg.scanner.yara_memory_max_region_mb * 1024 * 1024) as usize,
+                include_private: cfg.scanner.yara_memory_include_private,
+                include_image: cfg.scanner.yara_memory_include_image,
+                include_mapped: cfg.scanner.yara_memory_include_mapped,
+                delay_ms: cfg.scanner.yara_memory_delay_ms,
+            };
+            Some(runtime_yara::spawn_yara_memory_worker(
+                Arc::clone(&detectors),
+                alert_sink.clone(),
+                response_engine.clone(),
+                mem_cfg,
+                cfg.alerts.match_debug,
+                mem_rx,
+                platform,
+                "yara-memory",
+            ))
+        } else {
+            None
+        };
+
+        // Host-state enrichment and canonicalization boundary.
+        let host_state = state.host;
+
+        // Detection handlers + router
+        let sigma_handler = CanonicalEventDispatcher::detecting(
+            Arc::clone(&host_state),
+            DetectionPipeline {
+                detectors: Arc::clone(&detectors),
+                alert_sink: alert_sink.clone(),
+                response_engine: response_engine.clone(),
+            },
+        );
+
+        let yara_memory_handler = yara_memory_tx.map(|tx| YaraMemoryEventHandler {
+            tx,
+            allowlist_paths: yara_allowlist_paths,
+            scan_all_processes: cfg.scanner.yara_memory_enabled,
+        });
+
+        let mut downstream = SensorEventRouter::new();
+        downstream.register_handler(Box::new(sigma_handler));
+        if let Some(handler) = yara_memory_handler {
+            downstream.register_handler(Box::new(handler));
+        }
+        let (router, artifact_worker_handle, artifact_resolver_handle) = spawn_artifact_resolver(
+            Arc::new(downstream),
+            Arc::clone(&host_state),
+            ArtifactRuntime {
+                detectors: Some(Arc::clone(&detectors)),
+                alert_sink: Some(alert_sink),
+                response_engine: Some(response_engine),
+                match_debug: cfg.alerts.match_debug,
+                yara_allowlist_paths: scanner::normalize_allowlist_paths(
+                    &cfg.scanner.yara_allowlist_paths,
+                ),
+                pe_metadata: platform == Platform::Windows,
+                written_files: Some(crate::artifact::written_file_scan_selector()),
+            },
+        );
+
+        state.probes.attach_artifact(&artifact_resolver_handle);
+
+        Self {
+            router,
+            host_state,
+            artifact_worker_handle,
+            artifact_resolver_handle,
+            yara_memory_worker_handle,
+            reload_poller,
+            reload_worker_handle,
+            reload_tx,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io;
+    use std::sync::Mutex;
+    use tracing_subscriber::{fmt, layer::SubscriberExt};
+
+    struct SharedWriter(Arc<Mutex<Vec<u8>>>);
+
+    impl io::Write for SharedWriter {
+        fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buffer);
+            Ok(buffer.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    async fn shutdown_pipeline(pipeline: LivePipeline, response_worker: JoinHandle<()>) {
+        let sensor_worker = tokio::spawn(async {});
+        let (writer, _guard) = tracing_appender::non_blocking(io::sink());
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            pipeline.shutdown(
+                sensor_worker,
+                response_worker,
+                None,
+                &AlertSink::new(writer.clone()),
+                None,
+                None,
+                crate::runtime::lifecycle::Lifecycle::disabled(&AlertSink::new(writer)),
+                crate::runtime::lifecycle::StopReason::Signal,
+            ),
+        )
+        .await
+        .expect("pipeline must shut down");
+    }
+
+    #[tokio::test]
+    async fn empty_detectors_are_reported_as_enabled_but_inactive() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut cfg = AppConfig::default();
+        cfg.scanner.sigma_enabled = true;
+        cfg.scanner.sigma_rules_path = temp.path().join("sigma");
+        cfg.scanner.yara_enabled = true;
+        cfg.scanner.yara_rules_path = temp.path().join("yara");
+        cfg.ioc.enabled = true;
+        cfg.ioc.hashes_path = temp.path().join("hashes.txt");
+        cfg.ioc.ips_path = temp.path().join("ips.txt");
+        cfg.ioc.domains_path = temp.path().join("domains.txt");
+        cfg.ioc.paths_regex_path = temp.path().join("paths.txt");
+        cfg.reload.enabled = false;
+
+        let response_config = Arc::new(ArcSwap::from_pointee(cfg.response.clone()));
+        let (response, response_worker) = ResponseEngine::new(response_config.clone());
+        let output = Arc::new(Mutex::new(Vec::new()));
+        let writer_output = Arc::clone(&output);
+        let subscriber = tracing_subscriber::registry().with(
+            fmt::layer()
+                .with_ansi(false)
+                .without_time()
+                .with_writer(move || SharedWriter(Arc::clone(&writer_output))),
+        );
+        let (alert_writer, _guard) = tracing_appender::non_blocking(io::sink());
+
+        let pipeline = tracing::subscriber::with_default(subscriber, || {
+            LivePipeline::new(
+                &cfg,
+                None,
+                Platform::Linux,
+                SharedState::new(&cfg, PipelineProbes::default()),
+                AlertSink::new(alert_writer),
+                response_config,
+                response.clone(),
+            )
+        });
+        drop(response);
+
+        let output = String::from_utf8(output.lock().unwrap().clone()).unwrap();
+        assert!(output.contains("Sigma detection is enabled but no active rules were loaded"));
+        assert!(output.contains("YARA scanning is enabled but no rule files compiled successfully"));
+        assert!(output.contains("IOC detection is enabled but no indicators were loaded"));
+        assert!(!output.contains("Sigma engine initialized"));
+        assert!(!output.contains("YARA scanner initialized"));
+        assert!(!output.contains("IOC engine initialized"));
+
+        shutdown_pipeline(pipeline, response_worker).await;
+    }
+
+    #[tokio::test]
+    async fn optional_workers_follow_configuration_and_release_response_senders() {
+        for (enabled, memory_enabled) in [(false, false), (true, false), (true, true)] {
+            let temp = tempfile::tempdir().unwrap();
+            let mut cfg = AppConfig::default();
+            cfg.scanner.sigma_enabled = false;
+            cfg.scanner.yara_enabled = enabled;
+            cfg.scanner.yara_memory_enabled = memory_enabled;
+            cfg.scanner.yara_rules_path = temp.path().to_path_buf();
+            cfg.ioc.enabled = enabled;
+            cfg.ioc.hashes_path = temp.path().join("hashes.txt");
+            cfg.ioc.ips_path = temp.path().join("ips.txt");
+            cfg.ioc.domains_path = temp.path().join("domains.txt");
+            cfg.ioc.paths_regex_path = temp.path().join("paths.txt");
+            std::fs::write(&cfg.ioc.domains_path, "example.test\n").unwrap();
+            cfg.reload.enabled = enabled;
+            cfg.response.enabled = false;
+            cfg.response.prevention_enabled = false;
+            let response_config = Arc::new(ArcSwap::from_pointee(cfg.response.clone()));
+            let (response, response_worker) = ResponseEngine::new(response_config.clone());
+            let (writer, _guard) = tracing_appender::non_blocking(std::io::sink());
+            let pipeline = LivePipeline::new(
+                &cfg,
+                None,
+                Platform::Linux,
+                SharedState::new(&cfg, PipelineProbes::default()),
+                AlertSink::new(writer),
+                response_config,
+                response.clone(),
+            );
+            assert!(!pipeline.artifact_worker_handle.is_finished());
+            assert_eq!(pipeline.yara_memory_worker_handle.is_some(), enabled);
+            assert_eq!(pipeline.reload_poller.is_some(), enabled);
+            assert_eq!(pipeline.reload_worker_handle.is_some(), enabled);
+            assert_eq!(pipeline.reload_tx.is_some(), enabled);
+            drop(response);
+            shutdown_pipeline(pipeline, response_worker).await;
+        }
+    }
+}

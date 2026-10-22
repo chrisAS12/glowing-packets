@@ -1,0 +1,4 @@
+# IOC Type: IPs
+# Format: VALUE;COMMENT
+# Example: 203.0.113.1;C2 endpoint
+# Note: Supports single IPs and CIDR ranges.

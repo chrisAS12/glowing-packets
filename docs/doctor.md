@@ -1,0 +1,118 @@
+# Doctor checks
+
+`rustinel doctor` runs read-only checks and prints `PASS`, `WARN`, or `FAIL` for each.
+Fix failures first.
+It exits `0` when everything passes, `1` on a warning, and `2` on a failure.
+`--json` prints the same results, plus the raw counters from [telemetry.json](telemetry.md) under `telemetry`.
+
+Run it with `sudo` or as Administrator to check platform prerequisites.
+
+## Configuration and paths
+
+| Check | Verifies |
+| --- | --- |
+| `version` | The running Rustinel version |
+| `install_mode` | `managed`, after `rustinel setup`, or `portable` |
+| `config_discovery` | Which config file was found, see [Which file is used](configuration.md#which-file-is-used) |
+| `config_parse` | The file is valid TOML with valid values |
+| `logs_writable`, `alerts_writable` | The log and alert folders can be written |
+| `required_privileges` | Administrator on Windows; root, or the four eBPF capabilities, on Linux; root on macOS |
+| `platform_support` | The OS and CPU architecture are supported |
+| `allowlist_exclusions` | Lists the effective `allowlist.excluded_paths` |
+
+## Rules
+
+Use `rustinel sigma doctor` for the per-document compatibility report.
+It checks the configured Sigma directory against a selected platform and explains field, collector, logsource, fidelity, filter, and correlation dependency limits.
+See [Sigma compatibility diagnostics](sigma.md#compatibility-diagnostics).
+
+| Check | Verifies |
+| --- | --- |
+| `sigma_rules_dir`, `yara_rules_dir` | The rule folders exist |
+| `sigma_rules_dirs`, `yara_rules_dirs` | Each pack and [local](rule-packs.md#keep-local-rules-next-to-a-pack) rule directory, with its rule count |
+| `sigma_rules_collision`, `yara_rules_collision` | Local rules that replaced a pack rule with the same Sigma `id` or YARA name |
+| `sigma_rules_parse`, `yara_rules_parse` | Every rule compiles, and no other account can change the rules. Lists the files that do not |
+| `sigma_rules_unsupported` | Correlation or filter documents dropped because a rule they reference does not apply here, or a filter names no target rules |
+| `sigma_rules_inert` | Rules that loaded but have no collector on this platform, grouped by logsource. They never fire |
+| `ioc_files`, `ioc_parse`, `ioc_hashes`, `ioc_ips`, `ioc_domains`, `ioc_paths_regex` | Indicator files exist and parse |
+| `ioc_inputs_trust` | No other account can change the indicator files, see [Input trust](security.md#input-trust) |
+| `field_availability` | The field availability contract loaded. Names fields this platform never fills |
+| `rules_pack_state`, `rules_pack_manifest`, `rules_pack_schema`, `rules_pack_checksum`, `rules_pack_compatibility` | The installed pack is intact and fits this Rustinel version |
+
+## Service and response
+
+| Check | Verifies |
+| --- | --- |
+| `native_service` | Service status. Passes in portable mode, where no service is needed |
+| `linux_systemd` | systemd is available (Linux) |
+| `linux_service_capabilities` | The installed or running service has `CAP_SYS_PTRACE`, `CAP_DAC_READ_SEARCH`, and `CAP_KILL`, see [Linux capabilities](installation.md#linux-capabilities) (Linux) |
+| `active_response_mode` | Whether response is off, dry run, or killing |
+| `active_response_safety` | `response.min_severity` is a valid severity |
+| `active_response_allowlist` | Prevention has a trusted path allowlist |
+
+## Platform prerequisites
+
+| Check | Verifies |
+| --- | --- |
+| `telemetry_prerequisites` | Summary of the checks below |
+| `windows_etw` | ETW is usable (Windows) |
+| `linux_kernel`, `linux_btf`, `linux_tracefs`, `linux_dns_hooks` | Kernel 5.8+, BTF, tracefs, and DNS hooks (Linux) |
+| `macos_endpoint_security`, `macos_full_disk_access`, `macos_app_location` | Endpoint Security can start, see [macOS permissions](macos-permissions.md) |
+| `macos_bpf` | `/dev/bpf*` devices exist for network and DNS capture (macOS) |
+
+## Telemetry health
+
+These read `telemetry.json` from a running or stopped agent.
+See [Telemetry loss](telemetry-loss.md).
+The informational `field_fidelity` result lists counts of populated fields with [fidelity limitations](output.md#field-provenance); JSON includes the same counts under `telemetry.field_fidelity`.
+
+| Check | Warns when |
+| --- | --- |
+| `host_state` | Attribution updates were lost; reports process, user, DNS, and path-state occupancy |
+| `process_inventory` | Startup inventory failed or seeded no processes; reports duration and coverage |
+| `artifact_resolver` | At least 0.01% of artifact jobs failed: a file could not be hashed, scanned, or read for PE metadata in time: a queue was full, a budget expired, the file changed, or reading failed. Files over the size limit are listed but never change the result. Reports dropped jobs separately for process images, loaded images, and written files, and warns that written-file drops leave a YARA and hash IOC detection gap. Also covers a [deferred pass](detection.md#deferred-pass) that ran without `Hashes` or `Imphash` |
+| `field_contract_violations` | A normalized event populated a field declared `Never`; detection filters the contradictory field until the decoder or contract is corrected |
+| `pipeline_telemetry` | Warns when a pipeline queue shed at least 0.01% of the items offered to it, any alert was dropped, or `telemetry.enabled = false`. Fails when the alert writer dropped at least 0.1% of alerts. Also warns when the snapshot is unreadable or malformed, or missing while the service is running |
+| `telemetry_snapshot` | How old the snapshot is, see [Snapshot freshness](#snapshot-freshness) |
+| `alert_webhooks` | An alert failed, was dropped, was too large, or was abandoned at shutdown for a [webhook](output.md#webhooks). The alert file still has it |
+| `linux_ebpf` | A kernel ring or map filled, records were short or unusable, file paths could not be rebuilt, or counters do not add up |
+| `linux_ebpf_<feature>_capability` | A kernel hook is missing, so that feature is degraded. The rest keeps working |
+| `linux_task_<field>` | A process identity field is unavailable on this kernel |
+| `macos_esf_kernel_loss`, `macos_bpf_kernel_loss` | Endpoint Security or packet capture dropped events |
+| `macos_bpf_interface_<name>` | Capture on that interface failed or dropped packets |
+| `registry_path_resolution` | Fewer than 99.9% of registry writes had a key path (Windows) |
+| `file_path_attribution` | Fewer than 99% of file events had a path, or the startup file snapshot was rejected (Windows) |
+| `etw_decode` | ETW records failed to decode. Names the provider, event ID, and version (Windows) |
+| `etw_decode_reconciliation` | Records reached no outcome. A growing gap is a bug worth reporting (Windows) |
+| `windows_process_correlation` | Two sources disagreed about a process command line (Windows) |
+| `windows_event_log_<channel>` | An Event Log subscription failed, is retrying, or went stale, see [`windows_event_log`](telemetry.md#windows_event_log) (Windows) |
+| `windows_event_log_<channel>_retention` | Records were overwritten before Rustinel read them, for example while it was stopped (Windows) |
+
+## Loss budgets
+
+The drop counters in `telemetry.json` are lifetime totals, so `doctor` judges them as a share of what was offered, not as a bare count.
+One lost event among millions passes and the count stays in the message.
+A pipeline queue or the artifact resolver warns from 0.01% loss.
+Alert loss always warns, and fails from 0.1%.
+The thresholds are not configurable.
+
+## Snapshot freshness
+
+Service state alone does not show that collection is working, so `doctor` also judges whether `telemetry.json` is usable and current.
+A snapshot is stale after `2 × telemetry.snapshot_interval_secs + 30` seconds, which allows one missed write and scheduler delay.
+A timestamp more than 60 seconds ahead of this host's clock is reported as `future`.
+
+`--json` carries this in `telemetry_snapshot`: `state`, `age_secs`, `interval_secs`, `stale_after_secs`, and `path`.
+
+| `state` | Meaning | Result |
+| --- | --- | --- |
+| `fresh` | Written within the stale threshold | `PASS` |
+| `stale` | Older than the threshold. Service running: runtime health is degraded or unknown | `WARN` when the service is running, otherwise `PASS` with a note that it is not evidence of current health |
+| `historical` | Older than the threshold and the managed service is not running, so the counters describe its last run | `PASS` |
+| `future`, `invalid_timestamp` | Freshness cannot be assessed | `WARN` |
+| `missing` | No file. A running service should have written one | `WARN` when the service is running, otherwise `PASS` (never started) |
+| `unreadable` | The file exists but cannot be read, for example for permissions | `WARN` |
+| `malformed` | The file is not a valid snapshot | `WARN` |
+| `disabled` | `telemetry.enabled = false` | `WARN` |
+
+Portable runs and unknown service state are never treated as "not running": there, an old snapshot is reported as `stale` without a claim about current health.

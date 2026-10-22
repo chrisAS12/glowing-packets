@@ -1,0 +1,3942 @@
+//! Machine-readable field availability for every view and sensor event shape.
+//!
+//! This is the source of truth for field-level compatibility. Keep limitations
+//! here rather than in a decoder comment or a hand-maintained documentation
+//! list: `doctor`, the generated compatibility baseline, and the generated
+//! documentation all consume [`FIELD_AVAILABILITY`].
+
+use semver::Version;
+use serde::Serialize;
+
+use crate::models::{EventCategory, FieldViewName, NormalizedEvent};
+use crate::vocab::{Platform, SensorAction};
+
+pub const SCHEMA_VERSION: u16 = 3;
+
+/// The field had its current availability at or before the oldest supported
+/// Rustinel release. Keeping this explicit at every declaration prevents a new
+/// capability from silently acquiring a version floor.
+const SINCE_BASELINE: Option<&str> = None;
+const SINCE_1_1_0: Option<&str> = Some("1.1.0");
+const SINCE_1_4_0: Option<&str> = Some("1.4.0");
+const SINCE_1_4_1: Option<&str> = Some("1.4.1");
+const SINCE_1_6_0: Option<&str> = Some("1.6.0");
+const SINCE_1_7_0: Option<&str> = Some("1.7.0");
+/// Marks availability that has landed but is not in any release yet.
+///
+/// Declare new work as `Some("1.9.1")` rather than guessing the next
+/// version. Preparing a release replaces every use with the version being
+/// released, and CI refuses a release tag whose contract still contains it.
+pub const UNRELEASED: &str = "unreleased";
+/// Linux DNS response decoding (#439).
+const SINCE_DNS_RESPONSES: Option<&str> = Some("1.8.0");
+/// Additional Windows Security audit event families (#479).
+const SINCE_SECURITY_FAMILIES: Option<&str> = Some("1.8.0");
+/// Windows `Hashes` and `Imphash` from artifact resolution (#319).
+const SINCE_ARTIFACT_HASHES: Option<&str> = Some("1.8.0");
+/// Windows Authenticode `Signed`, `Signature` and `SignatureStatus` on image
+/// loads from artifact resolution (#320).
+const SINCE_AUTHENTICODE: Option<&str> = Some("1.11.0");
+/// Linux container context (#148).
+const SINCE_CONTAINER_CONTEXT: Option<&str> = Some("1.8.0");
+/// Identity-checked Linux process path enrichment (#231).
+const SINCE_PROCESS_PATH_ENRICHMENT: Option<&str> = Some("1.8.0");
+/// Windows process identity measured by classic-record correlation (#480).
+const SINCE_PROCESS_USER: Option<&str> = Some("1.8.0");
+/// Native Windows Event Log or ETW manifest channel (#543).
+const SINCE_WINDOWS_CHANNEL: Option<&str> = Some("1.8.0");
+/// Classic Windows PowerShell event 400 collection (#323).
+const SINCE_POWERSHELL_CLASSIC_START: Option<&str> = Some("1.9.0");
+/// Defender Operational event collection (#483).
+const SINCE_DEFENDER: Option<&str> = Some("1.9.0");
+/// WMI-Activity Operational events (#481).
+const SINCE_WMI_OPERATIONAL: Option<&str> = Some("1.9.0");
+/// Derived DNS name fields (#801).
+const SINCE_DNS_DERIVED: Option<&str> = Some("1.11.0");
+/// Application channel collection (#316).
+const SINCE_APPLICATION: Option<&str> = Some("1.9.0");
+/// Security 4740 and the gated long-tail events 4672, 4799 and 5140 (#805).
+const SINCE_SECURITY_LONG_TAIL: Option<&str> = Some("1.11.0");
+/// The domain-controller Security events and 5379 (#544).
+const SINCE_SECURITY_DOMAIN_CONTROLLER: Option<&str> = Some("1.11.0");
+/// DNS messages cut at the capture limit keep the name they have (#804).
+const SINCE_DNS_TRUNCATION: Option<&str> = Some("1.10.0");
+
+/// Whether a field can be present for one precise sensor event shape.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(tag = "availability", content = "reason", rename_all = "snake_case")]
+pub enum Availability {
+    /// Every emitted event of this shape carries the field.
+    Always,
+    /// The field is populated only when the source or bounded enrichment can
+    /// supply it. The reason describes that condition.
+    Conditional(&'static str),
+    /// No event of this shape can carry the field.
+    Never(&'static str),
+}
+
+impl Availability {
+    pub const fn status(self) -> &'static str {
+        match self {
+            Self::Always => "always",
+            Self::Conditional(_) => "conditional",
+            Self::Never(_) => "never",
+        }
+    }
+
+    pub const fn reason(self) -> Option<&'static str> {
+        match self {
+            Self::Always => None,
+            Self::Conditional(reason) | Self::Never(reason) => Some(reason),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct FieldContract {
+    pub field: &'static str,
+    /// First released version where the field reached its current
+    /// availability, or `None` when that predates the supported baseline.
+    pub since: Option<&'static str>,
+    /// Exact value for invariant fields such as a native Windows channel.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub value: Option<&'static str>,
+    /// Every value a multi-valued field holds at once, such as the audit
+    /// record types one exec stands for. A rule value matches when it equals
+    /// any of them.
+    #[serde(skip_serializing_if = "<[&str]>::is_empty")]
+    pub values: &'static [&'static str],
+    #[serde(flatten)]
+    pub availability: Availability,
+}
+
+/// Availability for one `(view, platform, category, event id/action, provider)` key.
+///
+/// `provider` is the stable provider written to [`NormalizedEvent`]. `source`
+/// names the native producer so ETW and Event Log contracts remain reviewable
+/// without leaking provider-specific identifiers into the shared event model.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct EventFieldContract {
+    pub view: FieldViewName,
+    pub platform: Platform,
+    pub category: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub event_id: Option<u16>,
+    /// Further `EventID` values this shape presents to Sigma, beyond `event_id`.
+    ///
+    /// A shape with no `event_id` and no further IDs leaves `EventID`
+    /// unconstrained. A shape that spans several IDs (the WMI trace events) or
+    /// presents an alias (Windows DNS also presents Sysmon 22) lists them here.
+    #[serde(skip_serializing_if = "<[u16]>::is_empty")]
+    pub event_ids: &'static [u16],
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub action: Option<SensorAction>,
+    pub provider: &'static str,
+    pub source: &'static str,
+    pub fields: &'static [FieldContract],
+}
+
+impl EventFieldContract {
+    /// Every `EventID` this shape presents to Sigma, or empty when unconstrained.
+    pub fn presented_event_ids(&self) -> impl Iterator<Item = u16> + '_ {
+        self.event_id
+            .into_iter()
+            .chain(self.event_ids.iter().copied())
+    }
+
+    /// Whether an event with `id` can be of this shape.
+    pub fn presents_event_id(&self, id: u16) -> bool {
+        (self.event_id.is_none() && self.event_ids.is_empty())
+            || self.presented_event_ids().any(|candidate| candidate == id)
+    }
+}
+
+const fn always(field: &'static str, since: Option<&'static str>) -> FieldContract {
+    FieldContract {
+        field,
+        since,
+        value: None,
+        values: &[],
+        availability: Availability::Always,
+    }
+}
+
+const fn always_value(
+    field: &'static str,
+    since: Option<&'static str>,
+    value: &'static str,
+) -> FieldContract {
+    FieldContract {
+        field,
+        since,
+        value: Some(value),
+        values: &[],
+        availability: Availability::Always,
+    }
+}
+
+const fn always_values(
+    field: &'static str,
+    since: Option<&'static str>,
+    values: &'static [&'static str],
+) -> FieldContract {
+    FieldContract {
+        field,
+        since,
+        value: None,
+        values,
+        availability: Availability::Always,
+    }
+}
+
+const fn conditional_values(
+    field: &'static str,
+    since: Option<&'static str>,
+    values: &'static [&'static str],
+    reason: &'static str,
+) -> FieldContract {
+    FieldContract {
+        field,
+        since,
+        value: None,
+        values,
+        availability: Availability::Conditional(reason),
+    }
+}
+
+const fn conditional(
+    field: &'static str,
+    since: Option<&'static str>,
+    reason: &'static str,
+) -> FieldContract {
+    FieldContract {
+        field,
+        since,
+        value: None,
+        values: &[],
+        availability: Availability::Conditional(reason),
+    }
+}
+
+const fn never(
+    field: &'static str,
+    since: Option<&'static str>,
+    reason: &'static str,
+) -> FieldContract {
+    FieldContract {
+        field,
+        since,
+        value: None,
+        values: &[],
+        availability: Availability::Never(reason),
+    }
+}
+
+const WINDOWS_PROCESS: &[FieldContract] = &[
+    always_value(
+        "Channel",
+        SINCE_WINDOWS_CHANNEL,
+        "Microsoft-Windows-Kernel-Process/Analytic",
+    ),
+    always("ProcessId", SINCE_BASELINE),
+    conditional(
+        "Image",
+        SINCE_BASELINE,
+        "the provider may omit the image path",
+    ),
+    conditional(
+        "CommandLine",
+        SINCE_BASELINE,
+        "queried from the live process and lost if it exits first",
+    ),
+    conditional(
+        "ProcessStartTime",
+        SINCE_BASELINE,
+        "the event template may omit the native creation time",
+    ),
+    conditional(
+        "ParentProcessId",
+        SINCE_BASELINE,
+        "the event template may omit parent identity",
+    ),
+    conditional(
+        "ParentImage",
+        SINCE_BASELINE,
+        "present in the event or derived from the process cache",
+    ),
+    conditional(
+        "ParentCommandLine",
+        SINCE_BASELINE,
+        "derived from the process cache when the parent is still known",
+    ),
+    conditional(
+        "ParentUser",
+        SINCE_PROCESS_USER,
+        "derived from the process cache when the stable parent identity is known",
+    ),
+    conditional(
+        "IntegrityLevel",
+        SINCE_1_4_1,
+        "available only on process-start templates with a MandatoryLabel SID",
+    ),
+    conditional(
+        "LogonId",
+        Some("1.11.0"),
+        "derived from the live process token when the process still exists and its start time matches; counted in windows_process_correlation",
+    ),
+    conditional(
+        "OriginalFileName",
+        SINCE_BASELINE,
+        "PE version-resource enrichment succeeds",
+    ),
+    conditional(
+        "Product",
+        SINCE_BASELINE,
+        "PE version-resource enrichment succeeds",
+    ),
+    conditional(
+        "Description",
+        SINCE_BASELINE,
+        "PE version-resource enrichment succeeds",
+    ),
+    conditional(
+        "Company",
+        SINCE_1_4_1,
+        "PE version-resource enrichment succeeds",
+    ),
+    conditional(
+        "FileVersion",
+        SINCE_1_4_1,
+        "PE version-resource enrichment succeeds",
+    ),
+    never(
+        "CgroupId",
+        SINCE_BASELINE,
+        "Windows process events do not have a Linux kernel cgroup identifier",
+    ),
+    conditional(
+        "User",
+        SINCE_PROCESS_USER,
+        "the classic process record is correlated; the measured SID is retained or resolves to an account name",
+    ),
+    conditional(
+        "CurrentDirectory",
+        Some("1.11.0"),
+        "Microsoft-Windows-Kernel-Process does not expose the working directory, so it is read from the live process parameters when the process is still alive, its start time matches, and its memory is readable",
+    ),
+    never(
+        "TargetImage",
+        SINCE_BASELINE,
+        "a process-creation event has no target process",
+    ),
+    conditional(
+        "Hashes",
+        SINCE_ARTIFACT_HASHES,
+        "computed from the image file after admission when a loaded rule selects on it, and seen only by those rules",
+    ),
+    conditional(
+        "Imphash",
+        SINCE_ARTIFACT_HASHES,
+        "computed from the image file's import table after admission when a loaded rule selects on it, and seen only by those rules",
+    ),
+];
+
+const WINDOWS_IMAGE_LOAD: &[FieldContract] = &[
+    always_value(
+        "Channel",
+        SINCE_WINDOWS_CHANNEL,
+        "Microsoft-Windows-Kernel-Process/Analytic",
+    ),
+    conditional(
+        "ImageLoaded",
+        SINCE_BASELINE,
+        "the provider may omit the loaded image path",
+    ),
+    conditional(
+        "ProcessId",
+        SINCE_BASELINE,
+        "the provider may omit process identity",
+    ),
+    conditional(
+        "Image",
+        SINCE_BASELINE,
+        "the provider may omit the loading process image",
+    ),
+    conditional(
+        "OriginalFileName",
+        SINCE_BASELINE,
+        "PE version-resource enrichment succeeds",
+    ),
+    conditional(
+        "Product",
+        SINCE_BASELINE,
+        "PE version-resource enrichment succeeds",
+    ),
+    conditional(
+        "Description",
+        SINCE_BASELINE,
+        "PE version-resource enrichment succeeds",
+    ),
+    conditional(
+        "Company",
+        SINCE_1_4_1,
+        "PE version-resource enrichment succeeds",
+    ),
+    conditional(
+        "FileVersion",
+        SINCE_1_4_1,
+        "PE version-resource enrichment succeeds",
+    ),
+    conditional(
+        "Signed",
+        SINCE_AUTHENTICODE,
+        "verified from the loaded file after admission when a loaded rule selects on it, and seen only by those rules; absent when verification did not complete",
+    ),
+    conditional(
+        "Signature",
+        SINCE_AUTHENTICODE,
+        "the signer's display name, set with Signed when the file carries a signature that verification could read",
+    ),
+    conditional(
+        "SignatureStatus",
+        SINCE_AUTHENTICODE,
+        "set with Signed: Valid, Expired, Revoked, Invalid, or Unavailable for an unsigned file",
+    ),
+    never(
+        "User",
+        SINCE_BASELINE,
+        "Kernel-Process image-load events contain no user identity",
+    ),
+    conditional(
+        "Hashes",
+        SINCE_ARTIFACT_HASHES,
+        "computed from the loaded file after admission when a loaded rule selects on it, and seen only by those rules",
+    ),
+    conditional(
+        "Imphash",
+        SINCE_ARTIFACT_HASHES,
+        "computed from the loaded file's import table after admission when a loaded rule selects on it, and seen only by those rules",
+    ),
+];
+
+/// A kernel image load: the same Kernel-Process event 5, split off by the
+/// System or idle actor it names (#548). Sysmon's driver_load carries the
+/// image, its hashes and its signature; the provider supplies only the path.
+const WINDOWS_DRIVER_LOAD: &[FieldContract] = &[
+    always_value(
+        "Channel",
+        Some("1.11.0"),
+        "Microsoft-Windows-Kernel-Process/Analytic",
+    ),
+    conditional(
+        "ImageLoaded",
+        Some("1.11.0"),
+        "the provider may omit the loaded image path",
+    ),
+    conditional(
+        "ProcessId",
+        Some("1.11.0"),
+        "the provider may omit process identity",
+    ),
+    conditional(
+        "Image",
+        Some("1.11.0"),
+        "the provider may omit the loading process image",
+    ),
+    conditional(
+        "OriginalFileName",
+        Some("1.11.0"),
+        "PE version-resource enrichment succeeds",
+    ),
+    conditional(
+        "Product",
+        Some("1.11.0"),
+        "PE version-resource enrichment succeeds",
+    ),
+    conditional(
+        "Description",
+        Some("1.11.0"),
+        "PE version-resource enrichment succeeds",
+    ),
+    conditional(
+        "Company",
+        Some("1.11.0"),
+        "PE version-resource enrichment succeeds",
+    ),
+    conditional(
+        "FileVersion",
+        Some("1.11.0"),
+        "PE version-resource enrichment succeeds",
+    ),
+    conditional(
+        "Signed",
+        SINCE_AUTHENTICODE,
+        "verified from the loaded file after admission when a loaded rule selects on it, and seen only by those rules; absent when verification did not complete",
+    ),
+    conditional(
+        "Signature",
+        SINCE_AUTHENTICODE,
+        "the signer's display name, set with Signed when the file carries a signature that verification could read",
+    ),
+    conditional(
+        "SignatureStatus",
+        SINCE_AUTHENTICODE,
+        "set with Signed: Valid, Expired, Revoked, Invalid, or Unavailable for an unsigned file",
+    ),
+    never(
+        "User",
+        Some("1.11.0"),
+        "Kernel-Process image-load events contain no user identity",
+    ),
+    conditional(
+        "Hashes",
+        Some("1.11.0"),
+        "computed from the loaded driver after admission when a loaded rule selects on it, and seen only by those rules",
+    ),
+    conditional(
+        "Imphash",
+        Some("1.11.0"),
+        "computed from the loaded driver's import table after admission when a loaded rule selects on it, and seen only by those rules",
+    ),
+];
+
+const WINDOWS_NETWORK: &[FieldContract] = &[
+    always_value(
+        "Channel",
+        SINCE_WINDOWS_CHANNEL,
+        "Microsoft-Windows-Kernel-Network/Analytic",
+    ),
+    conditional(
+        "DestinationIp",
+        SINCE_BASELINE,
+        "the provider event template must carry the remote address",
+    ),
+    conditional(
+        "SourceIp",
+        SINCE_BASELINE,
+        "the provider event template must carry the local address",
+    ),
+    conditional(
+        "DestinationPort",
+        SINCE_BASELINE,
+        "the provider event template must carry the remote port",
+    ),
+    conditional(
+        "SourcePort",
+        SINCE_BASELINE,
+        "the provider event template must carry the local port",
+    ),
+    always("ProcessId", SINCE_BASELINE),
+    always("Protocol", SINCE_BASELINE),
+    always("Initiated", SINCE_1_4_1),
+    conditional(
+        "Image",
+        SINCE_BASELINE,
+        "present in the event or derived from the process cache",
+    ),
+    conditional(
+        "User",
+        SINCE_BASELINE,
+        "the provider event template carries user identity",
+    ),
+    conditional(
+        "DestinationHostname",
+        SINCE_BASELINE,
+        "derived from a preceding observed DNS answer",
+    ),
+];
+
+const WINDOWS_FILE: &[FieldContract] = &[
+    always_value(
+        "Channel",
+        SINCE_WINDOWS_CHANNEL,
+        "Microsoft-Windows-Kernel-File/Analytic",
+    ),
+    always("TargetFilename", SINCE_BASELINE),
+    conditional(
+        "ProcessId",
+        SINCE_BASELINE,
+        "the provider event template carries process identity",
+    ),
+    conditional(
+        "Image",
+        SINCE_BASELINE,
+        "present in the event or derived from the process cache",
+    ),
+    conditional(
+        "User",
+        SINCE_BASELINE,
+        "the provider event template carries user identity",
+    ),
+    never(
+        "SourceFilename",
+        SINCE_BASELINE,
+        "Kernel-File does not provide the old name on emitted rename events",
+    ),
+    never(
+        "CreationUtcTime",
+        SINCE_BASELINE,
+        "Kernel-File reports the information class, not the new timestamp",
+    ),
+    never(
+        "PreviousCreationUtcTime",
+        SINCE_BASELINE,
+        "Kernel-File reports the information class, not the old timestamp",
+    ),
+    never(
+        "PathTruncated",
+        SINCE_BASELINE,
+        "ETW delivers a complete path or no attributable event",
+    ),
+];
+
+const WINDOWS_REGISTRY: &[FieldContract] = &[
+    always_value(
+        "Channel",
+        SINCE_WINDOWS_CHANNEL,
+        "Microsoft-Windows-Kernel-Registry/Analytic",
+    ),
+    always("TargetObject", SINCE_BASELINE),
+    conditional(
+        "Details",
+        SINCE_1_4_0,
+        "captured registry value data is available and renderable",
+    ),
+    conditional(
+        "ProcessId",
+        SINCE_BASELINE,
+        "the provider event template carries process identity",
+    ),
+    conditional(
+        "Image",
+        SINCE_BASELINE,
+        "present in the event or derived from the process cache",
+    ),
+    conditional(
+        "EventType",
+        SINCE_BASELINE,
+        "the provider event template carries the event type",
+    ),
+    conditional(
+        "User",
+        SINCE_BASELINE,
+        "the provider event template carries user identity",
+    ),
+    conditional(
+        "NewName",
+        SINCE_BASELINE,
+        "the operation is a rename and the provider carries the new name",
+    ),
+];
+
+const WINDOWS_DNS: &[FieldContract] = &[
+    never(
+        "QueryTruncated",
+        SINCE_DNS_TRUNCATION,
+        "ETW delivers whole DNS Client events",
+    ),
+    always_value(
+        "Channel",
+        SINCE_WINDOWS_CHANNEL,
+        "Microsoft-Windows-DNS-Client/Operational",
+    ),
+    conditional(
+        "QueryName",
+        SINCE_BASELINE,
+        "the DNS Client event template carries a query name",
+    ),
+    conditional(
+        "QueryRegisteredDomain",
+        SINCE_DNS_DERIVED,
+        "derived read-only from QueryName: the public-suffix registered domain of QueryName; absent for a bare suffix or an unlisted suffix",
+    ),
+    conditional(
+        "QueryLabelCount",
+        SINCE_DNS_DERIVED,
+        "derived read-only from QueryName: the label count of QueryName",
+    ),
+    conditional(
+        "QueryLongestLabel",
+        SINCE_DNS_DERIVED,
+        "derived read-only from QueryName: the longest label length of QueryName in bytes",
+    ),
+    conditional(
+        "QueryNameLength",
+        SINCE_DNS_DERIVED,
+        "derived read-only from QueryName: the length of QueryName in bytes",
+    ),
+    conditional(
+        "QueryResults",
+        SINCE_BASELINE,
+        "the event is a response carrying decoded answers",
+    ),
+    conditional(
+        "QueryStatus",
+        SINCE_BASELINE,
+        "the DNS Client event template carries a status",
+    ),
+    conditional(
+        "ProcessId",
+        SINCE_BASELINE,
+        "the DNS Client event template carries process identity",
+    ),
+    conditional(
+        "Image",
+        SINCE_BASELINE,
+        "present in the event or derived from the process cache",
+    ),
+    never(
+        "RecordType",
+        SINCE_BASELINE,
+        "the subscribed DNS Client events do not expose the query record type",
+    ),
+];
+
+const WINDOWS_POWERSHELL_SCRIPT: &[FieldContract] = &[
+    always_value(
+        "Channel",
+        SINCE_WINDOWS_CHANNEL,
+        "Microsoft-Windows-PowerShell/Operational",
+    ),
+    conditional(
+        "ScriptBlockText",
+        SINCE_BASELINE,
+        "event 4104 contains a script block",
+    ),
+    conditional(
+        "ScriptBlockId",
+        SINCE_BASELINE,
+        "event 4104 contains a script-block identifier",
+    ),
+    conditional(
+        "MessageNumber",
+        Some("1.9.1"),
+        "event 4104 carries the fragment number of a split script block",
+    ),
+    conditional(
+        "MessageTotal",
+        Some("1.9.1"),
+        "event 4104 carries the fragment count of a split script block",
+    ),
+    conditional(
+        "Path",
+        SINCE_BASELINE,
+        "the script block is associated with a file",
+    ),
+    conditional(
+        "ProcessId",
+        SINCE_BASELINE,
+        "the provider event template carries process identity",
+    ),
+    conditional(
+        "Image",
+        SINCE_BASELINE,
+        "present in the event or derived from the process cache",
+    ),
+    conditional(
+        "User",
+        SINCE_BASELINE,
+        "the provider event template carries user identity",
+    ),
+];
+
+const WINDOWS_POWERSHELL_MODULE: &[FieldContract] = &[
+    always_value(
+        "Channel",
+        SINCE_WINDOWS_CHANNEL,
+        "Microsoft-Windows-PowerShell/Operational",
+    ),
+    conditional(
+        "ContextInfo",
+        SINCE_1_4_1,
+        "Module Logging is enabled and event 4103 carries context",
+    ),
+    conditional(
+        "Payload",
+        SINCE_1_4_1,
+        "Module Logging is enabled and event 4103 carries a payload",
+    ),
+    conditional(
+        "ProcessId",
+        SINCE_1_4_1,
+        "the provider event template carries process identity",
+    ),
+    conditional(
+        "Image",
+        SINCE_1_4_1,
+        "present in the event or derived from the process cache",
+    ),
+    conditional(
+        "User",
+        SINCE_1_4_1,
+        "the provider event template carries user identity",
+    ),
+];
+
+const WINDOWS_POWERSHELL_CLASSIC_START: &[FieldContract] = &[
+    always_value(
+        "Channel",
+        SINCE_POWERSHELL_CLASSIC_START,
+        "Windows PowerShell",
+    ),
+    always("Data", SINCE_POWERSHELL_CLASSIC_START),
+];
+
+const DEFENDER_CHANNEL: &str = "Microsoft-Windows-Windows Defender/Operational";
+const DEFENDER_FIELD_REASON: &str = "the Defender event template supplies this value";
+
+macro_rules! defender_fields {
+    ($($field:literal),*; aliases: $($alias:literal),*; unreleased: $($new:literal),* $(,)?) => {
+        &[
+            always_value("Channel", SINCE_DEFENDER, DEFENDER_CHANNEL),
+            always("Provider_Name", SINCE_DEFENDER),
+            $(conditional($field, SINCE_DEFENDER, DEFENDER_FIELD_REASON),)*
+            $(conditional($alias, SINCE_DEFENDER, DEFENDER_FIELD_REASON),)*
+            $(conditional($new, Some("1.11.0"), DEFENDER_FIELD_REASON),)*
+        ]
+    };
+    ($($field:literal),*; aliases: $($alias:literal),* $(,)?) => {
+        &[
+            always_value("Channel", SINCE_DEFENDER, DEFENDER_CHANNEL),
+            always("Provider_Name", SINCE_DEFENDER),
+            $(conditional($field, SINCE_DEFENDER, DEFENDER_FIELD_REASON),)*
+            $(conditional($alias, SINCE_DEFENDER, DEFENDER_FIELD_REASON),)*
+        ]
+    };
+    ($($field:literal),* $(,)?) => {
+        defender_fields!($($field),*; aliases:)
+    };
+}
+
+const WINDOWS_DEFENDER_5001: &[FieldContract] = defender_fields!("Product Name", "Product Version");
+const WINDOWS_DEFENDER_5007: &[FieldContract] = defender_fields!("Product Name", "Product Version", "Old Value", "New Value"; aliases: "OldValue", "NewValue");
+const WINDOWS_DEFENDER_5013: &[FieldContract] =
+    defender_fields!("Product Name", "Product Version", "Changed Type", "Value");
+const WINDOWS_DEFENDER_1006: &[FieldContract] = defender_fields!(
+    "Product Name",
+    "Product Version",
+    "Detection ID",
+    "Detection Source Index",
+    "Detection Source",
+    "Process Name",
+    "Domain",
+    "User",
+    "SID",
+    "Threat Name",
+    "Threat ID",
+    "Severity ID",
+    "Category ID",
+    "FWLink",
+    "Path Found",
+    "Detection Origin Index",
+    "Detection Origin",
+    "Execution Status Index",
+    "Execution Status",
+    "Detection Type Index",
+    "Detection Type",
+    "Severity Name",
+    "Category Name",
+    "Security intelligence Version",
+    "Engine Version"; aliases: "ProcessName", "ThreatName"
+);
+const WINDOWS_DEFENDER_1015: &[FieldContract] = defender_fields!(
+    "Product Name",
+    "Product Version",
+    "Detection ID",
+    "Detection Source Index",
+    "Detection Source",
+    "Process Name",
+    "Domain",
+    "User",
+    "SID",
+    "Threat Name",
+    "Threat ID",
+    "Severity ID",
+    "Category ID",
+    "FWLink",
+    "Path Found",
+    "Detection Origin Index",
+    "Detection Origin",
+    "Execution Status Index",
+    "Execution Status",
+    "Detection Type Index",
+    "Detection Type",
+    "Severity Name",
+    "Category Name",
+    "Security intelligence Version",
+    "Engine Version",
+    "Process ID",
+    "Security intelligence ID",
+    "FidelityValue",
+    "FidelityLabel",
+    "Image File Hash",
+    "TargetFileName",
+    "TargetFileHash"; aliases: "ProcessName", "ThreatName"
+);
+const WINDOWS_DEFENDER_1009: &[FieldContract] = defender_fields!(
+    "Product Name",
+    "Product Version",
+    "Domain",
+    "User",
+    "SID",
+    "Threat Name",
+    "Threat ID",
+    "Severity ID",
+    "Category ID",
+    "FWLink",
+    "Path",
+    "Severity Name",
+    "Category Name",
+    "Security intelligence Version",
+    "Engine Version"; aliases: "ThreatName"
+);
+const WINDOWS_DEFENDER_1013: &[FieldContract] = defender_fields!(
+    "Product Name",
+    "Product Version",
+    "Timestamp",
+    "Domain",
+    "User",
+    "SID"
+);
+const WINDOWS_DEFENDER_1116: &[FieldContract] = defender_fields!(
+    "Product Name",
+    "Product Version",
+    "Detection ID",
+    "Detection Time",
+    "Threat ID",
+    "Threat Name",
+    "Severity ID",
+    "Severity Name",
+    "Category ID",
+    "Category Name",
+    "FWLink",
+    "Status Code",
+    "Status Description",
+    "State",
+    "Source ID",
+    "Source Name",
+    "Process Name",
+    "Detection User",
+    "Path",
+    "Origin ID",
+    "Origin Name",
+    "Execution ID",
+    "Execution Name",
+    "Type ID",
+    "Type Name",
+    "Pre Execution Status",
+    "Action ID",
+    "Action Name",
+    "Error Code",
+    "Error Description",
+    "Post Clean Status",
+    "Additional Actions ID",
+    "Additional Actions String",
+    "Remediation User",
+    "Security intelligence Version",
+    "Engine Version"; aliases: "ProcessName", "SourceName", "ThreatName"; unreleased: "Signature", "Filename"
+);
+const WINDOWS_DEFENDER_1121: &[FieldContract] = defender_fields!(
+    "Product Name",
+    "Product Version",
+    "ID",
+    "Detection Time",
+    "User",
+    "Path",
+    "Process Name",
+    "Security intelligence Version",
+    "Engine Version",
+    "RuleType",
+    "Target Commandline",
+    "Parent Commandline",
+    "Involved File",
+    "Inhertiance Flags"; aliases: "ProcessName"
+);
+const WINDOWS_DEFENDER_3002: &[FieldContract] = defender_fields!(
+    "Product Name",
+    "Product Version",
+    "Feature Name",
+    "Reason",
+    "Error Code",
+    "Error Description",
+    "Feature ID"; aliases: "Feature_Name"
+);
+const WINDOWS_DEFENDER_3007: &[FieldContract] = defender_fields!(
+    "Product Name",
+    "Product Version",
+    "Feature Name",
+    "Reason",
+    "Feature ID"; aliases: "Feature_Name"
+);
+const WINDOWS_DEFENDER_5101: &[FieldContract] = defender_fields!(
+    "Product Name",
+    "Product Version",
+    "Error Code",
+    "Error Description"
+);
+
+const WINDOWS_WMI: &[FieldContract] = &[
+    always_value(
+        "Channel",
+        SINCE_WINDOWS_CHANNEL,
+        "Microsoft-Windows-WMI-Activity/Trace",
+    ),
+    conditional(
+        "Operation",
+        SINCE_BASELINE,
+        "the native WMI event family carries an operation",
+    ),
+    conditional(
+        "User",
+        SINCE_BASELINE,
+        "the native WMI event family carries user identity",
+    ),
+    conditional(
+        "Query",
+        SINCE_BASELINE,
+        "the native WMI event family carries a query or command line",
+    ),
+    conditional(
+        "ProcessId",
+        SINCE_BASELINE,
+        "the native WMI event family carries client process identity",
+    ),
+    conditional(
+        "Image",
+        SINCE_BASELINE,
+        "present in the event or derived from the process cache",
+    ),
+    conditional(
+        "EventNamespace",
+        SINCE_BASELINE,
+        "the native WMI event family carries a namespace",
+    ),
+    conditional(
+        "EventType",
+        SINCE_BASELINE,
+        "the native WMI event family carries an event type",
+    ),
+    conditional(
+        "DestinationHostname",
+        SINCE_BASELINE,
+        "the native WMI event family carries a client machine",
+    ),
+];
+
+const WINDOWS_WMI_5857: &[FieldContract] = &[
+    always_value(
+        "Channel",
+        SINCE_WMI_OPERATIONAL,
+        "Microsoft-Windows-WMI-Activity/Operational",
+    ),
+    conditional(
+        "ProviderName",
+        SINCE_WMI_OPERATIONAL,
+        "the provider start record names its provider",
+    ),
+    conditional(
+        "Provider_Name",
+        SINCE_WMI_OPERATIONAL,
+        "alias of the reported provider name",
+    ),
+    conditional(
+        "ProviderPath",
+        SINCE_WMI_OPERATIONAL,
+        "the provider start record names its module",
+    ),
+    conditional(
+        "HostProcess",
+        SINCE_WMI_OPERATIONAL,
+        "the provider start record names its host",
+    ),
+    conditional(
+        "ProcessId",
+        SINCE_WMI_OPERATIONAL,
+        "the provider start record carries a process ID",
+    ),
+    conditional(
+        "ResultCode",
+        SINCE_WMI_OPERATIONAL,
+        "the provider start record carries a result code",
+    ),
+    conditional(
+        "Code",
+        SINCE_WMI_OPERATIONAL,
+        "alias of the provider start result code",
+    ),
+];
+const WINDOWS_WMI_5858: &[FieldContract] = &[
+    always_value(
+        "Channel",
+        SINCE_WMI_OPERATIONAL,
+        "Microsoft-Windows-WMI-Activity/Operational",
+    ),
+    conditional(
+        "Operation",
+        SINCE_WMI_OPERATIONAL,
+        "the failed operation is reported",
+    ),
+    conditional("User", SINCE_WMI_OPERATIONAL, "the client user is reported"),
+    conditional(
+        "ProcessId",
+        SINCE_WMI_OPERATIONAL,
+        "the client process is reported",
+    ),
+    conditional(
+        "DestinationHostname",
+        SINCE_WMI_OPERATIONAL,
+        "the client machine is reported",
+    ),
+    conditional(
+        "Component",
+        SINCE_WMI_OPERATIONAL,
+        "the failing component is reported",
+    ),
+    conditional(
+        "ResultCode",
+        SINCE_WMI_OPERATIONAL,
+        "the failed operation has a result code",
+    ),
+    conditional(
+        "PossibleCause",
+        SINCE_WMI_OPERATIONAL,
+        "the provider reports a possible cause",
+    ),
+];
+const WINDOWS_WMI_5859_5860: &[FieldContract] = &[
+    always_value(
+        "Channel",
+        SINCE_WMI_OPERATIONAL,
+        "Microsoft-Windows-WMI-Activity/Operational",
+    ),
+    conditional(
+        "EventNamespace",
+        SINCE_WMI_OPERATIONAL,
+        "the subscription namespace is reported",
+    ),
+    conditional(
+        "Query",
+        SINCE_WMI_OPERATIONAL,
+        "the subscription query is reported",
+    ),
+    conditional(
+        "User",
+        SINCE_WMI_OPERATIONAL,
+        "the subscriber user is reported",
+    ),
+    conditional(
+        "ProcessId",
+        SINCE_WMI_OPERATIONAL,
+        "the subscriber process is reported",
+    ),
+    conditional(
+        "ProviderName",
+        SINCE_WMI_OPERATIONAL,
+        "event 5859 names its provider",
+    ),
+    conditional(
+        "DestinationHostname",
+        SINCE_WMI_OPERATIONAL,
+        "event 5860 names its machine",
+    ),
+    conditional(
+        "PossibleCause",
+        SINCE_WMI_OPERATIONAL,
+        "the provider reports a possible cause",
+    ),
+];
+const WINDOWS_WMI_5861: &[FieldContract] = &[
+    always_value(
+        "Channel",
+        SINCE_WMI_OPERATIONAL,
+        "Microsoft-Windows-WMI-Activity/Operational",
+    ),
+    conditional(
+        "EventNamespace",
+        SINCE_WMI_OPERATIONAL,
+        "the binding namespace is reported",
+    ),
+    conditional(
+        "FilterName",
+        SINCE_WMI_OPERATIONAL,
+        "the event filter name is reported",
+    ),
+    conditional(
+        "ConsumerClass",
+        SINCE_WMI_OPERATIONAL,
+        "the consumer identity is reported",
+    ),
+    conditional(
+        "ConsumerName",
+        SINCE_WMI_OPERATIONAL,
+        "the consumer identity is reported",
+    ),
+    conditional(
+        "ConsumerText",
+        SINCE_WMI_OPERATIONAL,
+        "the provider includes the consumer definition",
+    ),
+    conditional(
+        "Destination",
+        SINCE_WMI_OPERATIONAL,
+        "the consumer definition carries the command or script",
+    ),
+    conditional(
+        "PossibleCause",
+        SINCE_WMI_OPERATIONAL,
+        "the binding details are reported",
+    ),
+];
+
+const WINDOWS_TASK: &[FieldContract] = &[
+    always_value(
+        "Channel",
+        SINCE_WINDOWS_CHANNEL,
+        "Microsoft-Windows-TaskScheduler/Operational",
+    ),
+    conditional(
+        "TaskName",
+        SINCE_BASELINE,
+        "TaskScheduler event 106 carries a task name",
+    ),
+    conditional(
+        "UserName",
+        SINCE_BASELINE,
+        "TaskScheduler event 106 carries user context",
+    ),
+    never(
+        "TaskContent",
+        SINCE_BASELINE,
+        "TaskScheduler event 106 does not carry the task XML definition",
+    ),
+    never(
+        "User",
+        SINCE_BASELINE,
+        "TaskScheduler event 106 has UserContext, not a Sysmon User field",
+    ),
+    never(
+        "ProcessId",
+        SINCE_BASELINE,
+        "TaskScheduler event 106 does not carry process identity",
+    ),
+    never(
+        "Image",
+        SINCE_BASELINE,
+        "TaskScheduler event 106 does not carry a process image",
+    ),
+];
+
+const WINDOWS_SERVICE: &[FieldContract] = &[
+    always_value("Channel", SINCE_WINDOWS_CHANNEL, "System"),
+    always("Provider_Name", SINCE_1_4_1),
+    always("ServiceName", SINCE_1_4_0),
+    always("ServiceFileName", SINCE_1_4_0),
+    always("ImagePath", SINCE_1_4_1),
+    conditional(
+        "ServiceType",
+        SINCE_1_4_0,
+        "System event 7045 carries a service type",
+    ),
+    conditional(
+        "StartType",
+        SINCE_1_4_0,
+        "System event 7045 carries a start type",
+    ),
+    conditional(
+        "AccountName",
+        SINCE_1_4_0,
+        "System event 7045 carries an account name",
+    ),
+    conditional(
+        "User",
+        SINCE_1_4_0,
+        "the Event Log system header carries a security user ID",
+    ),
+    never(
+        "ProcessId",
+        SINCE_1_4_0,
+        "System event 7045 does not carry process identity",
+    ),
+    never(
+        "Image",
+        SINCE_1_4_0,
+        "System event 7045 does not carry a creating process image",
+    ),
+];
+
+const SECURITY_FIELD_REASON: &str =
+    "the audited event template and host audit policy supply this field";
+
+macro_rules! security_fields {
+    ($($field:literal => $since:expr),+ $(,)?) => {
+        &[
+            always_value("Channel", SINCE_WINDOWS_CHANNEL, "Security"),
+            conditional("SubjectUserSid", SINCE_1_4_1, SECURITY_FIELD_REASON),
+            conditional("SubjectUserName", SINCE_1_4_1, SECURITY_FIELD_REASON),
+            conditional("SubjectDomainName", SINCE_1_4_1, SECURITY_FIELD_REASON),
+            conditional("SubjectLogonId", SINCE_1_4_1, SECURITY_FIELD_REASON),
+            $(conditional($field, $since, SECURITY_FIELD_REASON)),+
+        ]
+    };
+}
+
+/// A Security event family added by #479. The field names are the event
+/// template's own, read from the provider manifest on Windows 11 (all template
+/// versions merged), not from documentation.
+macro_rules! security_family {
+    // The same, for a family added after #479.
+    (long_tail: $($field:literal),+ $(,)?) => {
+        &[
+            always_value("Channel", SINCE_WINDOWS_CHANNEL, "Security"),
+            conditional("SubjectUserSid", SINCE_SECURITY_LONG_TAIL, SECURITY_FIELD_REASON),
+            conditional("SubjectUserName", SINCE_SECURITY_LONG_TAIL, SECURITY_FIELD_REASON),
+            conditional("SubjectDomainName", SINCE_SECURITY_LONG_TAIL, SECURITY_FIELD_REASON),
+            conditional("SubjectLogonId", SINCE_SECURITY_LONG_TAIL, SECURITY_FIELD_REASON),
+            $(conditional($field, SINCE_SECURITY_LONG_TAIL, SECURITY_FIELD_REASON)),+
+        ]
+    };
+    // The same, for the domain-controller families, whose templates open with
+    // the `Subject*` block.
+    (domain_controller_subject: $($field:literal),+ $(,)?) => {
+        &[
+            always_value("Channel", SINCE_WINDOWS_CHANNEL, "Security"),
+            conditional("SubjectUserSid", SINCE_SECURITY_DOMAIN_CONTROLLER, SECURITY_FIELD_REASON),
+            conditional("SubjectUserName", SINCE_SECURITY_DOMAIN_CONTROLLER, SECURITY_FIELD_REASON),
+            conditional("SubjectDomainName", SINCE_SECURITY_DOMAIN_CONTROLLER, SECURITY_FIELD_REASON),
+            conditional("SubjectLogonId", SINCE_SECURITY_DOMAIN_CONTROLLER, SECURITY_FIELD_REASON),
+            $(conditional($field, SINCE_SECURITY_DOMAIN_CONTROLLER, SECURITY_FIELD_REASON)),+
+        ]
+    };
+    // The Kerberos templates name no subject.
+    (domain_controller: $($field:literal),+ $(,)?) => {
+        &[
+            always_value("Channel", SINCE_WINDOWS_CHANNEL, "Security"),
+            $(conditional($field, SINCE_SECURITY_DOMAIN_CONTROLLER, SECURITY_FIELD_REASON)),+
+        ]
+    };
+    // The template opens with the `Subject*` identity block.
+    (subject: $($field:literal),+ $(,)?) => {
+        &[
+            always_value("Channel", SINCE_WINDOWS_CHANNEL, "Security"),
+            conditional("SubjectUserSid", SINCE_SECURITY_FAMILIES, SECURITY_FIELD_REASON),
+            conditional("SubjectUserName", SINCE_SECURITY_FAMILIES, SECURITY_FIELD_REASON),
+            conditional("SubjectDomainName", SINCE_SECURITY_FAMILIES, SECURITY_FIELD_REASON),
+            conditional("SubjectLogonId", SINCE_SECURITY_FAMILIES, SECURITY_FIELD_REASON),
+            $(conditional($field, SINCE_SECURITY_FAMILIES, SECURITY_FIELD_REASON)),+
+        ]
+    };
+    // Credential validation and Windows Filtering Platform templates name no
+    // subject.
+    (no_subject: $($field:literal),+ $(,)?) => {
+        &[
+            always_value("Channel", SINCE_WINDOWS_CHANNEL, "Security"),
+            $(conditional($field, SINCE_SECURITY_FAMILIES, SECURITY_FIELD_REASON)),+
+        ]
+    };
+}
+
+const WINDOWS_SECURITY_4624: &[FieldContract] = security_fields!(
+    "TargetUserSid" => SINCE_1_4_1,
+    "TargetUserName" => SINCE_1_4_1,
+    "TargetDomainName" => SINCE_1_4_1,
+    "TargetLogonId" => SINCE_1_4_1,
+    "LogonType" => SINCE_1_4_1,
+    "LogonProcessName" => SINCE_1_4_1,
+    "AuthenticationPackageName" => SINCE_1_4_1,
+    "WorkstationName" => SINCE_1_4_1,
+    "LogonGuid" => SINCE_1_4_1,
+    "LmPackageName" => SINCE_1_4_1,
+    "KeyLength" => SINCE_1_4_1,
+    "ProcessId" => SINCE_1_4_1,
+    "ProcessName" => SINCE_1_4_1,
+    "IpAddress" => SINCE_1_4_1,
+    "IpPort" => SINCE_1_4_1,
+    "ImpersonationLevel" => SINCE_1_4_1,
+    "RestrictedAdminMode" => SINCE_1_4_1,
+    "TargetOutboundUserName" => SINCE_1_4_1,
+    "TargetOutboundDomainName" => SINCE_1_4_1,
+    "VirtualAccount" => SINCE_1_4_1,
+    "TargetLinkedLogonId" => SINCE_1_4_1,
+    "ElevatedToken" => SINCE_1_4_1,
+);
+const WINDOWS_SECURITY_4656: &[FieldContract] = security_fields!(
+    "ObjectServer" => SINCE_1_4_1,
+    "ObjectType" => SINCE_1_4_1,
+    "ObjectName" => SINCE_1_4_1,
+    "HandleId" => SINCE_1_4_1,
+    "AccessList" => SINCE_1_4_1,
+    "AccessMask" => SINCE_1_4_1,
+    "AccessReason" => SINCE_1_4_1,
+    "PrivilegeList" => SINCE_1_4_1,
+    "ProcessId" => SINCE_1_4_1,
+    "ProcessName" => SINCE_1_4_1,
+);
+const WINDOWS_SECURITY_4663: &[FieldContract] = security_fields!(
+    "ObjectServer" => SINCE_1_4_1,
+    "ObjectType" => SINCE_1_4_1,
+    "ObjectName" => SINCE_1_4_1,
+    "HandleId" => SINCE_1_4_1,
+    "AccessList" => SINCE_1_4_1,
+    "AccessMask" => SINCE_1_4_1,
+    "ProcessId" => SINCE_1_4_1,
+    "ProcessName" => SINCE_1_4_1,
+);
+const WINDOWS_SECURITY_4697: &[FieldContract] = security_fields!(
+    "ServiceName" => SINCE_1_4_1,
+    "ServiceFileName" => SINCE_1_4_1,
+    "ServiceType" => SINCE_1_4_1,
+    "ServiceStartType" => SINCE_1_4_1,
+    "ServiceAccount" => SINCE_1_4_1,
+);
+const WINDOWS_SECURITY_5136: &[FieldContract] = security_fields!(
+    "DSName" => SINCE_1_4_1,
+    "DSType" => SINCE_1_4_1,
+    "ObjectDN" => SINCE_1_4_1,
+    "ObjectGUID" => SINCE_1_4_1,
+    "ObjectClass" => SINCE_1_4_1,
+    "AttributeLDAPDisplayName" => SINCE_1_4_1,
+    "AttributeSyntaxOID" => SINCE_1_4_1,
+    "AttributeValue" => SINCE_1_4_1,
+    "OperationType" => SINCE_1_4_1,
+);
+const WINDOWS_SECURITY_5145: &[FieldContract] = security_fields!(
+    "ObjectType" => SINCE_1_4_1,
+    "IpAddress" => SINCE_1_4_1,
+    "IpPort" => SINCE_1_4_1,
+    "ShareName" => SINCE_1_4_1,
+    "ShareLocalPath" => SINCE_1_4_1,
+    "RelativeTargetName" => SINCE_1_4_1,
+    "AccessMask" => SINCE_1_4_1,
+    "AccessList" => SINCE_1_4_1,
+    "AccessReason" => SINCE_1_4_1,
+);
+
+// Logon failure and explicit credentials.
+const WINDOWS_SECURITY_4625: &[FieldContract] = security_family!(subject:
+    "TargetUserSid", "TargetUserName", "TargetDomainName", "Status", "FailureReason",
+    "SubStatus", "LogonType", "LogonProcessName", "AuthenticationPackageName",
+    "WorkstationName", "TransmittedServices", "LmPackageName", "KeyLength", "ProcessId",
+    "ProcessName", "IpAddress", "IpPort",
+);
+const WINDOWS_SECURITY_4648: &[FieldContract] = security_family!(subject:
+    "LogonGuid", "TargetUserName", "TargetDomainName", "TargetLogonGuid", "TargetServerName",
+    "TargetInfo", "ProcessId", "ProcessName", "IpAddress", "IpPort",
+);
+const WINDOWS_SECURITY_4771: &[FieldContract] = security_family!(no_subject:
+    "TargetUserName", "TargetSid", "ServiceName", "TicketOptions", "Status", "PreAuthType",
+    "IpAddress", "IpPort", "CertIssuerName", "CertSerialNumber", "CertThumbprint",
+);
+const WINDOWS_SECURITY_4776: &[FieldContract] = security_family!(no_subject:
+    "PackageName", "TargetUserName", "Workstation", "Status",
+);
+
+// Registry value modification.
+const WINDOWS_SECURITY_4657: &[FieldContract] = security_family!(subject:
+    "ObjectName", "ObjectValueName", "HandleId", "OperationType", "OldValueType", "OldValue",
+    "NewValueType", "NewValue", "ProcessId", "ProcessName",
+);
+
+// Scheduled tasks. 4702 carries the new definition as `TaskContentNew`.
+const WINDOWS_SECURITY_TASK: &[FieldContract] = security_family!(subject:
+    "TaskName", "TaskContent", "ClientProcessStartKey", "ClientProcessId", "ParentProcessId",
+    "RpcCallClientLocality", "FQDN",
+);
+const WINDOWS_SECURITY_4702: &[FieldContract] = security_family!(subject:
+    "TaskName", "TaskContentNew", "ClientProcessStartKey", "ClientProcessId", "ParentProcessId",
+    "RpcCallClientLocality", "FQDN",
+);
+
+// Audit and log tampering. 1102 is written to the Security channel by the
+// Event Log service itself, under its own provider.
+const WINDOWS_SECURITY_1102: &[FieldContract] = &[
+    always_value("Channel", SINCE_WINDOWS_CHANNEL, "Security"),
+    always("Provider_Name", SINCE_SECURITY_FAMILIES),
+    conditional(
+        "SubjectUserSid",
+        SINCE_SECURITY_FAMILIES,
+        SECURITY_FIELD_REASON,
+    ),
+    conditional(
+        "SubjectUserName",
+        SINCE_SECURITY_FAMILIES,
+        SECURITY_FIELD_REASON,
+    ),
+    conditional(
+        "SubjectDomainName",
+        SINCE_SECURITY_FAMILIES,
+        SECURITY_FIELD_REASON,
+    ),
+    conditional(
+        "SubjectLogonId",
+        SINCE_SECURITY_FAMILIES,
+        SECURITY_FIELD_REASON,
+    ),
+    conditional(
+        "ClientProcessId",
+        SINCE_SECURITY_FAMILIES,
+        SECURITY_FIELD_REASON,
+    ),
+    conditional(
+        "ClientProcessStartKey",
+        SINCE_SECURITY_FAMILIES,
+        SECURITY_FIELD_REASON,
+    ),
+];
+const WINDOWS_SECURITY_4719: &[FieldContract] = security_family!(subject:
+    "CategoryId", "SubcategoryId", "SubcategoryGuid", "AuditPolicyChanges", "ClientProcessId",
+    "ClientProcessStartKey",
+);
+const WINDOWS_SECURITY_4817: &[FieldContract] = security_family!(subject:
+    "ObjectServer", "ObjectType", "ObjectName", "OldSd", "NewSd",
+);
+
+// Account management.
+const WINDOWS_SECURITY_USER_ACCOUNT: &[FieldContract] = security_family!(subject:
+    "TargetUserName", "TargetDomainName", "TargetSid", "PrivilegeList", "SamAccountName",
+    "DisplayName", "UserPrincipalName", "HomeDirectory", "HomePath", "ScriptPath",
+    "ProfilePath", "UserWorkstations", "PasswordLastSet", "AccountExpires", "PrimaryGroupId",
+    "AllowedToDelegateTo", "OldUacValue", "NewUacValue", "UserAccountControl",
+    "UserParameters", "SidHistory", "LogonHours",
+);
+const WINDOWS_SECURITY_4741: &[FieldContract] = security_family!(subject:
+    "TargetUserName", "TargetDomainName", "TargetSid", "PrivilegeList", "SamAccountName",
+    "DisplayName", "UserPrincipalName", "HomeDirectory", "HomePath", "ScriptPath",
+    "ProfilePath", "UserWorkstations", "PasswordLastSet", "AccountExpires", "PrimaryGroupId",
+    "AllowedToDelegateTo", "OldUacValue", "NewUacValue", "UserAccountControl",
+    "UserParameters", "SidHistory", "LogonHours", "DnsHostName", "ServicePrincipalNames",
+);
+const WINDOWS_SECURITY_ACCOUNT_TARGET: &[FieldContract] = security_family!(subject:
+    "TargetUserName", "TargetDomainName", "TargetSid",
+);
+const WINDOWS_SECURITY_ACCOUNT_REMOVED: &[FieldContract] = security_family!(subject:
+    "TargetUserName", "TargetDomainName", "TargetSid", "PrivilegeList",
+);
+const WINDOWS_SECURITY_GROUP_MEMBER_ADDED: &[FieldContract] = security_family!(subject:
+    "MemberName", "MemberSid", "TargetUserName", "TargetDomainName", "TargetSid",
+    "PrivilegeList", "MembershipExpirationTime",
+);
+// Account lockout and the gated long tail (#805).
+const WINDOWS_SECURITY_4740: &[FieldContract] = security_family!(long_tail:
+    "TargetUserName", "TargetDomainName", "TargetSid", "CallerComputerName",
+);
+const WINDOWS_SECURITY_4672: &[FieldContract] = security_family!(long_tail:
+    "PrivilegeList",
+);
+const WINDOWS_SECURITY_4799: &[FieldContract] = security_family!(long_tail:
+    "TargetUserName", "TargetDomainName", "TargetSid", "CallerProcessId", "CallerProcessName",
+);
+const WINDOWS_SECURITY_5140: &[FieldContract] = security_family!(long_tail:
+    "ObjectType", "IpAddress", "IpPort", "ShareName", "ShareLocalPath", "AccessMask",
+    "AccessList",
+);
+// The domain-controller family (#544) and Credential Manager reads. The field
+// names are the templates' own, read from the provider manifest on Windows 11.
+const WINDOWS_SECURITY_4768: &[FieldContract] = security_family!(domain_controller:
+    "TargetUserName", "TargetDomainName", "TargetSid", "ServiceName", "ServiceSid",
+    "TicketOptions", "Status", "TicketEncryptionType", "PreAuthType", "IpAddress", "IpPort",
+    "CertIssuerName", "CertSerialNumber", "CertThumbprint", "ResponseTicket",
+    "AccountSupportedEncryptionTypes", "AccountAvailableKeys",
+    "ServiceSupportedEncryptionTypes", "ServiceAvailableKeys", "DCSupportedEncryptionTypes",
+    "DCAvailableKeys", "ClientAdvertizedEncryptionTypes", "SessionKeyEncryptionType",
+    "PreAuthEncryptionType",
+);
+const WINDOWS_SECURITY_4769: &[FieldContract] = security_family!(domain_controller:
+    "TargetUserName", "TargetDomainName", "ServiceName", "ServiceSid", "TicketOptions",
+    "TicketEncryptionType", "IpAddress", "IpPort", "Status", "LogonGuid", "TransmittedServices",
+    "RequestTicketHash", "ResponseTicketHash", "AccountSupportedEncryptionTypes",
+    "AccountAvailableKeys", "ServiceSupportedEncryptionTypes", "ServiceAvailableKeys",
+    "DCSupportedEncryptionTypes", "DCAvailableKeys", "ClientAdvertizedEncryptionTypes",
+    "SessionKeyEncryptionType",
+);
+const WINDOWS_SECURITY_4662: &[FieldContract] = security_family!(domain_controller_subject:
+    "ObjectServer", "ObjectType", "ObjectName", "OperationType", "HandleId", "AccessList",
+    "AccessMask", "Properties", "AdditionalInfo", "AdditionalInfo2",
+);
+const WINDOWS_SECURITY_4742: &[FieldContract] = security_family!(domain_controller_subject:
+    "ComputerAccountChange", "TargetUserName", "TargetDomainName", "TargetSid", "PrivilegeList",
+    "SamAccountName", "DisplayName", "UserPrincipalName", "HomeDirectory", "HomePath",
+    "ScriptPath", "ProfilePath", "UserWorkstations", "PasswordLastSet", "AccountExpires",
+    "PrimaryGroupId", "AllowedToDelegateTo", "OldUacValue", "NewUacValue", "UserAccountControl",
+    "UserParameters", "SidHistory", "LogonHours", "DnsHostName", "ServicePrincipalNames",
+);
+const WINDOWS_SECURITY_4661: &[FieldContract] = security_family!(domain_controller_subject:
+    "ObjectServer", "ObjectType", "ObjectName", "HandleId", "TransactionId", "AccessList",
+    "AccessMask", "PrivilegeList", "Properties", "RestrictedSidCount", "ProcessId", "ProcessName",
+    "AccessReason",
+);
+const WINDOWS_SECURITY_4673: &[FieldContract] = security_family!(domain_controller_subject:
+    "ObjectServer", "Service", "PrivilegeList", "ProcessId", "ProcessName",
+);
+const WINDOWS_SECURITY_5137: &[FieldContract] = security_family!(domain_controller_subject:
+    "OpCorrelationID", "AppCorrelationID", "DSName", "DSType", "ObjectDN", "ObjectGUID",
+    "ObjectClass",
+);
+const WINDOWS_SECURITY_5141: &[FieldContract] = security_family!(domain_controller_subject:
+    "OpCorrelationID", "AppCorrelationID", "DSName", "DSType", "ObjectDN", "ObjectGUID",
+    "ObjectClass", "TreeDelete",
+);
+const WINDOWS_SECURITY_5379: &[FieldContract] = security_family!(domain_controller_subject:
+    "TargetName", "Type", "CountOfCredentialsReturned", "ReadOperation", "ReturnCode",
+    "ProcessCreationTime", "ClientProcessId",
+);
+const WINDOWS_SECURITY_4765: &[FieldContract] = security_family!(subject:
+    "SourceUserName", "SourceSid", "TargetUserName", "TargetDomainName", "TargetSid",
+    "PrivilegeList", "SidList",
+);
+const WINDOWS_SECURITY_4766: &[FieldContract] = security_family!(subject:
+    "SourceUserName", "TargetUserName", "TargetDomainName", "TargetSid", "PrivilegeList",
+);
+const WINDOWS_SECURITY_4781: &[FieldContract] = security_family!(subject:
+    "OldTargetUserName", "NewTargetUserName", "TargetDomainName", "TargetSid", "PrivilegeList",
+);
+const WINDOWS_SECURITY_4794: &[FieldContract] = security_family!(subject:
+    "Workstation", "Status",
+);
+
+// Windows Filtering Platform and Plug and Play. The connection templates
+// changed the process ID's spelling between versions (`ProcessID` in v0 and
+// v2, `ProcessId` in v1), so both are allowed and rules see whichever the
+// host writes.
+const WINDOWS_SECURITY_WFP_CONNECTION: &[FieldContract] = security_family!(no_subject:
+    "ProcessID", "ProcessId", "Application", "Direction", "SourceAddress", "SourcePort",
+    "DestAddress", "DestPort", "Protocol", "InterfaceIndex", "FilterName", "FilterOrigin",
+    "FilterRTID", "LayerName", "LayerRTID", "SublayerInformation", "RemoteUserID",
+    "RemoteMachineID", "OriginalProfile", "CurrentProfile", "IsLoopback",
+    "HasRemoteDynamicKeywordAddress", "FilterAction",
+);
+const WINDOWS_SECURITY_5152: &[FieldContract] = security_family!(no_subject:
+    "ProcessId", "Application", "Direction", "SourceAddress", "SourcePort", "DestAddress",
+    "DestPort", "Protocol", "FilterName", "FilterOrigin", "FilterRTID", "LayerName",
+    "LayerRTID", "SublayerInformation", "FilterAction",
+);
+const WINDOWS_SECURITY_5447: &[FieldContract] = security_family!(no_subject:
+    "ProcessId", "UserSid", "UserName", "ProviderKey", "ProviderName", "ChangeType",
+    "FilterKey", "FilterName", "FilterType", "FilterId", "LayerKey", "LayerName", "LayerId",
+    "Weight", "Conditions", "Action", "CalloutKey", "CalloutName",
+);
+const WINDOWS_SECURITY_6416: &[FieldContract] = security_family!(subject:
+    "DeviceId", "DeviceDescription", "ClassId", "ClassName", "VendorIds", "CompatibleIds",
+    "LocationInformation",
+);
+
+const WINDOWS_APPLICATION: &[FieldContract] = &[
+    always_value("Channel", SINCE_APPLICATION, "Application"),
+    always("Provider_Name", SINCE_APPLICATION),
+    always("Level", SINCE_APPLICATION),
+    conditional(
+        "Data",
+        SINCE_APPLICATION,
+        "the event has non-empty EventData values",
+    ),
+    never(
+        "Message",
+        SINCE_APPLICATION,
+        "formatted, localized messages are not rendered by the XML subscription",
+    ),
+];
+
+const WINDOWS_APPLICATION_ERROR: &[FieldContract] = &[
+    always_value("Channel", SINCE_APPLICATION, "Application"),
+    always("Provider_Name", SINCE_APPLICATION),
+    always("Level", SINCE_APPLICATION),
+    conditional(
+        "Data",
+        SINCE_APPLICATION,
+        "the event has non-empty EventData values",
+    ),
+    conditional(
+        "AppName",
+        SINCE_APPLICATION,
+        "Application Error event 1000 supplies the first positional value",
+    ),
+    conditional(
+        "AppVersion",
+        SINCE_APPLICATION,
+        "Application Error event 1000 supplies the second positional value",
+    ),
+    conditional(
+        "ModuleName",
+        SINCE_APPLICATION,
+        "Application Error event 1000 supplies the fourth positional value",
+    ),
+    conditional(
+        "ExceptionCode",
+        SINCE_APPLICATION,
+        "Application Error event 1000 supplies the seventh positional value",
+    ),
+    never(
+        "Message",
+        SINCE_APPLICATION,
+        "formatted, localized messages are not rendered by the XML subscription",
+    ),
+];
+
+const LINUX_PROCESS: &[FieldContract] = &[
+    always("Image", SINCE_BASELINE),
+    always("ImageSource", SINCE_1_6_0),
+    always("ProcessId", SINCE_BASELINE),
+    always("RealUserId", SINCE_1_6_0),
+    always("RealGroupId", SINCE_1_6_0),
+    conditional(
+        "EffectiveUserId",
+        SINCE_1_6_0,
+        "runtime BTF resolves this field and the kernel read succeeds",
+    ),
+    conditional(
+        "EffectiveGroupId",
+        SINCE_1_6_0,
+        "runtime BTF resolves this field and the kernel read succeeds",
+    ),
+    conditional(
+        "MountNamespace",
+        SINCE_1_6_0,
+        "runtime BTF resolves this field and the kernel read succeeds",
+    ),
+    conditional(
+        "PidNamespace",
+        SINCE_1_6_0,
+        "runtime BTF resolves this field and the kernel read succeeds",
+    ),
+    conditional(
+        "NetworkNamespace",
+        SINCE_1_6_0,
+        "runtime BTF resolves this field and the kernel read succeeds",
+    ),
+    conditional(
+        "SessionId",
+        SINCE_1_6_0,
+        "runtime BTF resolves this field and the kernel read succeeds",
+    ),
+    conditional(
+        "KernelStartBoottime",
+        SINCE_1_6_0,
+        "runtime BTF resolves this field and the kernel read succeeds",
+    ),
+    conditional(
+        "ControllingTty",
+        SINCE_1_6_0,
+        "runtime BTF resolves terminal fields and the process has a controlling terminal",
+    ),
+    conditional(
+        "User",
+        SINCE_1_6_0,
+        "runtime BTF resolves effective credentials and the kernel read succeeds",
+    ),
+    conditional(
+        "ImageTruncated",
+        SINCE_1_6_0,
+        "the raw exec filename exceeded the kernel capture buffer",
+    ),
+    conditional(
+        "CommandLine",
+        SINCE_BASELINE,
+        "kernel argv capture or the live /proc entry is available",
+    ),
+    conditional(
+        "ParentProcessId",
+        SINCE_BASELINE,
+        "the live /proc entry is available",
+    ),
+    conditional(
+        "ParentImage",
+        SINCE_BASELINE,
+        "measured at fork or available from process state",
+    ),
+    conditional(
+        "ParentCommandLine",
+        SINCE_BASELINE,
+        "measured at fork or available from process state",
+    ),
+    conditional(
+        "CurrentDirectory",
+        SINCE_PROCESS_PATH_ENRICHMENT,
+        "the live /proc entry and BTF process identity remain available during downstream enrichment",
+    ),
+    conditional(
+        "CgroupId",
+        SINCE_BASELINE,
+        "the kernel reports a non-zero cgroup identifier at exec time",
+    ),
+    conditional(
+        "CgroupPath",
+        SINCE_CONTAINER_CONTEXT,
+        "the host mounts cgroup2 and the cgroup still exists when the event is enriched",
+    ),
+    conditional(
+        "ContainerId",
+        SINCE_CONTAINER_CONTEXT,
+        "the cgroup path names a recognized container layout",
+    ),
+    conditional(
+        "ContainerRuntime",
+        SINCE_CONTAINER_CONTEXT,
+        "ContainerId is present and its cgroup layout names the runtime",
+    ),
+    never(
+        "OriginalFileName",
+        SINCE_BASELINE,
+        "PE version resources are Windows-only",
+    ),
+    never(
+        "Product",
+        SINCE_BASELINE,
+        "PE version resources are Windows-only",
+    ),
+    never(
+        "Description",
+        SINCE_BASELINE,
+        "PE version resources are Windows-only",
+    ),
+    never(
+        "Company",
+        SINCE_BASELINE,
+        "PE version resources are Windows-only",
+    ),
+    never(
+        "FileVersion",
+        SINCE_BASELINE,
+        "PE version resources are Windows-only",
+    ),
+    never(
+        "IntegrityLevel",
+        SINCE_BASELINE,
+        "Windows integrity levels do not exist on Linux",
+    ),
+    conditional(
+        "LogonId",
+        Some("1.11.0"),
+        "the audit login UID from /proc/<pid>/loginuid, read under the same identity check as CurrentDirectory; 4294967295 means the process has no login session",
+    ),
+    never(
+        "TargetImage",
+        SINCE_BASELINE,
+        "a process-creation event has no target process",
+    ),
+];
+
+const LINUX_NETWORK: &[FieldContract] = &[
+    always("DestinationIp", SINCE_BASELINE),
+    always("DestinationPort", SINCE_BASELINE),
+    always("ProcessId", SINCE_BASELINE),
+    conditional(
+        "User",
+        SINCE_1_6_0,
+        "runtime BTF resolves effective credentials and the kernel read succeeds",
+    ),
+    always("Initiated", SINCE_1_4_1),
+    conditional(
+        "Protocol",
+        SINCE_BASELINE,
+        "the socket fexit tier is active and sk_protocol names TCP or UDP",
+    ),
+    conditional(
+        "Image",
+        SINCE_BASELINE,
+        "the process identity is still present in the process cache",
+    ),
+    conditional(
+        "DestinationHostname",
+        SINCE_BASELINE,
+        "a preceding observed DNS answer resolves the destination",
+    ),
+    conditional(
+        "SourceIp",
+        SINCE_1_6_0,
+        "the socket fexit tier measures the bound source address",
+    ),
+    conditional(
+        "SourcePort",
+        SINCE_1_6_0,
+        "the socket fexit tier measures the bound source port",
+    ),
+];
+
+const LINUX_FILE: &[FieldContract] = &[
+    always("TargetFilename", SINCE_BASELINE),
+    always("ProcessId", SINCE_BASELINE),
+    conditional(
+        "User",
+        SINCE_1_6_0,
+        "runtime BTF resolves effective credentials and the kernel read succeeds",
+    ),
+    conditional(
+        "SourceFilename",
+        SINCE_BASELINE,
+        "the action is rename and the old path can be resolved",
+    ),
+    conditional(
+        "Image",
+        SINCE_BASELINE,
+        "the process identity is still present in the process cache",
+    ),
+    conditional(
+        "PathTruncated",
+        SINCE_BASELINE,
+        "the kernel path buffer truncated a source or target",
+    ),
+    never(
+        "CreationUtcTime",
+        SINCE_BASELINE,
+        "the eBPF file probes do not read file timestamps",
+    ),
+    never(
+        "PreviousCreationUtcTime",
+        SINCE_BASELINE,
+        "the eBPF file probes do not read file timestamps",
+    ),
+];
+
+const LINUX_DNS: &[FieldContract] = &[
+    conditional(
+        "QueryTruncated",
+        SINCE_DNS_TRUNCATION,
+        "the message was longer than the sensor's 512-byte capture and ended inside the name",
+    ),
+    always("RecordType", SINCE_BASELINE),
+    always("ProcessId", SINCE_BASELINE),
+    conditional(
+        "QueryName",
+        SINCE_BASELINE,
+        "the DNS question can be parsed",
+    ),
+    conditional(
+        "QueryRegisteredDomain",
+        SINCE_DNS_DERIVED,
+        "derived read-only from QueryName: the public-suffix registered domain of QueryName; absent for a bare suffix or an unlisted suffix; absent when the question cannot be parsed, which drops names with a label over 63 bytes; absent when QueryTruncated is true",
+    ),
+    conditional(
+        "QueryLabelCount",
+        SINCE_DNS_DERIVED,
+        "derived read-only from QueryName: the label count of QueryName; absent when the question cannot be parsed, which drops names with a label over 63 bytes; absent when QueryTruncated is true",
+    ),
+    conditional(
+        "QueryLongestLabel",
+        SINCE_DNS_DERIVED,
+        "derived read-only from QueryName: the longest label length of QueryName in bytes; absent when the question cannot be parsed, which drops names with a label over 63 bytes; absent when QueryTruncated is true",
+    ),
+    conditional(
+        "QueryNameLength",
+        SINCE_DNS_DERIVED,
+        "derived read-only from QueryName: the length of QueryName in bytes; absent when the question cannot be parsed, which drops names with a label over 63 bytes; absent when QueryTruncated is true",
+    ),
+    conditional(
+        "QueryResults",
+        SINCE_DNS_RESPONSES,
+        "the event is a response carrying A, AAAA, or CNAME answers",
+    ),
+    conditional(
+        "Image",
+        SINCE_BASELINE,
+        "the process identity is still present in the process cache",
+    ),
+    conditional(
+        "QueryStatus",
+        SINCE_DNS_RESPONSES,
+        "the event is a response; the value is the DNS RCODE",
+    ),
+];
+
+const MACOS_PROCESS: &[FieldContract] = &[
+    always("Image", SINCE_1_1_0),
+    always("ProcessId", SINCE_1_1_0),
+    always("ProcessStartTime", SINCE_1_1_0),
+    always("User", SINCE_1_1_0),
+    conditional(
+        "CommandLine",
+        SINCE_1_1_0,
+        "ESF supplies at least one exec argument",
+    ),
+    conditional("ParentProcessId", SINCE_1_1_0, "the parent PID is non-zero"),
+    conditional(
+        "ParentImage",
+        SINCE_1_1_0,
+        "derived from the process cache by an observed stable parent identity",
+    ),
+    conditional(
+        "ParentCommandLine",
+        SINCE_1_6_0,
+        "the stable parent identity resolves to a cached command line",
+    ),
+    always("RealUserId", SINCE_1_6_0),
+    always("Signed", SINCE_1_6_0),
+    always("SignatureStatus", SINCE_1_6_0),
+    always("CodeSigningFlags", SINCE_1_6_0),
+    always("IsPlatformBinary", SINCE_1_6_0),
+    conditional(
+        "PreExecImage",
+        SINCE_1_6_0,
+        "ESF supplies a non-empty acting process executable path",
+    ),
+    conditional(
+        "Script",
+        SINCE_1_6_0,
+        "message version 2+ supplies a script for direct shebang execution",
+    ),
+    conditional(
+        "SigningId",
+        SINCE_1_6_0,
+        "ESF supplies a non-empty signing identifier",
+    ),
+    conditional(
+        "TeamId",
+        SINCE_1_6_0,
+        "ESF supplies a non-empty signing team identifier",
+    ),
+    conditional(
+        "CdHash",
+        SINCE_1_6_0,
+        "the executable has the CS_SIGNED flag",
+    ),
+    conditional(
+        "CurrentDirectory",
+        SINCE_1_1_0,
+        "ESF supplies an exec working directory",
+    ),
+    never(
+        "CgroupId",
+        SINCE_1_1_0,
+        "macOS process events do not have a Linux kernel cgroup identifier",
+    ),
+    never(
+        "ImageSource",
+        SINCE_1_6_0,
+        "ESF supplies the executable path directly",
+    ),
+    never(
+        "ImageTruncated",
+        SINCE_1_6_0,
+        "ESF does not use the Linux raw-image buffer",
+    ),
+    never(
+        "IntegrityLevel",
+        SINCE_1_4_1,
+        "Windows integrity levels do not exist on macOS",
+    ),
+    never(
+        "LogonId",
+        Some("1.11.0"),
+        "Endpoint Security exec events do not carry a logon session",
+    ),
+    never(
+        "TargetImage",
+        SINCE_1_1_0,
+        "a process-creation event has no target process",
+    ),
+    never(
+        "OriginalFileName",
+        SINCE_1_1_0,
+        "PE version resources are Windows-only",
+    ),
+    never(
+        "Product",
+        SINCE_1_1_0,
+        "PE version resources are Windows-only",
+    ),
+    never(
+        "Description",
+        SINCE_1_1_0,
+        "PE version resources are Windows-only",
+    ),
+    never(
+        "Company",
+        SINCE_1_4_1,
+        "PE version resources are Windows-only",
+    ),
+    never(
+        "FileVersion",
+        SINCE_1_4_1,
+        "PE version resources are Windows-only",
+    ),
+];
+
+const MACOS_FILE: &[FieldContract] = &[
+    always("TargetFilename", SINCE_1_1_0),
+    always("ProcessId", SINCE_1_1_0),
+    always("User", SINCE_1_1_0),
+    conditional("SourceFilename", SINCE_1_1_0, "the ESF action is a rename"),
+    conditional(
+        "Image",
+        SINCE_1_1_0,
+        "ESF supplies the acting process executable path",
+    ),
+    never(
+        "CreationUtcTime",
+        SINCE_1_1_0,
+        "ESF file notifications do not carry file timestamps",
+    ),
+    never(
+        "PreviousCreationUtcTime",
+        SINCE_1_1_0,
+        "ESF file notifications do not carry file timestamps",
+    ),
+    never(
+        "PathTruncated",
+        SINCE_1_1_0,
+        "ESF paths are not copied through a fixed Rustinel buffer",
+    ),
+];
+
+const MACOS_NETWORK: &[FieldContract] = &[
+    always("DestinationIp", SINCE_1_1_0),
+    always("SourceIp", SINCE_1_1_0),
+    always("DestinationPort", SINCE_1_1_0),
+    always("SourcePort", SINCE_1_1_0),
+    always("Protocol", SINCE_1_1_0),
+    conditional(
+        "ProcessId",
+        SINCE_1_1_0,
+        "bounded socket-inventory attribution finds the owner",
+    ),
+    conditional(
+        "Image",
+        SINCE_1_1_0,
+        "bounded socket-inventory attribution finds the owner",
+    ),
+    conditional(
+        "DestinationHostname",
+        SINCE_1_1_0,
+        "a preceding observed DNS answer resolves the destination",
+    ),
+    never(
+        "User",
+        SINCE_1_1_0,
+        "BPF packets do not carry process user identity",
+    ),
+    never(
+        "Initiated",
+        SINCE_1_4_1,
+        "a wire capture cannot determine whether the local host initiated the flow",
+    ),
+];
+
+const MACOS_DNS: &[FieldContract] = &[
+    never(
+        "QueryTruncated",
+        SINCE_DNS_TRUNCATION,
+        "the BPF DNS path parses one packet and drops a question it cannot finish",
+    ),
+    always("QueryName", SINCE_1_1_0),
+    conditional(
+        "RecordType",
+        SINCE_1_1_0,
+        "the DNS qtype has a known Sysmon-compatible name",
+    ),
+    conditional(
+        "QueryRegisteredDomain",
+        SINCE_DNS_DERIVED,
+        "derived read-only from QueryName: the public-suffix registered domain of QueryName; absent for a bare suffix or an unlisted suffix",
+    ),
+    conditional(
+        "QueryLabelCount",
+        SINCE_DNS_DERIVED,
+        "derived read-only from QueryName: the label count of QueryName",
+    ),
+    conditional(
+        "QueryLongestLabel",
+        SINCE_DNS_DERIVED,
+        "derived read-only from QueryName: the longest label length of QueryName in bytes",
+    ),
+    conditional(
+        "QueryNameLength",
+        SINCE_DNS_DERIVED,
+        "derived read-only from QueryName: the length of QueryName in bytes",
+    ),
+    never(
+        "QueryResults",
+        SINCE_1_1_0,
+        "the BPF DNS path emits queries, not responses",
+    ),
+    never(
+        "QueryStatus",
+        SINCE_1_1_0,
+        "the BPF DNS path emits queries, not responses",
+    ),
+    conditional(
+        "ProcessId",
+        SINCE_1_7_0,
+        "bounded socket-inventory attribution finds the owner",
+    ),
+    conditional(
+        "Image",
+        SINCE_1_7_0,
+        "bounded socket-inventory attribution finds the owner and executable path",
+    ),
+];
+
+const PIPE_CREATED: &[FieldContract] = &[never(
+    "*", SINCE_BASELINE,
+    "named-pipe activity is not carried by Microsoft-Windows-Kernel-File and is not available from ETW",
+)];
+
+const CREATE_REMOTE_THREAD: &[FieldContract] = &[never(
+    "*",
+    SINCE_BASELINE,
+    "no Rustinel sensor produces remote-thread creation telemetry",
+)];
+
+/// The auditd view (#321). Linux eBPF telemetry stands for the audit records
+/// auditd would write; nothing here is read from auditd.
+const SINCE_AUDITD_VIEW: Option<&str> = Some("1.11.0");
+
+const AUDIT_NO_KEY: &str = "an audit key is a label an operator configures on an audit rule; it is not a fact about the event, so the view never manufactures one";
+const AUDIT_NO_UNIT: &str =
+    "no Rustinel sensor produces service start or stop records, which carry `unit`";
+const AUDIT_ARGV: &str = "the kernel argv snapshot joined this exec and holds that many arguments; capture stops at 32 arguments, 128 bytes each and 512 bytes in all";
+
+macro_rules! audit_argv {
+    ($index:literal) => {
+        conditional(concat!("a", $index), SINCE_AUDITD_VIEW, AUDIT_ARGV)
+    };
+}
+
+const AUDITD_PROCESS: &[FieldContract] = &[
+    always_values(
+        "type",
+        SINCE_AUDITD_VIEW,
+        &["SYSCALL", "EXECVE", "PATH"],
+    ),
+    conditional_values(
+        "SYSCALL",
+        SINCE_AUDITD_VIEW,
+        &["execve", "execveat"],
+        "the argv snapshot taken at syscall entry named the entry point; absent when no snapshot was joined",
+    ),
+    audit_argv!("0"),
+    audit_argv!("1"),
+    audit_argv!("2"),
+    audit_argv!("3"),
+    audit_argv!("4"),
+    audit_argv!("5"),
+    audit_argv!("6"),
+    audit_argv!("7"),
+    conditional(
+        "comm",
+        SINCE_AUDITD_VIEW,
+        "the kernel supplied a non-empty task name",
+    ),
+    conditional(
+        "euid",
+        SINCE_AUDITD_VIEW,
+        "runtime BTF resolves effective credentials and the kernel read succeeds",
+    ),
+    always("exe", SINCE_AUDITD_VIEW),
+    always("name", SINCE_AUDITD_VIEW),
+    never(
+        "nametype",
+        SINCE_AUDITD_VIEW,
+        "exec telemetry does not model per-path name types",
+    ),
+    never("key", SINCE_AUDITD_VIEW, AUDIT_NO_KEY),
+    never("unit", SINCE_AUDITD_VIEW, AUDIT_NO_UNIT),
+];
+
+macro_rules! auditd_file_fields {
+    ($name:ident, $nametype:expr) => {
+        const $name: &[FieldContract] = &[
+            always_values("type", SINCE_AUDITD_VIEW, &["SYSCALL", "PATH"]),
+            never(
+                "SYSCALL",
+                SINCE_AUDITD_VIEW,
+                "the eBPF file probes do not retain which syscall produced the event",
+            ),
+            never(
+                "a0",
+                SINCE_AUDITD_VIEW,
+                "raw syscall arguments are not captured for file events",
+            ),
+            never(
+                "a1",
+                SINCE_AUDITD_VIEW,
+                "raw syscall arguments are not captured for file events",
+            ),
+            never(
+                "a2",
+                SINCE_AUDITD_VIEW,
+                "raw syscall arguments are not captured for file events",
+            ),
+            never(
+                "a3",
+                SINCE_AUDITD_VIEW,
+                "raw syscall arguments are not captured for file events",
+            ),
+            never(
+                "a4",
+                SINCE_AUDITD_VIEW,
+                "raw syscall arguments are not captured for file events",
+            ),
+            never(
+                "a5",
+                SINCE_AUDITD_VIEW,
+                "raw syscall arguments are not captured for file events",
+            ),
+            never(
+                "a6",
+                SINCE_AUDITD_VIEW,
+                "raw syscall arguments are not captured for file events",
+            ),
+            never(
+                "a7",
+                SINCE_AUDITD_VIEW,
+                "raw syscall arguments are not captured for file events",
+            ),
+            conditional(
+                "comm",
+                SINCE_AUDITD_VIEW,
+                "the process is still present in the process cache",
+            ),
+            conditional(
+                "euid",
+                SINCE_AUDITD_VIEW,
+                "runtime BTF resolves effective credentials and the kernel read succeeds",
+            ),
+            conditional(
+                "exe",
+                SINCE_AUDITD_VIEW,
+                "the process identity is still present in the process cache",
+            ),
+            always("name", SINCE_AUDITD_VIEW),
+            always_values("nametype", SINCE_AUDITD_VIEW, $nametype),
+            never("key", SINCE_AUDITD_VIEW, AUDIT_NO_KEY),
+            never("unit", SINCE_AUDITD_VIEW, AUDIT_NO_UNIT),
+        ];
+    };
+}
+
+auditd_file_fields!(AUDITD_FILE_CREATE, &["CREATE"]);
+auditd_file_fields!(AUDITD_FILE_MODIFY, &["NORMAL"]);
+auditd_file_fields!(AUDITD_FILE_DELETE, &["DELETE"]);
+auditd_file_fields!(AUDITD_FILE_RENAME, &["DELETE", "CREATE"]);
+
+macro_rules! auditd_contract {
+    ($category:literal, $event:expr, $action:ident, $source:literal, $fields:ident) => {
+        EventFieldContract {
+            view: FieldViewName::AUDITD,
+            platform: Platform::Linux,
+            category: $category,
+            event_id: $event,
+            event_ids: &[],
+            action: Some(SensorAction::$action),
+            provider: "ebpf",
+            source: $source,
+            fields: $fields,
+        }
+    };
+}
+
+macro_rules! contract {
+    ($platform:ident, $category:literal, $event:expr, $action:ident, $provider:literal, $source:literal, $fields:ident) => {
+        EventFieldContract {
+            view: FieldViewName::SYSMON,
+            platform: Platform::$platform,
+            category: $category,
+            event_id: $event,
+            event_ids: &[],
+            action: Some(SensorAction::$action),
+            provider: $provider,
+            source: $source,
+            fields: $fields,
+        }
+    };
+}
+
+/// A shape that presents `$ids` to Sigma in addition to its own `$event`.
+macro_rules! contract_with_ids {
+    ($platform:ident, $category:literal, $event:expr, $ids:expr, $action:ident, $provider:literal, $source:literal, $fields:ident) => {
+        EventFieldContract {
+            event_ids: $ids,
+            ..contract!($platform, $category, $event, $action, $provider, $source, $fields)
+        }
+    };
+}
+
+macro_rules! application_contract {
+    ($event:literal, $source:literal, $fields:ident) => {
+        contract!(
+            Windows,
+            "application",
+            Some($event),
+            Access,
+            "windows_event_log",
+            $source,
+            $fields
+        )
+    };
+}
+
+/// Windows DNS Client events also present Sysmon's DNS query ID to Sigma
+/// (`RsigmaEvent::event_id_value`), so category-based `dns_query` rules match.
+const DNS_SYSMON_ALIAS_EVENT_IDS: &[u16] = &[22];
+
+/// `EventID`s the WMI-Activity trace shape emits. The Operational events
+/// 5857 to 5861 have their own shapes, and Sysmon's 19 to 21 are never emitted
+/// (#291).
+pub const WMI_TRACE_EVENT_IDS: &[u16] = &[1, 2, 11, 12, 14, 15, 16, 17, 22, 23, 24];
+
+/// Complete event-field availability table.
+pub const FIELD_AVAILABILITY: &[EventFieldContract] = &[
+    contract!(
+        Windows,
+        "process_creation",
+        Some(1),
+        Start,
+        "etw",
+        "Microsoft-Windows-Kernel-Process",
+        WINDOWS_PROCESS
+    ),
+    contract!(
+        Windows,
+        "network_connection",
+        Some(3),
+        Connect,
+        "etw",
+        "Microsoft-Windows-Kernel-Network",
+        WINDOWS_NETWORK
+    ),
+    contract!(
+        Windows,
+        "network_connection",
+        Some(3),
+        Accept,
+        "etw",
+        "Microsoft-Windows-Kernel-Network",
+        WINDOWS_NETWORK
+    ),
+    contract!(
+        Windows,
+        "file_event",
+        Some(11),
+        Create,
+        "etw",
+        "Microsoft-Windows-Kernel-File",
+        WINDOWS_FILE
+    ),
+    contract!(
+        Windows,
+        "file_event",
+        Some(2),
+        Set,
+        "etw",
+        "Microsoft-Windows-Kernel-File",
+        WINDOWS_FILE
+    ),
+    contract!(
+        Windows,
+        "file_event",
+        Some(65),
+        Modify,
+        "etw",
+        "Microsoft-Windows-Kernel-File",
+        WINDOWS_FILE
+    ),
+    contract!(
+        Windows,
+        "file_event",
+        Some(23),
+        Delete,
+        "etw",
+        "Microsoft-Windows-Kernel-File",
+        WINDOWS_FILE
+    ),
+    contract!(
+        Windows,
+        "file_event",
+        Some(71),
+        Rename,
+        "etw",
+        "Microsoft-Windows-Kernel-File",
+        WINDOWS_FILE
+    ),
+    contract!(
+        Windows,
+        "registry_event",
+        Some(12),
+        Create,
+        "etw",
+        "Microsoft-Windows-Kernel-Registry",
+        WINDOWS_REGISTRY
+    ),
+    contract!(
+        Windows,
+        "registry_event",
+        Some(13),
+        Set,
+        "etw",
+        "Microsoft-Windows-Kernel-Registry",
+        WINDOWS_REGISTRY
+    ),
+    contract!(
+        Windows,
+        "registry_event",
+        Some(12),
+        Delete,
+        "etw",
+        "Microsoft-Windows-Kernel-Registry",
+        WINDOWS_REGISTRY
+    ),
+    contract_with_ids!(
+        Windows,
+        "dns_query",
+        Some(3006),
+        DNS_SYSMON_ALIAS_EVENT_IDS,
+        Query,
+        "etw",
+        "Microsoft-Windows-DNS-Client",
+        WINDOWS_DNS
+    ),
+    contract_with_ids!(
+        Windows,
+        "dns_query",
+        Some(3008),
+        DNS_SYSMON_ALIAS_EVENT_IDS,
+        Query,
+        "etw",
+        "Microsoft-Windows-DNS-Client",
+        WINDOWS_DNS
+    ),
+    contract!(
+        Windows,
+        "image_load",
+        Some(7),
+        Load,
+        "etw",
+        "Microsoft-Windows-Kernel-Process",
+        WINDOWS_IMAGE_LOAD
+    ),
+    contract!(
+        Windows,
+        "driver_load",
+        Some(6),
+        Load,
+        "etw",
+        "Microsoft-Windows-Kernel-Process",
+        WINDOWS_DRIVER_LOAD
+    ),
+    contract!(
+        Windows,
+        "ps_script",
+        Some(4104),
+        Execute,
+        "etw",
+        "Microsoft-Windows-PowerShell",
+        WINDOWS_POWERSHELL_SCRIPT
+    ),
+    contract!(
+        Windows,
+        "ps_module",
+        Some(4103),
+        Execute,
+        "etw",
+        "Microsoft-Windows-PowerShell",
+        WINDOWS_POWERSHELL_MODULE
+    ),
+    contract!(
+        Windows,
+        "ps_classic_start",
+        Some(400),
+        Start,
+        "windows_event_log",
+        "PowerShell",
+        WINDOWS_POWERSHELL_CLASSIC_START
+    ),
+    contract!(
+        Windows,
+        "wmi_event",
+        Some(5857),
+        Execute,
+        "etw",
+        "Microsoft-Windows-WMI-Activity",
+        WINDOWS_WMI_5857
+    ),
+    contract!(
+        Windows,
+        "wmi_event",
+        Some(5858),
+        Execute,
+        "etw",
+        "Microsoft-Windows-WMI-Activity",
+        WINDOWS_WMI_5858
+    ),
+    contract!(
+        Windows,
+        "wmi_event",
+        Some(5859),
+        Execute,
+        "etw",
+        "Microsoft-Windows-WMI-Activity",
+        WINDOWS_WMI_5859_5860
+    ),
+    contract!(
+        Windows,
+        "wmi_event",
+        Some(5860),
+        Execute,
+        "etw",
+        "Microsoft-Windows-WMI-Activity",
+        WINDOWS_WMI_5859_5860
+    ),
+    contract!(
+        Windows,
+        "wmi_event",
+        Some(5861),
+        Execute,
+        "etw",
+        "Microsoft-Windows-WMI-Activity",
+        WINDOWS_WMI_5861
+    ),
+    contract_with_ids!(
+        Windows,
+        "wmi_event",
+        None,
+        WMI_TRACE_EVENT_IDS,
+        Execute,
+        "etw",
+        "Microsoft-Windows-WMI-Activity",
+        WINDOWS_WMI
+    ),
+    contract!(
+        Windows,
+        "task_creation",
+        Some(106),
+        Register,
+        "etw",
+        "Microsoft-Windows-TaskScheduler",
+        WINDOWS_TASK
+    ),
+    contract!(
+        Windows,
+        "service_creation",
+        Some(7045),
+        Register,
+        "windows_event_log",
+        "Service Control Manager",
+        WINDOWS_SERVICE
+    ),
+    contract!(
+        Windows,
+        "windefend",
+        Some(5001),
+        Set,
+        "windows_event_log",
+        "Microsoft-Windows-Windows Defender",
+        WINDOWS_DEFENDER_5001
+    ),
+    contract!(
+        Windows,
+        "windefend",
+        Some(5010),
+        Set,
+        "windows_event_log",
+        "Microsoft-Windows-Windows Defender",
+        WINDOWS_DEFENDER_5001
+    ),
+    contract!(
+        Windows,
+        "windefend",
+        Some(5012),
+        Set,
+        "windows_event_log",
+        "Microsoft-Windows-Windows Defender",
+        WINDOWS_DEFENDER_5001
+    ),
+    contract!(
+        Windows,
+        "windefend",
+        Some(5007),
+        Modify,
+        "windows_event_log",
+        "Microsoft-Windows-Windows Defender",
+        WINDOWS_DEFENDER_5007
+    ),
+    contract!(
+        Windows,
+        "windefend",
+        Some(5013),
+        Modify,
+        "windows_event_log",
+        "Microsoft-Windows-Windows Defender",
+        WINDOWS_DEFENDER_5013
+    ),
+    contract!(
+        Windows,
+        "windefend",
+        Some(1006),
+        Create,
+        "windows_event_log",
+        "Microsoft-Windows-Windows Defender",
+        WINDOWS_DEFENDER_1006
+    ),
+    contract!(
+        Windows,
+        "windefend",
+        Some(1015),
+        Create,
+        "windows_event_log",
+        "Microsoft-Windows-Windows Defender",
+        WINDOWS_DEFENDER_1015
+    ),
+    contract!(
+        Windows,
+        "windefend",
+        Some(1116),
+        Create,
+        "windows_event_log",
+        "Microsoft-Windows-Windows Defender",
+        WINDOWS_DEFENDER_1116
+    ),
+    contract!(
+        Windows,
+        "windefend",
+        Some(1117),
+        Create,
+        "windows_event_log",
+        "Microsoft-Windows-Windows Defender",
+        WINDOWS_DEFENDER_1116
+    ),
+    contract!(
+        Windows,
+        "windefend",
+        Some(1119),
+        Create,
+        "windows_event_log",
+        "Microsoft-Windows-Windows Defender",
+        WINDOWS_DEFENDER_1116
+    ),
+    contract!(
+        Windows,
+        "windefend",
+        Some(1009),
+        Delete,
+        "windows_event_log",
+        "Microsoft-Windows-Windows Defender",
+        WINDOWS_DEFENDER_1009
+    ),
+    contract!(
+        Windows,
+        "windefend",
+        Some(1013),
+        Delete,
+        "windows_event_log",
+        "Microsoft-Windows-Windows Defender",
+        WINDOWS_DEFENDER_1013
+    ),
+    contract!(
+        Windows,
+        "windefend",
+        Some(1121),
+        Create,
+        "windows_event_log",
+        "Microsoft-Windows-Windows Defender",
+        WINDOWS_DEFENDER_1121
+    ),
+    contract!(
+        Windows,
+        "windefend",
+        Some(3002),
+        Set,
+        "windows_event_log",
+        "Microsoft-Windows-Windows Defender",
+        WINDOWS_DEFENDER_3002
+    ),
+    contract!(
+        Windows,
+        "windefend",
+        Some(3007),
+        Set,
+        "windows_event_log",
+        "Microsoft-Windows-Windows Defender",
+        WINDOWS_DEFENDER_3007
+    ),
+    contract!(
+        Windows,
+        "windefend",
+        Some(5101),
+        Set,
+        "windows_event_log",
+        "Microsoft-Windows-Windows Defender",
+        WINDOWS_DEFENDER_5101
+    ),
+    contract!(
+        Windows,
+        "security",
+        Some(4624),
+        Start,
+        "windows_event_log",
+        "Microsoft-Windows-Security-Auditing",
+        WINDOWS_SECURITY_4624
+    ),
+    contract!(
+        Windows,
+        "security",
+        Some(4656),
+        Access,
+        "windows_event_log",
+        "Microsoft-Windows-Security-Auditing",
+        WINDOWS_SECURITY_4656
+    ),
+    contract!(
+        Windows,
+        "security",
+        Some(4663),
+        Access,
+        "windows_event_log",
+        "Microsoft-Windows-Security-Auditing",
+        WINDOWS_SECURITY_4663
+    ),
+    contract!(
+        Windows,
+        "security",
+        Some(4697),
+        Register,
+        "windows_event_log",
+        "Microsoft-Windows-Security-Auditing",
+        WINDOWS_SECURITY_4697
+    ),
+    contract!(
+        Windows,
+        "security",
+        Some(5136),
+        Modify,
+        "windows_event_log",
+        "Microsoft-Windows-Security-Auditing",
+        WINDOWS_SECURITY_5136
+    ),
+    contract!(
+        Windows,
+        "security",
+        Some(5140),
+        Access,
+        "windows_event_log",
+        "Microsoft-Windows-Security-Auditing",
+        WINDOWS_SECURITY_5140
+    ),
+    contract!(
+        Windows,
+        "security",
+        Some(5145),
+        Access,
+        "windows_event_log",
+        "Microsoft-Windows-Security-Auditing",
+        WINDOWS_SECURITY_5145
+    ),
+    contract!(
+        Windows,
+        "security",
+        Some(1102),
+        Delete,
+        "windows_event_log",
+        "Microsoft-Windows-Eventlog",
+        WINDOWS_SECURITY_1102
+    ),
+    contract!(
+        Windows,
+        "security",
+        Some(4625),
+        Start,
+        "windows_event_log",
+        "Microsoft-Windows-Security-Auditing",
+        WINDOWS_SECURITY_4625
+    ),
+    contract!(
+        Windows,
+        "security",
+        Some(4648),
+        Start,
+        "windows_event_log",
+        "Microsoft-Windows-Security-Auditing",
+        WINDOWS_SECURITY_4648
+    ),
+    contract!(
+        Windows,
+        "security",
+        Some(4657),
+        Set,
+        "windows_event_log",
+        "Microsoft-Windows-Security-Auditing",
+        WINDOWS_SECURITY_4657
+    ),
+    contract!(
+        Windows,
+        "security",
+        Some(4698),
+        Register,
+        "windows_event_log",
+        "Microsoft-Windows-Security-Auditing",
+        WINDOWS_SECURITY_TASK
+    ),
+    contract!(
+        Windows,
+        "security",
+        Some(4699),
+        Delete,
+        "windows_event_log",
+        "Microsoft-Windows-Security-Auditing",
+        WINDOWS_SECURITY_TASK
+    ),
+    contract!(
+        Windows,
+        "security",
+        Some(4700),
+        Modify,
+        "windows_event_log",
+        "Microsoft-Windows-Security-Auditing",
+        WINDOWS_SECURITY_TASK
+    ),
+    contract!(
+        Windows,
+        "security",
+        Some(4701),
+        Modify,
+        "windows_event_log",
+        "Microsoft-Windows-Security-Auditing",
+        WINDOWS_SECURITY_TASK
+    ),
+    contract!(
+        Windows,
+        "security",
+        Some(4702),
+        Modify,
+        "windows_event_log",
+        "Microsoft-Windows-Security-Auditing",
+        WINDOWS_SECURITY_4702
+    ),
+    contract!(
+        Windows,
+        "security",
+        Some(4719),
+        Modify,
+        "windows_event_log",
+        "Microsoft-Windows-Security-Auditing",
+        WINDOWS_SECURITY_4719
+    ),
+    contract!(
+        Windows,
+        "security",
+        Some(4720),
+        Create,
+        "windows_event_log",
+        "Microsoft-Windows-Security-Auditing",
+        WINDOWS_SECURITY_USER_ACCOUNT
+    ),
+    contract!(
+        Windows,
+        "security",
+        Some(4722),
+        Modify,
+        "windows_event_log",
+        "Microsoft-Windows-Security-Auditing",
+        WINDOWS_SECURITY_ACCOUNT_TARGET
+    ),
+    contract!(
+        Windows,
+        "security",
+        Some(4724),
+        Modify,
+        "windows_event_log",
+        "Microsoft-Windows-Security-Auditing",
+        WINDOWS_SECURITY_ACCOUNT_TARGET
+    ),
+    contract!(
+        Windows,
+        "security",
+        Some(4726),
+        Delete,
+        "windows_event_log",
+        "Microsoft-Windows-Security-Auditing",
+        WINDOWS_SECURITY_ACCOUNT_REMOVED
+    ),
+    contract!(
+        Windows,
+        "security",
+        Some(4728),
+        Modify,
+        "windows_event_log",
+        "Microsoft-Windows-Security-Auditing",
+        WINDOWS_SECURITY_GROUP_MEMBER_ADDED
+    ),
+    contract!(
+        Windows,
+        "security",
+        Some(4732),
+        Modify,
+        "windows_event_log",
+        "Microsoft-Windows-Security-Auditing",
+        WINDOWS_SECURITY_GROUP_MEMBER_ADDED
+    ),
+    contract!(
+        Windows,
+        "security",
+        Some(4738),
+        Modify,
+        "windows_event_log",
+        "Microsoft-Windows-Security-Auditing",
+        WINDOWS_SECURITY_USER_ACCOUNT
+    ),
+    contract!(
+        Windows,
+        "security",
+        Some(4740),
+        Modify,
+        "windows_event_log",
+        "Microsoft-Windows-Security-Auditing",
+        WINDOWS_SECURITY_4740
+    ),
+    contract!(
+        Windows,
+        "security",
+        Some(4741),
+        Create,
+        "windows_event_log",
+        "Microsoft-Windows-Security-Auditing",
+        WINDOWS_SECURITY_4741
+    ),
+    contract!(
+        Windows,
+        "security",
+        Some(4743),
+        Delete,
+        "windows_event_log",
+        "Microsoft-Windows-Security-Auditing",
+        WINDOWS_SECURITY_ACCOUNT_REMOVED
+    ),
+    contract!(
+        Windows,
+        "security",
+        Some(4756),
+        Modify,
+        "windows_event_log",
+        "Microsoft-Windows-Security-Auditing",
+        WINDOWS_SECURITY_GROUP_MEMBER_ADDED
+    ),
+    contract!(
+        Windows,
+        "security",
+        Some(4768),
+        Start,
+        "windows_event_log",
+        "Microsoft-Windows-Security-Auditing",
+        WINDOWS_SECURITY_4768
+    ),
+    contract!(
+        Windows,
+        "security",
+        Some(4769),
+        Start,
+        "windows_event_log",
+        "Microsoft-Windows-Security-Auditing",
+        WINDOWS_SECURITY_4769
+    ),
+    contract!(
+        Windows,
+        "security",
+        Some(4662),
+        Access,
+        "windows_event_log",
+        "Microsoft-Windows-Security-Auditing",
+        WINDOWS_SECURITY_4662
+    ),
+    contract!(
+        Windows,
+        "security",
+        Some(4742),
+        Modify,
+        "windows_event_log",
+        "Microsoft-Windows-Security-Auditing",
+        WINDOWS_SECURITY_4742
+    ),
+    contract!(
+        Windows,
+        "security",
+        Some(4661),
+        Access,
+        "windows_event_log",
+        "Microsoft-Windows-Security-Auditing",
+        WINDOWS_SECURITY_4661
+    ),
+    contract!(
+        Windows,
+        "security",
+        Some(4673),
+        Access,
+        "windows_event_log",
+        "Microsoft-Windows-Security-Auditing",
+        WINDOWS_SECURITY_4673
+    ),
+    contract!(
+        Windows,
+        "security",
+        Some(5137),
+        Create,
+        "windows_event_log",
+        "Microsoft-Windows-Security-Auditing",
+        WINDOWS_SECURITY_5137
+    ),
+    contract!(
+        Windows,
+        "security",
+        Some(5141),
+        Delete,
+        "windows_event_log",
+        "Microsoft-Windows-Security-Auditing",
+        WINDOWS_SECURITY_5141
+    ),
+    contract!(
+        Windows,
+        "security",
+        Some(5379),
+        Access,
+        "windows_event_log",
+        "Microsoft-Windows-Security-Auditing",
+        WINDOWS_SECURITY_5379
+    ),
+    contract!(
+        Windows,
+        "security",
+        Some(4672),
+        Access,
+        "windows_event_log",
+        "Microsoft-Windows-Security-Auditing",
+        WINDOWS_SECURITY_4672
+    ),
+    contract!(
+        Windows,
+        "security",
+        Some(4799),
+        Access,
+        "windows_event_log",
+        "Microsoft-Windows-Security-Auditing",
+        WINDOWS_SECURITY_4799
+    ),
+    contract!(
+        Windows,
+        "security",
+        Some(4765),
+        Modify,
+        "windows_event_log",
+        "Microsoft-Windows-Security-Auditing",
+        WINDOWS_SECURITY_4765
+    ),
+    contract!(
+        Windows,
+        "security",
+        Some(4766),
+        Modify,
+        "windows_event_log",
+        "Microsoft-Windows-Security-Auditing",
+        WINDOWS_SECURITY_4766
+    ),
+    contract!(
+        Windows,
+        "security",
+        Some(4771),
+        Start,
+        "windows_event_log",
+        "Microsoft-Windows-Security-Auditing",
+        WINDOWS_SECURITY_4771
+    ),
+    contract!(
+        Windows,
+        "security",
+        Some(4776),
+        Start,
+        "windows_event_log",
+        "Microsoft-Windows-Security-Auditing",
+        WINDOWS_SECURITY_4776
+    ),
+    contract!(
+        Windows,
+        "security",
+        Some(4781),
+        Rename,
+        "windows_event_log",
+        "Microsoft-Windows-Security-Auditing",
+        WINDOWS_SECURITY_4781
+    ),
+    contract!(
+        Windows,
+        "security",
+        Some(4794),
+        Modify,
+        "windows_event_log",
+        "Microsoft-Windows-Security-Auditing",
+        WINDOWS_SECURITY_4794
+    ),
+    contract!(
+        Windows,
+        "security",
+        Some(4817),
+        Modify,
+        "windows_event_log",
+        "Microsoft-Windows-Security-Auditing",
+        WINDOWS_SECURITY_4817
+    ),
+    contract!(
+        Windows,
+        "security",
+        Some(5152),
+        Connect,
+        "windows_event_log",
+        "Microsoft-Windows-Security-Auditing",
+        WINDOWS_SECURITY_5152
+    ),
+    contract!(
+        Windows,
+        "security",
+        Some(5156),
+        Connect,
+        "windows_event_log",
+        "Microsoft-Windows-Security-Auditing",
+        WINDOWS_SECURITY_WFP_CONNECTION
+    ),
+    contract!(
+        Windows,
+        "security",
+        Some(5157),
+        Connect,
+        "windows_event_log",
+        "Microsoft-Windows-Security-Auditing",
+        WINDOWS_SECURITY_WFP_CONNECTION
+    ),
+    contract!(
+        Windows,
+        "security",
+        Some(5447),
+        Modify,
+        "windows_event_log",
+        "Microsoft-Windows-Security-Auditing",
+        WINDOWS_SECURITY_5447
+    ),
+    contract!(
+        Windows,
+        "security",
+        Some(6416),
+        Register,
+        "windows_event_log",
+        "Microsoft-Windows-Security-Auditing",
+        WINDOWS_SECURITY_6416
+    ),
+    // The Application channel shares event IDs across independent providers.
+    // Each row names the producer and the fields its decoder may populate.
+    application_contract!(1000, "Application Error", WINDOWS_APPLICATION_ERROR),
+    application_contract!(1001, "Windows Error Reporting", WINDOWS_APPLICATION),
+    application_contract!(1, "Microsoft-Windows-Audit-CVE", WINDOWS_APPLICATION),
+    application_contract!(1, "Audit-CVE", WINDOWS_APPLICATION),
+    application_contract!(
+        865,
+        "Microsoft-Windows-SoftwareRestrictionPolicies",
+        WINDOWS_APPLICATION
+    ),
+    application_contract!(
+        866,
+        "Microsoft-Windows-SoftwareRestrictionPolicies",
+        WINDOWS_APPLICATION
+    ),
+    application_contract!(
+        867,
+        "Microsoft-Windows-SoftwareRestrictionPolicies",
+        WINDOWS_APPLICATION
+    ),
+    application_contract!(
+        868,
+        "Microsoft-Windows-SoftwareRestrictionPolicies",
+        WINDOWS_APPLICATION
+    ),
+    application_contract!(
+        882,
+        "Microsoft-Windows-SoftwareRestrictionPolicies",
+        WINDOWS_APPLICATION
+    ),
+    application_contract!(1033, "MsiInstaller", WINDOWS_APPLICATION),
+    application_contract!(1034, "MsiInstaller", WINDOWS_APPLICATION),
+    application_contract!(1040, "MsiInstaller", WINDOWS_APPLICATION),
+    application_contract!(1042, "MsiInstaller", WINDOWS_APPLICATION),
+    application_contract!(11724, "MsiInstaller", WINDOWS_APPLICATION),
+    application_contract!(216, "ESENT", WINDOWS_APPLICATION),
+    application_contract!(325, "ESENT", WINDOWS_APPLICATION),
+    application_contract!(326, "ESENT", WINDOWS_APPLICATION),
+    application_contract!(327, "ESENT", WINDOWS_APPLICATION),
+    application_contract!(8128, "MSSQL*", WINDOWS_APPLICATION),
+    application_contract!(15457, "MSSQL*", WINDOWS_APPLICATION),
+    application_contract!(18456, "MSSQL*", WINDOWS_APPLICATION),
+    application_contract!(33205, "MSSQL*", WINDOWS_APPLICATION),
+    application_contract!(524, "Microsoft-Windows-Backup", WINDOWS_APPLICATION),
+    application_contract!(200, "ScreenConnect", WINDOWS_APPLICATION),
+    application_contract!(201, "ScreenConnect", WINDOWS_APPLICATION),
+    application_contract!(
+        1511,
+        "Microsoft-Windows-User Profiles Service",
+        WINDOWS_APPLICATION
+    ),
+    application_contract!(7053, "Windows Server Update Services", WINDOWS_APPLICATION),
+    application_contract!(2027, "MSMQ", WINDOWS_APPLICATION),
+    application_contract!(4, "MSExchange Control Panel", WINDOWS_APPLICATION),
+    EventFieldContract {
+        view: FieldViewName::SYSMON,
+        platform: Platform::Windows,
+        category: "pipe_created",
+        event_id: Some(17),
+        event_ids: &[],
+        action: None,
+        provider: "none",
+        source: "Microsoft-Windows-Kernel-File",
+        fields: PIPE_CREATED,
+    },
+    EventFieldContract {
+        view: FieldViewName::SYSMON,
+        platform: Platform::Windows,
+        category: "create_remote_thread",
+        event_id: Some(8),
+        event_ids: &[],
+        action: None,
+        provider: "none",
+        source: "none",
+        fields: CREATE_REMOTE_THREAD,
+    },
+    contract!(
+        Linux,
+        "process_creation",
+        Some(1),
+        Start,
+        "ebpf",
+        "execve tracepoints",
+        LINUX_PROCESS
+    ),
+    contract!(
+        Linux,
+        "network_connection",
+        Some(3),
+        Connect,
+        "ebpf",
+        "socket fexit or connect tracepoints",
+        LINUX_NETWORK
+    ),
+    contract!(
+        Linux,
+        "file_event",
+        None,
+        Create,
+        "ebpf",
+        "file syscall tracepoints",
+        LINUX_FILE
+    ),
+    contract!(
+        Linux,
+        "file_event",
+        None,
+        Modify,
+        "ebpf",
+        "file syscall tracepoints",
+        LINUX_FILE
+    ),
+    contract!(
+        Linux,
+        "file_event",
+        None,
+        Delete,
+        "ebpf",
+        "file syscall tracepoints",
+        LINUX_FILE
+    ),
+    contract!(
+        Linux,
+        "file_event",
+        None,
+        Rename,
+        "ebpf",
+        "file syscall tracepoints",
+        LINUX_FILE
+    ),
+    contract!(
+        Linux,
+        "dns_query",
+        Some(22),
+        Query,
+        "ebpf",
+        "DNS socket syscall hooks",
+        LINUX_DNS
+    ),
+    auditd_contract!(
+        "process_creation",
+        Some(1),
+        Start,
+        "execve tracepoints",
+        AUDITD_PROCESS
+    ),
+    auditd_contract!(
+        "file_event",
+        None,
+        Create,
+        "file syscall tracepoints",
+        AUDITD_FILE_CREATE
+    ),
+    auditd_contract!(
+        "file_event",
+        None,
+        Modify,
+        "file syscall tracepoints",
+        AUDITD_FILE_MODIFY
+    ),
+    auditd_contract!(
+        "file_event",
+        None,
+        Delete,
+        "file syscall tracepoints",
+        AUDITD_FILE_DELETE
+    ),
+    auditd_contract!(
+        "file_event",
+        None,
+        Rename,
+        "file syscall tracepoints",
+        AUDITD_FILE_RENAME
+    ),
+    contract!(
+        MacOS,
+        "process_creation",
+        Some(1),
+        Start,
+        "esf",
+        "Endpoint Security exec",
+        MACOS_PROCESS
+    ),
+    contract!(
+        MacOS,
+        "network_connection",
+        Some(3),
+        Connect,
+        "bpf",
+        "/dev/bpf",
+        MACOS_NETWORK
+    ),
+    contract!(
+        MacOS,
+        "file_event",
+        None,
+        Create,
+        "esf",
+        "Endpoint Security file notifications",
+        MACOS_FILE
+    ),
+    contract!(
+        MacOS,
+        "file_event",
+        None,
+        Modify,
+        "esf",
+        "Endpoint Security file notifications",
+        MACOS_FILE
+    ),
+    contract!(
+        MacOS,
+        "file_event",
+        None,
+        Delete,
+        "esf",
+        "Endpoint Security file notifications",
+        MACOS_FILE
+    ),
+    contract!(
+        MacOS,
+        "file_event",
+        None,
+        Rename,
+        "esf",
+        "Endpoint Security file notifications",
+        MACOS_FILE
+    ),
+    contract!(
+        MacOS,
+        "dns_query",
+        Some(22),
+        Query,
+        "bpf",
+        "/dev/bpf",
+        MACOS_DNS
+    ),
+];
+
+/// Canonical category name used by the compatibility table.
+pub const fn category_name(category: EventCategory) -> &'static str {
+    match category {
+        EventCategory::Process => "process_creation",
+        EventCategory::Network => "network_connection",
+        EventCategory::File => "file_event",
+        EventCategory::Registry => "registry_event",
+        EventCategory::Dns => "dns_query",
+        EventCategory::ImageLoad => "image_load",
+        EventCategory::DriverLoad => "driver_load",
+        EventCategory::Scripting => "ps_script",
+        EventCategory::PowerShellModule => "ps_module",
+        EventCategory::PowerShellClassicStart => "ps_classic_start",
+        EventCategory::Wmi => "wmi_event",
+        EventCategory::Service => "service_creation",
+        EventCategory::Task => "task_creation",
+        EventCategory::Security => "security",
+        EventCategory::Defender => "windefend",
+        EventCategory::Application => "application",
+    }
+}
+
+/// Inverse of [`category_name`]; `None` for shapes no sensor can emit.
+pub fn category_from_name(name: &str) -> Option<EventCategory> {
+    EventCategory::ALL
+        .into_iter()
+        .find(|category| category_name(*category) == name)
+}
+
+const fn same_platform(left: Platform, right: Platform) -> bool {
+    matches!(
+        (left, right),
+        (Platform::Windows, Platform::Windows)
+            | (Platform::Linux, Platform::Linux)
+            | (Platform::MacOS, Platform::MacOS)
+    )
+}
+
+/// The half-open range of one platform's rows in [`FIELD_AVAILABILITY`].
+///
+/// The table is grouped by platform, so a lookup scans only its own platform's
+/// rows. Without this, every field a Sigma rule reads from a Linux or macOS
+/// event walks past every Windows contract first, and adding Windows event
+/// families slows down the other platforms' detection hot path.
+const fn platform_range(platform: Platform) -> (usize, usize) {
+    let mut start = 0;
+    while start < FIELD_AVAILABILITY.len()
+        && !same_platform(FIELD_AVAILABILITY[start].platform, platform)
+    {
+        start += 1;
+    }
+    let mut end = start;
+    while end < FIELD_AVAILABILITY.len()
+        && same_platform(FIELD_AVAILABILITY[end].platform, platform)
+    {
+        end += 1;
+    }
+    (start, end)
+}
+
+const WINDOWS_RANGE: (usize, usize) = platform_range(Platform::Windows);
+const LINUX_RANGE: (usize, usize) = platform_range(Platform::Linux);
+const MACOS_RANGE: (usize, usize) = platform_range(Platform::MacOS);
+
+/// Each platform's rows must be one contiguous run, or [`platform_range`] would
+/// silently hide the rows after a second run and their contracts would stop
+/// being found.
+const _: () = assert!(
+    (WINDOWS_RANGE.1 - WINDOWS_RANGE.0)
+        + (LINUX_RANGE.1 - LINUX_RANGE.0)
+        + (MACOS_RANGE.1 - MACOS_RANGE.0)
+        == FIELD_AVAILABILITY.len(),
+    "FIELD_AVAILABILITY must be grouped by platform: keep each platform's contracts contiguous"
+);
+
+/// The contracts for one platform, as a subslice of [`FIELD_AVAILABILITY`].
+fn platform_contracts(platform: Platform) -> &'static [EventFieldContract] {
+    let (start, end) = match platform {
+        Platform::Windows => WINDOWS_RANGE,
+        Platform::Linux => LINUX_RANGE,
+        Platform::MacOS => MACOS_RANGE,
+    };
+    &FIELD_AVAILABILITY[start..end]
+}
+
+/// Find an event contract when the native decoder has not yet assigned an
+/// action. Event ID must make the key unique; this is used by the Security
+/// channel decoder as its field allowlist.
+pub fn contract_for_event_id(
+    platform: Platform,
+    category: &str,
+    event_id: u16,
+    provider: &str,
+) -> Option<&'static EventFieldContract> {
+    platform_contracts(platform).iter().find(|contract| {
+        contract.view == FieldViewName::DEFAULT
+            && contract.category == category
+            && contract.event_id == Some(event_id)
+            && contract.provider == provider
+    })
+}
+
+/// Find an Application contract by both event ID and native provider.
+pub fn application_contract(
+    event_id: u16,
+    native_provider: &str,
+) -> Option<&'static EventFieldContract> {
+    platform_contracts(Platform::Windows)
+        .iter()
+        .find(|contract| {
+            contract.category == "application"
+                && contract.event_id == Some(event_id)
+                && application_source_matches(contract.source, native_provider)
+        })
+}
+
+fn application_source_matches(source: &str, provider: &str) -> bool {
+    if source == "MSSQL*" {
+        provider.contains("MSSQL")
+    } else {
+        source == provider
+    }
+}
+
+/// Availability of `field` within an already-resolved event contract.
+///
+/// Resolving the contract is a scan of the platform's table, so callers that
+/// read many fields of one event resolve it once with [`event_contract`].
+pub(crate) fn availability_in_contract(
+    contract: Option<&'static EventFieldContract>,
+    field: &str,
+) -> Option<Availability> {
+    contract.and_then(|contract| {
+        let field = crate::models::field_view::contract_field_name(contract.view, field);
+        contract
+            .fields
+            .iter()
+            .find(|entry| entry.field == field || entry.field == "*")
+            .map(|entry| entry.availability)
+    })
+}
+
+pub(crate) fn event_contract(
+    view: FieldViewName,
+    event: &NormalizedEvent,
+) -> Option<&'static EventFieldContract> {
+    platform_contracts(event.platform).iter().find(|contract| {
+        contract.view == view
+            && contract.category == category_name(event.category)
+            && contract.provider == event.provider
+            && contract.presents_event_id(event.event_id)
+            && (event.category != EventCategory::Application
+                || match &event.fields {
+                    crate::models::EventFields::ApplicationEvent(fields) => fields
+                        .get("Provider_Name")
+                        .is_some_and(|provider| application_source_matches(contract.source, provider)),
+                    _ => false,
+                })
+            // Event Log records identify their schema by event ID and do not
+            // carry the synthetic action opcode used by native sensors.
+            && (event.provider == "windows_event_log"
+                || contract
+                    .action
+                    .is_none_or(|action| action_code_matches(action, event.opcode)))
+    })
+}
+
+/// Native Windows channel recorded for this exact emitted event shape.
+pub(crate) fn channel_for_event(
+    view: FieldViewName,
+    event: &NormalizedEvent,
+) -> Option<&'static str> {
+    event_contract(view, event).and_then(|contract| {
+        contract
+            .fields
+            .iter()
+            .find(|field| field.field == "Channel")
+            .and_then(|field| field.value)
+    })
+}
+
+const fn action_code_matches(action: SensorAction, opcode: u8) -> bool {
+    match action {
+        SensorAction::Start => opcode == 1,
+        SensorAction::Stop => opcode == 2,
+        SensorAction::Connect => opcode == 0 || opcode == 12,
+        SensorAction::Accept => opcode == 15,
+        SensorAction::Create => opcode == 36 || opcode == 64,
+        SensorAction::Modify => opcode == 65,
+        SensorAction::Delete => opcode == 38 || opcode == 70,
+        SensorAction::Rename => opcode == 71,
+        SensorAction::Set => opcode == 2 || opcode == 39,
+        SensorAction::Query
+        | SensorAction::Load
+        | SensorAction::Execute
+        | SensorAction::Register => opcode == 0 || opcode == 10,
+        SensorAction::Disconnect | SensorAction::Access | SensorAction::Fork => true,
+    }
+}
+
+/// Look up a field exactly as one named view will expose the event.
+pub fn availability_for_view(
+    view: FieldViewName,
+    event: &NormalizedEvent,
+    field: &str,
+) -> Option<Availability> {
+    availability_in_contract(event_contract(view, event), field)
+}
+
+/// Look up a field in the default Sysmon compatibility view.
+pub fn availability_for_event(event: &NormalizedEvent, field: &str) -> Option<Availability> {
+    availability_for_view(FieldViewName::DEFAULT, event, field)
+}
+
+/// Always fields missing from an emitted normalized event.
+pub fn missing_always_fields(event: &NormalizedEvent) -> Vec<&'static str> {
+    missing_always_fields_for_view(FieldViewName::DEFAULT, event)
+}
+
+pub fn missing_always_fields_for_view(
+    view: FieldViewName,
+    event: &NormalizedEvent,
+) -> Vec<&'static str> {
+    event_contract(view, event)
+        .into_iter()
+        .flat_map(|contract| contract.fields)
+        .filter(|entry| entry.availability == Availability::Always)
+        .filter_map(|entry| (!field_is_populated(view, event, entry.field)).then_some(entry.field))
+        .collect()
+}
+
+/// Populated fields which the matching event contract declares unavailable.
+///
+/// The detector accessor still filters these fields at read time. This check
+/// makes the contradictory producer/contract state observable instead of
+/// silently relying on that safety net forever.
+pub fn populated_never_fields(event: &NormalizedEvent) -> Vec<&'static str> {
+    populated_never_fields_for_view(FieldViewName::DEFAULT, event)
+}
+
+pub fn populated_never_fields_for_view(
+    view: FieldViewName,
+    event: &NormalizedEvent,
+) -> Vec<&'static str> {
+    event_contract(view, event)
+        .into_iter()
+        .flat_map(|contract| contract.fields)
+        .filter(|entry| matches!(entry.availability, Availability::Never(_)))
+        .filter_map(|entry| field_is_populated(view, event, entry.field).then_some(entry.field))
+        .collect()
+}
+
+fn field_is_populated(view: FieldViewName, event: &NormalizedEvent, field: &str) -> bool {
+    event.field_view(view).get_unchecked(field).is_some()
+}
+
+/// Flattened compatibility artifact generated from [`FIELD_AVAILABILITY`].
+#[derive(Serialize)]
+struct Baseline<'a> {
+    schema_version: u16,
+    entries: Vec<BaselineEntry<'a>>,
+}
+
+#[derive(Serialize)]
+struct BaselineEntry<'a> {
+    view: FieldViewName,
+    platform: Platform,
+    category: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    event_id: Option<u16>,
+    #[serde(skip_serializing_if = "<[u16]>::is_empty")]
+    event_ids: &'a [u16],
+    #[serde(skip_serializing_if = "Option::is_none")]
+    action: Option<SensorAction>,
+    provider: &'a str,
+    source: &'a str,
+    field: &'a str,
+    since: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    value: Option<&'a str>,
+    #[serde(skip_serializing_if = "<[&str]>::is_empty")]
+    values: &'a [&'a str],
+    #[serde(flatten)]
+    availability: Availability,
+}
+
+pub fn compatibility_json() -> String {
+    validate_since_versions();
+    let entries = FIELD_AVAILABILITY
+        .iter()
+        .flat_map(|contract| {
+            contract.fields.iter().map(|field| BaselineEntry {
+                view: contract.view,
+                platform: contract.platform,
+                category: contract.category,
+                event_id: contract.event_id,
+                event_ids: contract.event_ids,
+                action: contract.action,
+                provider: contract.provider,
+                source: contract.source,
+                field: field.field,
+                since: field.since,
+                value: field.value,
+                values: field.values,
+                availability: field.availability,
+            })
+        })
+        .collect();
+    let mut json = serde_json::to_string_pretty(&Baseline {
+        schema_version: SCHEMA_VERSION,
+        entries,
+    })
+    .expect("static field availability serializes");
+    json.push('\n');
+    json
+}
+
+fn validate_since_versions() {
+    let current = Version::parse(env!("CARGO_PKG_VERSION"))
+        .expect("the Rustinel package version must be valid semver");
+    for field in FIELD_AVAILABILITY
+        .iter()
+        .flat_map(|contract| contract.fields)
+    {
+        if let Some(error) = field
+            .since
+            .and_then(|since| since_version_error(since, &current))
+        {
+            panic!("{} {error}", field.field);
+        }
+    }
+}
+
+/// Why `since` cannot be declared by a build of `current`, if it cannot.
+///
+/// A release candidate may already name the release it prepares, so the
+/// comparison ignores the prerelease part of `current`.
+fn since_version_error(since: &str, current: &Version) -> Option<String> {
+    if since == UNRELEASED {
+        return None;
+    }
+    let version = match Version::parse(since) {
+        Ok(version) => version,
+        Err(error) => return Some(format!("has invalid since {since:?}: {error}")),
+    };
+    if !version.pre.is_empty() {
+        return Some(format!("since {since:?} is not a released version"));
+    }
+    let release = Version::new(current.major, current.minor, current.patch);
+    (version > release).then(|| format!("since {since:?} is newer than Rustinel {release}"))
+}
+
+fn key_label(contract: &EventFieldContract) -> String {
+    let selector = match (contract.event_id, contract.action) {
+        (Some(id), Some(action)) => format!("{id} / {action:?}"),
+        (Some(id), None) => id.to_string(),
+        (None, Some(action)) => format!("{action:?}"),
+        (None, None) => "all".to_string(),
+    };
+    selector.to_ascii_lowercase()
+}
+
+/// Generated permanent-gap table embedded in `docs/field-availability.md`.
+pub fn unavailable_fields_markdown() -> String {
+    use std::collections::BTreeMap;
+    type GapKey<'a> = (&'a str, &'a str, &'a str, &'a str, &'a str, &'a str);
+
+    let mut output = String::from(
+        "<!-- BEGIN GENERATED FIELD AVAILABILITY -->\n\
+This table is generated from `FIELD_AVAILABILITY` in `src/field_availability.rs`.\n\
+Edit that table and run `cargo run --bin generate-docs`.\n\n\
+| View | Platform | Category | Event / action | Source | Unavailable field | Reason |\n\
+| --- | --- | --- | --- | --- | --- | --- |\n",
+    );
+    let mut rows: BTreeMap<GapKey<'_>, Vec<String>> = BTreeMap::new();
+    for contract in FIELD_AVAILABILITY {
+        for field in contract.fields {
+            let Availability::Never(reason) = field.availability else {
+                continue;
+            };
+            rows.entry((
+                contract.view.as_str(),
+                contract.platform.as_str(),
+                contract.category,
+                contract.source,
+                field.field,
+                reason,
+            ))
+            .or_default()
+            .push(key_label(contract));
+        }
+    }
+    for ((view, platform, category, source, field, reason), mut selectors) in rows {
+        selectors.sort();
+        selectors.dedup();
+        output.push_str(&format!(
+            "| `{}` | {} | `{}` | `{}` | `{}` | `{}` | {} |\n",
+            view,
+            platform,
+            category,
+            selectors.join(", "),
+            source,
+            field,
+            reason
+        ));
+    }
+    output.push_str("<!-- END GENERATED FIELD AVAILABILITY -->\n");
+    output
+}
+
+/// Generated availability summary embedded in `docs/coverage.md`.
+pub fn coverage_markdown() -> String {
+    let mut output = String::from(
+        "<!-- BEGIN GENERATED FIELD AVAILABILITY -->\n\
+Generated from `FIELD_AVAILABILITY`.\n\
+These count fields, not rules: a rule that references a `Never` field inside an `or` branch can still fire.\n\n\
+| View | Platform | Always | Conditional | Never |\n\
+| --- | --- | ---: | ---: | ---: |\n",
+    );
+    for view in [FieldViewName::SYSMON, FieldViewName::AUDITD] {
+        for platform in [Platform::Windows, Platform::Linux, Platform::MacOS] {
+            let mut counts = [0usize; 3];
+            for availability in FIELD_AVAILABILITY
+                .iter()
+                .filter(|contract| contract.view == view && contract.platform == platform)
+                .flat_map(|contract| contract.fields.iter().map(|field| field.availability))
+            {
+                match availability {
+                    Availability::Always => counts[0] += 1,
+                    Availability::Conditional(_) => counts[1] += 1,
+                    Availability::Never(_) => counts[2] += 1,
+                }
+            }
+            if counts == [0; 3] {
+                continue;
+            }
+            output.push_str(&format!(
+                "| `{}` | {} | {} | {} | {} |\n",
+                view.as_str(),
+                platform.as_str(),
+                counts[0],
+                counts[1],
+                counts[2]
+            ));
+        }
+    }
+    output.push_str(
+        "\nThe complete machine-readable baseline is \
+[`compatibility/field-availability.json`](https://github.com/Karib0u/rustinel/blob/main/compatibility/field-availability.json).\n\
+<!-- END GENERATED FIELD AVAILABILITY -->\n",
+    );
+    output
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn error(since: &str, current: &str) -> Option<String> {
+        since_version_error(since, &Version::parse(current).unwrap())
+    }
+
+    #[test]
+    fn since_accepts_released_versions_up_to_the_current_release() {
+        assert_eq!(error("1.7.0", "1.8.0"), None);
+        assert_eq!(error("1.8.0", "1.8.0"), None);
+    }
+
+    #[test]
+    fn since_accepts_the_release_a_candidate_prepares() {
+        assert_eq!(error("1.9.0", "1.9.0-rc.1"), None);
+        assert!(error("1.9.1", "1.9.0-rc.1").is_some());
+    }
+
+    #[test]
+    fn since_rejects_guesses_prereleases_and_garbage() {
+        assert!(error("1.9.0", "1.8.0").is_some());
+        assert!(error("1.9.0-rc.1", "1.9.0").is_some());
+        assert!(error("next", "1.8.0").is_some());
+    }
+
+    #[test]
+    fn since_accepts_the_unreleased_marker() {
+        assert_eq!(error(UNRELEASED, "1.8.0"), None);
+    }
+}

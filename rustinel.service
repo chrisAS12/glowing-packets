@@ -1,0 +1,33 @@
+[Unit]
+Description=Rustinel eBPF Sentinel
+Documentation=https://github.com/Karib0u/rustinel
+After=network.target time-sync.target
+
+[Service]
+Type=simple
+ExecStart=/opt/rustinel/rustinel run --config /etc/rustinel/config.toml --no-console
+WorkingDirectory=/opt/rustinel
+Restart=on-failure
+RestartSec=5s
+KillSignal=SIGINT
+TimeoutStopSec=30s
+User=root
+
+# Allow eBPF program loading and network observability without full root.
+# CAP_BPF loads and attaches eBPF programs.
+# CAP_PERFMON enables tracepoint and performance monitoring access.
+# CAP_NET_ADMIN attaches tc/xdp programs and reads socket metadata.
+# CAP_SYS_RESOURCE raises memlock limits required by eBPF maps.
+# CAP_KILL terminates processes owned by other users.
+# CAP_SYS_PTRACE reads process metadata and memory across user boundaries.
+# CAP_DAC_READ_SEARCH reads binaries in private user directories.
+AmbientCapabilities=CAP_BPF CAP_PERFMON CAP_NET_ADMIN CAP_SYS_RESOURCE CAP_KILL CAP_SYS_PTRACE CAP_DAC_READ_SEARCH
+CapabilityBoundingSet=CAP_BPF CAP_PERFMON CAP_NET_ADMIN CAP_SYS_RESOURCE CAP_KILL CAP_SYS_PTRACE CAP_DAC_READ_SEARCH
+NoNewPrivileges=true
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=rustinel
+
+[Install]
+WantedBy=multi-user.target

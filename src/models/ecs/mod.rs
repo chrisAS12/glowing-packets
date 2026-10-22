@@ -1,0 +1,1385 @@
+//! ECS (Elastic Common Schema) alert mapping
+//! https://github.com/elastic/ecs/tree/main
+//! This module provides a translation layer between internal Alert structures
+//! and the standardized ECS format expected by SIEM systems like Elasticsearch,
+//! Splunk, and other log aggregation platforms.
+
+mod alert;
+mod event;
+mod helpers;
+mod network;
+mod registry;
+mod threat;
+mod user;
+
+pub use alert::{
+    AgentLifecycle, AgentLoss, AgentTamper, DnsAnswer, EcsAlert, LifecycleKind, ReplayProvenance,
+};
+
+use crate::models::{
+    Alert, AlertSeverity, DetectionEngine, EventCategory, EventFields, NormalizedEvent,
+};
+use crate::vocab::Platform;
+use event::{
+    alert_severity_to_event_severity, ecs_event_action, ecs_event_category, ecs_event_type,
+    ecs_object_access_category, event_dataset, event_provider, host_os_family, host_os_type,
+    network_direction_from_category, network_direction_from_initiated,
+};
+use helpers::{
+    basename, file_extension_from_path, parse_bool, parse_u16, parse_u64, SysmonDigests,
+};
+use network::{extract_ips, network_transport_from_opcode, network_type_from_ip};
+use registry::split_registry_path;
+use threat::attack_fields;
+use user::apply_user_fields;
+
+const ECS_VERSION: &str = "9.5.0";
+const EVENT_MODULE: &str = "edr";
+
+/// What a loss alert tells the receiver, by the stage that lost the events.
+fn loss_description(loss: &AgentLoss) -> String {
+    let AgentLoss {
+        channel,
+        category,
+        dropped,
+        window_secs,
+    } = loss;
+    match *channel {
+        "sensor_events" => format!(
+            "{dropped} {category} events were dropped in {window_secs} seconds because the \
+             {channel} queue was full; detections that depend on them did not run"
+        ),
+        "artifact_resolution" | "artifact_written_files" | "yara_memory_scan" => format!(
+            "{dropped} {category} requests were dropped in {window_secs} seconds because the \
+             {channel} queue was full; the base events were still evaluated, but their hashes, \
+             PE metadata or YARA results are missing"
+        ),
+        _ => format!(
+            "{dropped} {category} events were lost in {window_secs} seconds by {channel} \
+             before the sensor could read them; detections that depend on them did not run"
+        ),
+    }
+}
+
+impl EcsAlert {
+    /// An operational alert about the agent itself rather than a detection:
+    /// `edr.rule.engine` is `Agent` and `event.dataset` is `edr.agent`.
+    ///
+    /// It is written straight to the sink, so it never passes through
+    /// deduplication or active response.
+    pub fn agent_loss(platform: Platform, timestamp: String, loss: AgentLoss) -> Self {
+        let mut ecs = Self::agent_alert(
+            platform,
+            timestamp,
+            AlertSeverity::Medium,
+            format!("agent::loss::{}", loss.channel),
+            loss_description(&loss),
+            "sensor-events-dropped",
+        );
+        ecs.edr_agent_loss = Some(loss);
+        ecs
+    }
+
+    /// An operational alert that something changed the agent's own telemetry
+    /// collection, such as an ETW provider switched off under a live session.
+    pub fn agent_tamper(platform: Platform, timestamp: String, tamper: AgentTamper) -> Self {
+        let description = format!(
+            "ETW session {} no longer matches what the agent configured for provider {}: {}",
+            tamper.session, tamper.provider, tamper.detail
+        );
+        let mut ecs = Self::agent_alert(
+            platform,
+            timestamp,
+            AlertSeverity::High,
+            format!("agent::tamper::{}", tamper.kind),
+            description,
+            tamper.change,
+        );
+        ecs.edr_agent_tamper = Some(tamper);
+        ecs
+    }
+
+    /// An operational alert about the agent starting or stopping.
+    ///
+    /// Shaped like [`EcsAlert::agent_loss`]: it goes straight to the sink, so
+    /// it skips deduplication and active response.
+    pub fn agent_lifecycle(
+        platform: Platform,
+        timestamp: String,
+        lifecycle: AgentLifecycle,
+    ) -> Self {
+        let (severity, rule, description, action) = match lifecycle.kind {
+            LifecycleKind::Stopping => (
+                if lifecycle.reason == "sensor_failure" {
+                    AlertSeverity::High
+                } else {
+                    AlertSeverity::Low
+                },
+                "agent::lifecycle::stopping",
+                format!("The agent is shutting down (reason: {})", lifecycle.reason),
+                "agent-stopping",
+            ),
+            LifecycleKind::UncleanShutdown => (
+                AlertSeverity::High,
+                "agent::lifecycle::unclean_shutdown",
+                "The previous run did not stop cleanly: it was killed, crashed, or the host \
+                 lost power. Nothing was collected between its last snapshot and this start"
+                    .to_string(),
+                "agent-unclean-shutdown",
+            ),
+        };
+        let mut ecs = Self::agent_alert(
+            platform,
+            timestamp,
+            severity,
+            rule.to_string(),
+            description,
+            action,
+        );
+        ecs.edr_agent_lifecycle = Some(lifecycle);
+        ecs
+    }
+
+    fn agent_alert(
+        platform: Platform,
+        timestamp: String,
+        severity: AlertSeverity,
+        rule_name: String,
+        description: String,
+        action: &str,
+    ) -> Self {
+        let alert = Alert {
+            severity,
+            rule_name,
+            rule_description: Some(description),
+            rule_id: None,
+            sigma_metadata: None,
+            engine: DetectionEngine::Sigma,
+            event: NormalizedEvent {
+                timestamp,
+                source_seq: None,
+                ingest_seq: 0,
+                platform,
+                provider: "rustinel".to_string(),
+                category: EventCategory::Process,
+                event_id: 0,
+                event_id_string: String::new(),
+                opcode: 0,
+                fields: EventFields::Generic(Default::default()),
+                provenance: Default::default(),
+                process_name: None,
+                process_context: None,
+            },
+            match_details: None,
+        };
+        let mut ecs = EcsAlert::from(&alert);
+        ecs.edr_rule_engine = "Agent".to_string();
+        ecs.event_dataset = format!("{EVENT_MODULE}.agent");
+        ecs.event_category = vec!["host".to_string()];
+        ecs.event_type = vec!["info".to_string()];
+        ecs.event_action = Some(action.to_string());
+        ecs.event_code = None;
+        ecs
+    }
+}
+
+impl From<&Alert> for EcsAlert {
+    fn from(alert: &Alert) -> Self {
+        let opcode = alert.event.opcode;
+        let event_id = alert.event.event_id;
+        let event_category = ecs_event_category(alert.event.category, event_id);
+        let event_type = ecs_event_type(alert.event.category, opcode, event_id);
+        let event_action = ecs_event_action(alert.event.category, opcode, event_id);
+        let event_code = if !alert.event.event_id_string.is_empty() {
+            Some(alert.event.event_id_string.clone())
+        } else {
+            Some(alert.event.event_id.to_string())
+        };
+        let sigma_metadata = alert.sigma_metadata.as_ref();
+        let attack = attack_fields(
+            sigma_metadata
+                .map(|metadata| metadata.tags.as_slice())
+                .unwrap_or_default(),
+        );
+
+        let mut ecs = EcsAlert {
+            timestamp: alert.event.timestamp.clone(),
+            event_source_seq: alert.event.source_seq,
+            event_ingest_seq: alert.event.ingest_seq,
+            event_provenance: alert.event.provenance.clone(),
+            windows_process_metadata: None,
+            ecs_version: ECS_VERSION.to_string(),
+            event_count: None,
+            event_kind: "alert".to_string(),
+            event_category,
+            event_type,
+            event_action,
+            event_code,
+            event_severity: Some(alert_severity_to_event_severity(alert.severity)),
+            event_module: EVENT_MODULE.to_string(),
+            event_dataset: event_dataset(alert.event.category),
+            event_provider: event_provider(alert),
+            host_os_type: host_os_type(alert.event.platform),
+            host_os_family: host_os_family(alert.event.platform),
+            rule_name: alert.rule_name.clone(),
+            rule_description: alert.rule_description.clone(),
+            rule_id: alert.rule_id.clone(),
+            rule_author: sigma_metadata
+                .and_then(|metadata| metadata.author.clone())
+                .map(|author| vec![author]),
+            rule_reference: sigma_metadata
+                .map(|metadata| metadata.references.clone())
+                .unwrap_or_default(),
+            tags: sigma_metadata
+                .map(|metadata| metadata.tags.clone())
+                .unwrap_or_default(),
+            edr_rule_severity: format!("{:?}", alert.severity),
+            edr_rule_engine: format!("{:?}", alert.engine),
+            edr_sigma_level: sigma_metadata.and_then(|metadata| metadata.level.clone()),
+            edr_sigma_status: sigma_metadata.and_then(|metadata| metadata.status.clone()),
+            edr_sigma_metadata_truncated: sigma_metadata
+                .filter(|metadata| metadata.truncated)
+                .map(|_| true),
+            threat_framework: attack.framework,
+            threat_tactic_id: attack.tactic_ids,
+            threat_tactic_name: attack.tactic_names,
+            threat_tactic_reference: attack.tactic_references,
+            threat_technique_id: attack.technique_ids,
+            threat_technique_reference: attack.technique_references,
+            threat_subtechnique_id: attack.subtechnique_ids,
+            threat_subtechnique_reference: attack.subtechnique_references,
+            edr_yara_scan_source: None,
+            process_executable: None,
+            edr_process_image_source: None,
+            edr_process_image_truncated: None,
+            edr_process_cgroup_id: None,
+            edr_process_cgroup_path: None,
+            container_id: None,
+            container_runtime: None,
+            edr_process_real_user_id: None,
+            edr_process_real_group_id: None,
+            edr_process_effective_user_id: None,
+            edr_process_effective_group_id: None,
+            edr_process_mount_namespace: None,
+            edr_process_pid_namespace: None,
+            edr_process_network_namespace: None,
+            edr_process_session_id: None,
+            edr_process_controlling_tty: None,
+            edr_process_kernel_start_boottime: None,
+            process_name: alert.event.process_name.clone(),
+            process_command_line: None,
+            process_pid: None,
+            process_parent_executable: None,
+            process_parent_name: None,
+            process_parent_command_line: None,
+            process_parent_pid: None,
+            process_working_directory: None,
+            edr_process_integrity_level: None,
+            process_original_file_name: None,
+            process_product: None,
+            process_description: None,
+            process_company: None,
+            process_file_version: None,
+            process_hash_md5: None,
+            process_hash_sha1: None,
+            process_hash_sha256: None,
+            process_pe_imphash: None,
+            user_name: None,
+            user_id: None,
+            user_domain: None,
+            winlog_logon_id: None,
+            winlog_logon_guid: None,
+            destination_ip: None,
+            destination_port: None,
+            source_ip: None,
+            source_port: None,
+            destination_domain: None,
+            network_transport: None,
+            network_type: None,
+            network_protocol: None,
+            network_direction: None,
+            file_path: None,
+            file_name: None,
+            file_extension: None,
+            file_created: None,
+            edr_file_previous_created: None,
+            edr_file_path_truncated: None,
+            edr_dns_query_truncated: None,
+            file_original_file_name: None,
+            file_product: None,
+            file_description: None,
+            file_company: None,
+            file_file_version: None,
+            file_code_signature_exists: None,
+            file_code_signature_subject_name: None,
+            file_code_signature_status: None,
+            file_code_signature_valid: None,
+            dll_name: None,
+            dll_path: None,
+            dll_hash_md5: None,
+            dll_hash_sha1: None,
+            dll_hash_sha256: None,
+            dll_pe_imphash: None,
+            registry_path: None,
+            registry_hive: None,
+            registry_key: None,
+            registry_value: None,
+            registry_data_strings: None,
+            edr_registry_event_type: None,
+            edr_registry_new_name: None,
+            dns_query: None,
+            dns_answers: None,
+            dns_response_code: None,
+            dns_resolved_ip: None,
+            service_name: None,
+            edr_service_executable: None,
+            edr_service_type: None,
+            edr_service_start_type: None,
+            edr_service_account_name: None,
+            edr_event_log_provider_name: None,
+            edr_task_name: None,
+            edr_task_content: None,
+            edr_task_user_name: None,
+            edr_powershell_script_block_text: None,
+            edr_powershell_script_block_id: None,
+            edr_powershell_message_number: None,
+            edr_powershell_message_total: None,
+            edr_powershell_context_info: None,
+            edr_powershell_payload: None,
+            edr_powershell_data: None,
+            edr_wmi_operation: None,
+            edr_wmi_query: None,
+            edr_wmi_namespace: None,
+            edr_wmi_event_type: None,
+            edr_process_target_image: None,
+            edr_security: None,
+            related_ip: None,
+            related_user: None,
+            edr_match: alert.match_details.clone(),
+            edr_replay: None,
+            edr_agent_loss: None,
+            edr_agent_tamper: None,
+            edr_agent_lifecycle: None,
+        };
+
+        // Map internal fields to ECS based on event type
+        match &alert.event.fields {
+            EventFields::ProcessCreation(f) => {
+                ecs.windows_process_metadata = f.windows.clone();
+                ecs.user_id = f
+                    .windows
+                    .as_ref()
+                    .and_then(|metadata| metadata.user_sid.clone());
+                ecs.process_executable = f.image.clone();
+                ecs.edr_process_image_source = f.image_source.clone();
+                ecs.edr_process_image_truncated = f.image_truncated;
+                ecs.edr_process_cgroup_id = f.cgroup_id.clone();
+                ecs.edr_process_cgroup_path = f.container.cgroup_path.clone();
+                ecs.container_id = f.container.container_id.clone();
+                ecs.container_runtime = f.container.container_runtime.clone();
+                ecs.edr_process_real_user_id =
+                    f.exec.as_ref().and_then(|exec| exec.real_user_id.clone());
+                ecs.edr_process_real_group_id = f.linux_identity.real_group_id.clone();
+                ecs.edr_process_effective_user_id = f.linux_identity.effective_user_id.clone();
+                ecs.edr_process_effective_group_id = f.linux_identity.effective_group_id.clone();
+                ecs.edr_process_mount_namespace = f.linux_identity.mount_namespace.clone();
+                ecs.edr_process_pid_namespace = f.linux_identity.pid_namespace.clone();
+                ecs.edr_process_network_namespace = f.linux_identity.network_namespace.clone();
+                ecs.edr_process_session_id = f.linux_identity.session_id.clone();
+                ecs.edr_process_controlling_tty = f.linux_identity.controlling_tty.clone();
+                ecs.edr_process_kernel_start_boottime = f.linux_identity.kernel_start_boottime;
+                ecs.process_command_line = f.command_line.clone();
+                ecs.process_pid = parse_u64(&f.process_id);
+                ecs.process_parent_executable = f.parent_image.clone();
+                ecs.process_parent_command_line = f.parent_command_line.clone();
+                ecs.process_parent_pid = parse_u64(&f.parent_process_id);
+                ecs.process_working_directory = f.current_directory.clone();
+                ecs.edr_process_integrity_level = f.integrity_level.clone();
+                ecs.process_original_file_name = f.original_file_name.clone();
+                ecs.process_product = f.product.clone();
+                ecs.process_description = f.description.clone();
+                ecs.process_company = f.company.clone();
+                ecs.process_file_version = f.file_version.clone();
+                let digests = SysmonDigests::parse(f.hashes.as_deref());
+                ecs.process_hash_md5 = digests.md5;
+                ecs.process_hash_sha1 = digests.sha1;
+                ecs.process_hash_sha256 = digests.sha256;
+                ecs.process_pe_imphash = f.imphash.clone().or(digests.imphash);
+                apply_user_fields(&mut ecs, f.user.as_deref());
+                ecs.edr_process_target_image = f.target_image.clone();
+            }
+            EventFields::NetworkConnection(f) => {
+                ecs.process_executable = f.image.clone();
+                ecs.process_pid = parse_u64(&f.process_id);
+                ecs.destination_ip = f.destination_ip.clone();
+                ecs.destination_port = parse_u16(&f.destination_port);
+                ecs.source_ip = f.source_ip.clone();
+                ecs.source_port = parse_u16(&f.source_port);
+                ecs.destination_domain = f.destination_hostname.clone();
+                ecs.network_transport = f
+                    .protocol
+                    .clone()
+                    .or_else(|| network_transport_from_opcode(opcode));
+                if let Some(ip) = ecs.source_ip.as_deref().or(ecs.destination_ip.as_deref()) {
+                    ecs.network_type = network_type_from_ip(ip);
+                }
+                ecs.network_direction = f.initiated.map(network_direction_from_initiated);
+                apply_user_fields(&mut ecs, f.user.as_deref());
+            }
+            EventFields::FileEvent(f) => {
+                ecs.file_path = f.target_filename.clone();
+                ecs.file_created = f.creation_utc_time.clone();
+                ecs.edr_file_previous_created = f.previous_creation_utc_time.clone();
+                ecs.edr_file_path_truncated = f.path_truncated.clone();
+                ecs.process_executable = f.image.clone();
+                ecs.process_pid = parse_u64(&f.process_id);
+                apply_user_fields(&mut ecs, f.user.as_deref());
+            }
+            EventFields::RegistryEvent(f) => {
+                ecs.registry_path = f.target_object.clone();
+                if let Some(path) = f.target_object.as_deref() {
+                    let (hive, key, value) = split_registry_path(path, f.event_type.as_deref());
+                    ecs.registry_hive = hive;
+                    ecs.registry_key = key;
+                    ecs.registry_value = value;
+                }
+                ecs.registry_data_strings = f.details.as_ref().map(|value| vec![value.clone()]);
+                ecs.edr_registry_event_type = f.event_type.clone();
+                ecs.edr_registry_new_name = f.new_name.clone();
+                ecs.process_executable = f.image.clone();
+                ecs.process_pid = parse_u64(&f.process_id);
+                apply_user_fields(&mut ecs, f.user.as_deref());
+                if let Some(event_type) = &f.event_type {
+                    ecs.event_action = Some(event_type.clone());
+                }
+            }
+            EventFields::DnsQuery(f) => {
+                apply_user_fields(&mut ecs, f.user.as_deref());
+                ecs.dns_query = f.query_name.clone();
+                if let Some(results) = &f.query_results {
+                    ecs.dns_answers = Some(vec![DnsAnswer {
+                        data: results.clone(),
+                    }]);
+                    let ips = extract_ips(results);
+                    if !ips.is_empty() {
+                        ecs.dns_resolved_ip = Some(ips);
+                    }
+                }
+                ecs.dns_response_code = f.query_status.clone();
+                ecs.edr_dns_query_truncated = f.query_truncated.clone();
+                ecs.network_protocol = Some("dns".to_string());
+                ecs.process_executable = f.image.clone();
+                ecs.process_pid = parse_u64(&f.process_id);
+            }
+            EventFields::ImageLoad(f) => {
+                ecs.file_path = f.image_loaded.clone();
+                ecs.file_original_file_name = f.original_file_name.clone();
+                ecs.file_product = f.product.clone();
+                ecs.file_description = f.description.clone();
+                ecs.file_company = f.company.clone();
+                ecs.file_file_version = f.file_version.clone();
+                ecs.file_code_signature_exists = parse_bool(&f.signed);
+                ecs.file_code_signature_subject_name = f.signature.clone();
+                ecs.file_code_signature_status = f.signature_status.clone();
+                ecs.file_code_signature_valid = f
+                    .signature_status
+                    .as_deref()
+                    .map(|status| status.eq_ignore_ascii_case("Valid"));
+                ecs.dll_path = f.image_loaded.clone();
+                ecs.dll_name = f.image_loaded.as_deref().and_then(basename);
+                let digests = SysmonDigests::parse(f.hashes.as_deref());
+                ecs.dll_hash_md5 = digests.md5;
+                ecs.dll_hash_sha1 = digests.sha1;
+                ecs.dll_hash_sha256 = digests.sha256;
+                ecs.dll_pe_imphash = f.imphash.clone().or(digests.imphash);
+                ecs.process_executable = f.image.clone();
+                ecs.process_pid = parse_u64(&f.process_id);
+                apply_user_fields(&mut ecs, f.user.as_deref());
+            }
+            EventFields::PowerShellScript(f) => {
+                ecs.process_executable = f.image.clone();
+                ecs.process_pid = parse_u64(&f.process_id);
+                apply_user_fields(&mut ecs, f.user.as_deref());
+                ecs.file_path = f.path.clone();
+                ecs.edr_powershell_script_block_text = f.script_block_text.clone();
+                ecs.edr_powershell_script_block_id = f.script_block_id.clone();
+                ecs.edr_powershell_message_number = f.message_number.clone();
+                ecs.edr_powershell_message_total = f.message_total.clone();
+            }
+            EventFields::PowerShellModule(f) => {
+                ecs.process_executable = f.image.clone();
+                ecs.process_pid = parse_u64(&f.process_id);
+                apply_user_fields(&mut ecs, f.user.as_deref());
+                ecs.edr_powershell_context_info = f.context_info.clone();
+                ecs.edr_powershell_payload = f.payload.clone();
+            }
+            EventFields::PowerShellClassicStart(f) => {
+                ecs.edr_powershell_data = f.data.clone();
+            }
+            EventFields::WmiEvent(f) => {
+                ecs.process_executable = f.image.clone();
+                ecs.process_pid = parse_u64(&f.process_id);
+                apply_user_fields(&mut ecs, f.user.as_deref());
+                ecs.destination_domain = f.destination_hostname.clone();
+                ecs.edr_wmi_operation = f.operation.clone();
+                ecs.edr_wmi_query = f.query.clone();
+                ecs.edr_wmi_namespace = f.event_namespace.clone();
+                ecs.edr_wmi_event_type = f.event_type.clone();
+                if let Some(operation) = &f.operation {
+                    ecs.event_action = Some(operation.clone());
+                }
+            }
+            EventFields::ServiceCreation(f) => {
+                ecs.edr_event_log_provider_name = f.provider_name.clone();
+                ecs.service_name = f.service_name.clone();
+                ecs.edr_service_executable = f.service_file_name.clone();
+                ecs.edr_service_type = f.service_type.clone();
+                ecs.edr_service_start_type = f.start_type.clone();
+                ecs.edr_service_account_name = f.account_name.clone();
+                ecs.process_executable = f.image.clone();
+                ecs.process_pid = parse_u64(&f.process_id);
+                apply_user_fields(&mut ecs, f.user.as_deref());
+            }
+            EventFields::TaskCreation(f) => {
+                ecs.edr_task_name = f.task_name.clone();
+                ecs.edr_task_content = f.task_content.clone();
+                ecs.edr_task_user_name = f.user_name.clone();
+                ecs.process_executable = f.image.clone();
+                ecs.process_pid = parse_u64(&f.process_id);
+                apply_user_fields(&mut ecs, f.user.as_deref());
+            }
+            EventFields::SecurityAudit(f) => {
+                // Windows names the acting identity in three separate fields;
+                // the rest of the model carries one `DOMAIN\\user` string, so
+                // recompose it before handing it to the shared user mapping.
+                let subject = match (
+                    f.get_non_placeholder("SubjectDomainName"),
+                    f.get_non_placeholder("SubjectUserName"),
+                ) {
+                    (Some(domain), Some(name)) => Some(format!("{domain}\\{name}")),
+                    (None, Some(name)) => Some(name.to_string()),
+                    _ => None,
+                };
+                apply_user_fields(&mut ecs, subject.as_deref());
+                if ecs.user_id.is_none() {
+                    ecs.user_id = f.get_non_placeholder("SubjectUserSid").map(str::to_string);
+                }
+                ecs.winlog_logon_id = f.get_non_placeholder("SubjectLogonId").map(str::to_string);
+
+                // 4624 and 5145 name the machine the request came *from*.
+                ecs.source_ip = f.get_non_placeholder("IpAddress").map(str::to_string);
+                ecs.source_port = parse_u16(&f.get_non_placeholder("IpPort").map(str::to_string));
+
+                ecs.process_executable = f.get_non_placeholder("ProcessName").map(str::to_string);
+                ecs.process_pid = f.process_id().map(u64::from);
+
+                ecs.service_name = f.get_non_placeholder("ServiceName").map(str::to_string);
+                ecs.edr_service_executable =
+                    f.get_non_placeholder("ServiceFileName").map(str::to_string);
+                ecs.edr_service_type = f.get_non_placeholder("ServiceType").map(str::to_string);
+                ecs.edr_service_start_type = f
+                    .get_non_placeholder("ServiceStartType")
+                    .map(str::to_string);
+                ecs.edr_service_account_name =
+                    f.get_non_placeholder("ServiceAccount").map(str::to_string);
+
+                // 4698-4701 carry the task definition as `TaskContent`; an
+                // update (4702) carries the new one as `TaskContentNew`.
+                ecs.edr_task_name = f.get_non_placeholder("TaskName").map(str::to_string);
+                ecs.edr_task_content = f
+                    .get_non_placeholder("TaskContent")
+                    .or_else(|| f.get_non_placeholder("TaskContentNew"))
+                    .map(str::to_string);
+
+                if matches!(
+                    f.get_non_placeholder("ObjectType"),
+                    Some("File") | Some("Directory")
+                ) {
+                    ecs.file_path = f.get_non_placeholder("ObjectName").map(str::to_string);
+                }
+                if matches!(f.get_non_placeholder("ObjectType"), Some("Key")) {
+                    ecs.registry_path = f.get_non_placeholder("ObjectName").map(str::to_string);
+                }
+                if matches!(event_id, 4656 | 4663 | 5145) {
+                    ecs.event_category =
+                        ecs_object_access_category(f.get_non_placeholder("ObjectType"));
+                }
+
+                if !f.fields.is_empty() {
+                    ecs.edr_security = Some(f.fields.clone());
+                }
+            }
+            EventFields::ApplicationEvent(f) => {
+                ecs.edr_event_log_provider_name = f.get("Provider_Name").map(str::to_string);
+            }
+            EventFields::Generic(_) => {
+                // Generic events don't have structured field mapping
+            }
+        }
+
+        if let Some(context) = &alert.event.process_context {
+            Self::apply_process_context(&mut ecs, context);
+        }
+
+        if ecs.process_name.is_none() {
+            ecs.process_name = ecs.process_executable.as_deref().and_then(basename);
+        }
+
+        if ecs.process_parent_name.is_none() {
+            ecs.process_parent_name = ecs.process_parent_executable.as_deref().and_then(basename);
+        }
+
+        if ecs.network_direction.is_none() {
+            ecs.network_direction = network_direction_from_category(alert.event.category);
+        }
+
+        if ecs.file_name.is_none() {
+            if let Some(path) = ecs.file_path.as_deref() {
+                ecs.file_name = basename(path);
+            }
+        }
+
+        if ecs.file_extension.is_none() {
+            if let Some(path) = ecs.file_path.as_deref() {
+                ecs.file_extension = file_extension_from_path(path);
+            }
+        }
+
+        let mut related_ips = Vec::new();
+        if let Some(ip) = ecs.source_ip.as_ref() {
+            related_ips.push(ip.clone());
+        }
+        if let Some(ip) = ecs.destination_ip.as_ref() {
+            related_ips.push(ip.clone());
+        }
+        if let Some(ips) = ecs.dns_resolved_ip.as_ref() {
+            related_ips.extend(ips.iter().cloned());
+        }
+        related_ips.sort();
+        related_ips.dedup();
+        if !related_ips.is_empty() {
+            ecs.related_ip = Some(related_ips);
+        }
+
+        let mut related_users = Vec::new();
+        if let Some(user) = ecs.user_name.as_ref() {
+            related_users.push(user.clone());
+        }
+        if let Some(user_id) = ecs.user_id.as_ref() {
+            related_users.push(user_id.clone());
+        }
+        related_users.sort();
+        related_users.dedup();
+        if !related_users.is_empty() {
+            ecs.related_user = Some(related_users);
+        }
+
+        ecs
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::models::{
+        AlertSeverity, DetectionEngine, DnsQueryFields, EventCategory, FileEventFields,
+        MatchDetails, NetworkConnectionFields, NormalizedEvent, ProcessContext,
+        ProcessCreationFields, RegistryEventFields, SecurityAuditFields, ServiceCreationFields,
+    };
+    use crate::vocab::Platform;
+    use std::collections::HashMap;
+
+    /// Every file and registry action must mean the same thing to replay, ECS,
+    /// and Sigma as it does to the table the sensors number their events from.
+    #[test]
+    fn every_event_action_row_agrees_across_consumers() {
+        use crate::engine::Engine;
+        use crate::models::event_actions::EVENT_ACTIONS;
+        use crate::models::CanonicalEvent;
+
+        for row in EVENT_ACTIONS {
+            let codes = std::iter::once(row.action_code).chain(row.alias_codes.iter().copied());
+            for code in codes {
+                let mut view = crate::models::canonical::tests::recorded_view();
+                view.category = row.category;
+                view.opcode = code;
+                view.event_id = row.event_id;
+                let label = format!("{:?} {:?} code {code}", row.category, row.action);
+
+                // Replay recovers the action the live event carried.
+                let replayed = CanonicalEvent::from_normalized(view.clone());
+                assert_eq!(replayed.action, row.action, "replay: {label}");
+
+                // ECS output.
+                assert_eq!(
+                    event::ecs_event_action(row.category, code, row.event_id).as_deref(),
+                    Some(row.ecs_action),
+                    "ecs action: {label}"
+                );
+                assert_eq!(
+                    event::ecs_event_type(row.category, code, row.event_id),
+                    vec![row.ecs_type.to_string()],
+                    "ecs type: {label}"
+                );
+
+                // Sigma logsource categories.
+                let categories = match row.category {
+                    EventCategory::File => Engine::sigma_file_categories_for_event(&view),
+                    _ => Engine::sigma_registry_categories_for_event(&view),
+                };
+                assert_eq!(categories, row.sigma_categories, "sigma: {label}");
+            }
+        }
+    }
+
+    #[test]
+    fn test_ecs_process_creation() {
+        let alert = Alert {
+            severity: AlertSeverity::High,
+            rule_name: "Test Rule".to_string(),
+            rule_description: None,
+            rule_id: Some("sigma::test-rule-id".to_string()),
+            sigma_metadata: None,
+            engine: DetectionEngine::Sigma,
+            event: NormalizedEvent {
+                timestamp: "2026-01-06T00:00:00Z".to_string(),
+                source_seq: None,
+                ingest_seq: 9,
+                platform: Platform::Windows,
+                provider: "etw".to_string(),
+                category: EventCategory::Process,
+                event_id: 1,
+                event_id_string: "1".to_string(),
+                opcode: 1,
+                fields: EventFields::ProcessCreation(ProcessCreationFields {
+                    hashes: None,
+                    imphash: None,
+                    container: Default::default(),
+                    linux_identity: Default::default(),
+                    cgroup_id: Some("123456".to_string()),
+                    exec: Default::default(),
+                    parent_process_id_derived: false,
+                    windows: Default::default(),
+                    image: Some(r"C:\Windows\System32\cmd.exe".to_string()),
+                    image_source: None,
+                    image_truncated: None,
+                    command_line: Some("cmd.exe /c whoami".to_string()),
+                    process_id: Some("1234".to_string()),
+                    process_start_time: None,
+                    parent_image: Some(r"C:\Windows\explorer.exe".to_string()),
+                    user: Some("SYSTEM".to_string()),
+                    original_file_name: None,
+                    product: None,
+                    description: None,
+                    company: None,
+                    file_version: None,
+                    target_image: None,
+                    parent_process_id: None,
+                    parent_command_line: None,
+                    parent_user: None,
+                    current_directory: None,
+                    integrity_level: None,
+                    logon_id: None,
+                }),
+                process_name: None,
+                provenance: Default::default(),
+                process_context: None,
+            },
+            match_details: None,
+        };
+
+        let ecs = EcsAlert::from(&alert);
+        assert_eq!(ecs.ecs_version, ECS_VERSION);
+        assert_eq!(ecs.event_kind, "alert");
+        assert_eq!(ecs.event_module, EVENT_MODULE);
+        assert_eq!(ecs.event_dataset, "edr.process");
+        assert_eq!(ecs.event_provider, "etw");
+        assert_eq!(ecs.event_source_seq, None);
+        assert_eq!(ecs.event_ingest_seq, 9);
+        let json = serde_json::to_value(&ecs).expect("ECS alert serializes");
+        assert!(json.get("event.sequence").is_none());
+        assert_eq!(json["edr.event.ingest_seq"], 9);
+        assert_eq!(ecs.host_os_type, "windows");
+        assert_eq!(ecs.host_os_family, "windows");
+        assert_eq!(ecs.event_category, vec!["process".to_string()]);
+        assert_eq!(ecs.event_type, vec!["start".to_string()]);
+        assert_eq!(ecs.event_action.as_deref(), Some("process-start"));
+        assert_eq!(ecs.event_code.as_deref(), Some("1"));
+        assert_eq!(ecs.event_severity, Some(75));
+        assert_eq!(ecs.rule_name, "Test Rule");
+        assert_eq!(ecs.rule_id.as_deref(), Some("sigma::test-rule-id"));
+        assert_eq!(ecs.edr_rule_severity, "High");
+        assert_eq!(ecs.edr_rule_engine, "Sigma");
+        assert_eq!(
+            ecs.process_executable.as_deref(),
+            Some(r"C:\Windows\System32\cmd.exe")
+        );
+        assert_eq!(ecs.process_pid, Some(1234));
+        assert_eq!(ecs.edr_process_cgroup_id.as_deref(), Some("123456"));
+        assert_eq!(ecs.process_name.as_deref(), Some("cmd.exe"));
+        assert_eq!(ecs.user_name.as_deref(), Some("SYSTEM"));
+        assert!(ecs.edr_process_target_image.is_none());
+
+        let json = serde_json::to_value(&ecs).expect("ECS alert serializes");
+        assert!(json.get("edr.process.target_image").is_none());
+    }
+
+    #[test]
+    fn test_ecs_linux_container_context() {
+        const ID: &str = "4f0a3c1b2d5e6f708192a3b4c5d6e7f8091a2b3c4d5e6f708192a3b4c5d6e7f8";
+        let event = NormalizedEvent {
+            timestamp: "2026-01-06T00:00:00Z".to_string(),
+            source_seq: None,
+            ingest_seq: 1,
+            platform: Platform::Linux,
+            provider: "ebpf".to_string(),
+            category: EventCategory::Process,
+            event_id: 1,
+            event_id_string: "1".to_string(),
+            opcode: 1,
+            fields: EventFields::ProcessCreation(ProcessCreationFields {
+                hashes: None,
+                imphash: None,
+                container: Box::new(crate::models::LinuxContainerContext {
+                    cgroup_path: Some(format!("/system.slice/docker-{ID}.scope")),
+                    container_id: Some(ID.to_string()),
+                    container_runtime: Some("docker".to_string()),
+                }),
+                linux_identity: Default::default(),
+                cgroup_id: Some("8812".to_string()),
+                exec: Default::default(),
+                parent_process_id_derived: false,
+                windows: Default::default(),
+                image: Some("/bin/sh".to_string()),
+                image_source: Some("execve".to_string()),
+                image_truncated: None,
+                command_line: Some("sh -c id".to_string()),
+                process_id: Some("4321".to_string()),
+                process_start_time: None,
+                parent_image: None,
+                user: None,
+                original_file_name: None,
+                product: None,
+                description: None,
+                company: None,
+                file_version: None,
+                target_image: None,
+                parent_process_id: None,
+                parent_command_line: None,
+                parent_user: None,
+                current_directory: None,
+                integrity_level: None,
+                logon_id: None,
+            }),
+            process_name: None,
+            provenance: Default::default(),
+            process_context: None,
+        };
+        let alert = Alert {
+            severity: AlertSeverity::High,
+            rule_name: "Container".to_string(),
+            rule_description: None,
+            rule_id: None,
+            sigma_metadata: None,
+            engine: DetectionEngine::Sigma,
+            event,
+            match_details: None,
+        };
+
+        let json = serde_json::to_value(EcsAlert::from(&alert)).expect("ECS alert serializes");
+        assert_eq!(json["container.id"], ID);
+        assert_eq!(json["container.runtime"], "docker");
+        assert_eq!(
+            json["edr.process.cgroup_path"],
+            format!("/system.slice/docker-{ID}.scope")
+        );
+        assert_eq!(json["edr.process.cgroup_id"], "8812");
+    }
+
+    #[test]
+    fn test_ecs_service_creation() {
+        let alert = Alert {
+            severity: AlertSeverity::Critical,
+            rule_name: "Suspicious Service".to_string(),
+            rule_description: None,
+            rule_id: None,
+            sigma_metadata: None,
+            engine: DetectionEngine::Sigma,
+            event: NormalizedEvent {
+                timestamp: "2026-01-06T00:00:00Z".to_string(),
+                source_seq: Some(81234),
+                ingest_seq: 10,
+                platform: Platform::Windows,
+                provider: "windows_event_log".to_string(),
+                category: EventCategory::Service,
+                event_id: 7045,
+                event_id_string: "7045".to_string(),
+                opcode: 0,
+                fields: EventFields::ServiceCreation(ServiceCreationFields {
+                    provider_name: Some("Service Control Manager".to_string()),
+                    service_name: Some("BackdoorSvc".to_string()),
+                    service_file_name: Some(r"C:\Temp\evil.exe".to_string()),
+                    service_type: Some("0x10".to_string()),
+                    start_type: Some("2".to_string()),
+                    account_name: Some("LocalSystem".to_string()),
+                    user: Some("Administrator".to_string()),
+                    process_id: None,
+                    image: None,
+                }),
+                process_name: None,
+                provenance: Default::default(),
+                process_context: None,
+            },
+            match_details: None,
+        };
+
+        let ecs = EcsAlert::from(&alert);
+        assert_eq!(ecs.event_category, vec!["configuration".to_string()]);
+        assert_eq!(ecs.event_type, vec!["creation".to_string()]);
+        assert_eq!(ecs.service_name, Some("BackdoorSvc".to_string()));
+        assert_eq!(
+            ecs.edr_service_executable,
+            Some(r"C:\Temp\evil.exe".to_string())
+        );
+        // The two providers are different things and both are reported: the
+        // sensor that collected the record, and the Windows provider that
+        // wrote it.
+        assert_eq!(ecs.event_provider, "windows_event_log");
+        assert_eq!(ecs.event_source_seq, Some(81234));
+        assert_eq!(ecs.event_ingest_seq, 10);
+        let json = serde_json::to_value(&ecs).expect("ECS alert serializes");
+        assert_eq!(json["event.sequence"], 81234);
+        assert_eq!(json["edr.event.ingest_seq"], 10);
+        assert_eq!(
+            ecs.edr_event_log_provider_name,
+            Some("Service Control Manager".to_string())
+        );
+        assert_eq!(ecs.edr_rule_severity, "Critical");
+        assert_eq!(ecs.event_severity, Some(100));
+    }
+
+    #[test]
+    fn test_ecs_process_context_fallback() {
+        let alert = Alert {
+            severity: AlertSeverity::High,
+            rule_name: "Context Test".to_string(),
+            rule_description: None,
+            rule_id: None,
+            sigma_metadata: None,
+            engine: DetectionEngine::Sigma,
+            event: NormalizedEvent {
+                timestamp: "2026-01-06T00:00:00Z".to_string(),
+                source_seq: None,
+                ingest_seq: 0,
+                platform: Platform::Windows,
+                provider: "etw".to_string(),
+                category: EventCategory::Service,
+                event_id: 7045,
+                event_id_string: "7045".to_string(),
+                opcode: 0,
+                fields: EventFields::ServiceCreation(ServiceCreationFields {
+                    provider_name: Some("Service Control Manager".to_string()),
+                    service_name: Some("UpdaterSvc".to_string()),
+                    service_file_name: Some(r"C:\Temp\updater.exe".to_string()),
+                    service_type: None,
+                    start_type: None,
+                    account_name: None,
+                    user: None,
+                    process_id: None,
+                    image: None,
+                }),
+                process_name: None,
+                provenance: Default::default(),
+                process_context: Some(ProcessContext {
+                    image: Some(r"C:\Windows\System32\svchost.exe".to_string()),
+                    command_line: Some("svchost.exe -k netsvcs".to_string()),
+                    process_id: Some("4321".to_string()),
+                    process_start_time: None,
+                    parent_process_id: Some("100".to_string()),
+                    parent_image: Some(r"C:\Windows\System32\services.exe".to_string()),
+                    parent_command_line: Some("services.exe".to_string()),
+                    original_file_name: Some("svchost.exe".to_string()),
+                    product: Some("Microsoft Windows".to_string()),
+                    description: Some("Host Process".to_string()),
+                    company: None,
+                    file_version: None,
+                    current_directory: Some(r"C:\Windows\System32".to_string()),
+                    integrity_level: Some("System".to_string()),
+                    user: Some(r"NT AUTHORITY\SYSTEM".to_string()),
+                }),
+            },
+            match_details: None,
+        };
+
+        let ecs = EcsAlert::from(&alert);
+        assert_eq!(
+            ecs.process_command_line,
+            Some("svchost.exe -k netsvcs".to_string())
+        );
+        assert_eq!(
+            ecs.process_parent_executable,
+            Some(r"C:\Windows\System32\services.exe".to_string())
+        );
+        assert_eq!(
+            ecs.process_original_file_name,
+            Some("svchost.exe".to_string())
+        );
+        assert_eq!(ecs.process_pid, Some(4321));
+        assert_eq!(ecs.user_name.as_deref(), Some("SYSTEM"));
+        assert_eq!(ecs.user_domain.as_deref(), Some("NT AUTHORITY"));
+    }
+
+    #[test]
+    fn test_ecs_registry_mapping() {
+        let alert = Alert {
+            severity: AlertSeverity::Medium,
+            rule_name: "Registry Test".to_string(),
+            rule_description: None,
+            rule_id: None,
+            sigma_metadata: None,
+            engine: DetectionEngine::Sigma,
+            event: NormalizedEvent {
+                timestamp: "2026-01-06T00:00:00Z".to_string(),
+                source_seq: None,
+                ingest_seq: 0,
+                platform: Platform::Windows,
+                provider: "etw".to_string(),
+                category: EventCategory::Registry,
+                event_id: 13,
+                event_id_string: "13".to_string(),
+                opcode: 39,
+                fields: EventFields::RegistryEvent(RegistryEventFields {
+                    target_object: Some(r"HKLM\Software\Test\Value".to_string()),
+                    details: Some("DWORD (0x00000001)".to_string()),
+                    process_id: Some("42".to_string()),
+                    image: Some(r"C:\Windows\System32\reg.exe".to_string()),
+                    event_type: Some("SetValue".to_string()),
+                    user: Some("SYSTEM".to_string()),
+                    new_name: None,
+                }),
+                process_name: None,
+                provenance: Default::default(),
+                process_context: None,
+            },
+            match_details: None,
+        };
+
+        let ecs = EcsAlert::from(&alert);
+        assert_eq!(ecs.registry_hive, Some("HKLM".to_string()));
+        assert_eq!(ecs.registry_key, Some(r"Software\Test".to_string()));
+        assert_eq!(ecs.registry_value, Some("Value".to_string()));
+        assert_eq!(
+            ecs.registry_data_strings,
+            Some(vec!["DWORD (0x00000001)".to_string()])
+        );
+        assert_eq!(ecs.event_action, Some("SetValue".to_string()));
+    }
+
+    fn network_alert(initiated: Option<bool>) -> Alert {
+        Alert {
+            severity: AlertSeverity::Medium,
+            rule_name: "Network Test".to_string(),
+            rule_description: None,
+            rule_id: None,
+            sigma_metadata: None,
+            engine: DetectionEngine::Sigma,
+            event: NormalizedEvent {
+                timestamp: "2026-01-06T00:00:00Z".to_string(),
+                source_seq: None,
+                ingest_seq: 0,
+                platform: Platform::Windows,
+                provider: "etw".to_string(),
+                category: EventCategory::Network,
+                event_id: 3,
+                event_id_string: "3".to_string(),
+                opcode: 12,
+                fields: EventFields::NetworkConnection(NetworkConnectionFields {
+                    destination_ip: Some("198.51.100.10".to_string()),
+                    source_ip: Some("10.0.0.5".to_string()),
+                    destination_port: Some("443".to_string()),
+                    source_port: Some("51324".to_string()),
+                    process_id: Some("4188".to_string()),
+                    image: Some(r"C:\Windows\System32\curl.exe".to_string()),
+                    user: None,
+                    destination_hostname: None,
+                    protocol: Some("tcp".to_string()),
+                    initiated,
+                }),
+                process_name: None,
+                provenance: Default::default(),
+                process_context: None,
+            },
+            match_details: None,
+        }
+    }
+
+    #[test]
+    fn network_direction_follows_the_connection_direction() {
+        // An accepted connection is inbound. Before `Initiated` existed every
+        // network alert was reported `egress`, which put inbound connections on
+        // the wrong side of any direction-aware SIEM query.
+        let outbound = EcsAlert::from(&network_alert(Some(true)));
+        assert_eq!(outbound.network_direction, Some("egress".to_string()));
+
+        let inbound = EcsAlert::from(&network_alert(Some(false)));
+        assert_eq!(inbound.network_direction, Some("ingress".to_string()));
+    }
+
+    #[test]
+    fn an_unknown_direction_falls_back_to_the_category_default() {
+        // Sensors that cannot report a direction capture outbound traffic, so
+        // the category default still describes them.
+        let ecs = EcsAlert::from(&network_alert(None));
+        assert_eq!(ecs.network_direction, Some("egress".to_string()));
+    }
+
+    #[test]
+    fn windows_source_evidence_and_derived_values_survive_recording_and_ecs() {
+        let mut alert = network_alert(Some(true));
+        alert.event.category = EventCategory::Process;
+        alert.event.fields = EventFields::ProcessCreation(serde_json::from_value(serde_json::json!({
+            "CommandLine": "measured plus recovered suffix", "User": "DOMAIN\\alice",
+            "WindowsProcessMetadata": { "command_line_source": "live_query", "classic_command_line": "measured",
+                "conflicting_live_command_line": "measured plus recovered suffix", "user_sid": "S-1-5-21-42", "session_id": 1 }
+        })).unwrap());
+        alert
+            .event
+            .provenance
+            .mark_derived("WindowsProcessMetadata.conflicting_live_command_line");
+        alert.event.provenance.mark_derived("CommandLine");
+        let recorded = serde_json::to_vec(&alert.event).unwrap();
+        alert.event = serde_json::from_slice(&recorded).unwrap();
+        let json = serde_json::to_value(EcsAlert::from(&alert)).unwrap();
+        assert_eq!(
+            json["process.command_line"],
+            "measured plus recovered suffix"
+        );
+        assert_eq!(
+            json["edr.process.windows_metadata"]["classic_command_line"],
+            "measured"
+        );
+        assert_eq!(json["user.id"], "S-1-5-21-42");
+        assert_eq!(
+            json["edr.process.windows_metadata"]["conflicting_live_command_line"],
+            "measured plus recovered suffix"
+        );
+        assert_eq!(json["edr.event.provenance"][0]["fidelity"], "derived");
+    }
+
+    #[test]
+    fn ecs_carries_field_provenance() {
+        let mut alert = network_alert(Some(true));
+        alert.event.provenance.mark_derived("Image");
+        alert
+            .event
+            .provenance
+            .mark("Image", crate::models::Fidelity::Truncated);
+
+        let json = serde_json::to_value(EcsAlert::from(&alert)).expect("ECS serializes");
+        assert_eq!(json["edr.event.provenance"][0]["field"], "Image");
+        assert_eq!(json["edr.event.provenance"][0]["fidelity"], "derived");
+        assert_eq!(json["edr.event.provenance"][1]["fidelity"], "truncated");
+    }
+
+    #[test]
+    fn native_short_name_does_not_supply_an_executable_path() {
+        let mut alert = network_alert(None);
+        alert.event.process_name = Some("curl".into());
+        if let EventFields::NetworkConnection(fields) = &mut alert.event.fields {
+            fields.image = None;
+        }
+        let ecs = EcsAlert::from(&alert);
+        assert_eq!(ecs.process_name.as_deref(), Some("curl"));
+        assert!(ecs.process_executable.is_none());
+    }
+
+    #[test]
+    fn an_absent_source_ip_leaves_related_ip_to_the_destination() {
+        // `related.ip` is a correlation field. A sensor that cannot see the
+        // local address reports none, and nothing may be invented in its
+        // place — a fabricated entry there is indistinguishable from a host
+        // that really used that address.
+        let mut alert = network_alert(Some(true));
+        if let EventFields::NetworkConnection(fields) = &mut alert.event.fields {
+            fields.source_ip = None;
+            fields.source_port = None;
+        }
+
+        let ecs = EcsAlert::from(&alert);
+        assert!(ecs.source_ip.is_none());
+        assert!(ecs.source_port.is_none());
+        assert_eq!(
+            ecs.related_ip,
+            Some(vec!["198.51.100.10".to_string()]),
+            "related.ip should carry the destination alone"
+        );
+        // The type still describes the connection, derived from the address
+        // the sensor actually observed.
+        assert_eq!(ecs.network_type, Some("ipv4".to_string()));
+    }
+
+    #[test]
+    fn security_placeholders_remain_raw_but_do_not_populate_ecs_values() {
+        let mut alert = network_alert(None);
+        let mut fields = SecurityAuditFields::default();
+        fields.insert("IpAddress", "-");
+        fields.insert("ProcessName", "-");
+        fields.insert("SubjectUserName", "-");
+        alert.event.provider = "windows_event_log".to_string();
+        alert.event.category = EventCategory::Security;
+        alert.event.event_id = 4624;
+        alert.event.event_id_string = "4624".to_string();
+        alert.event.fields = EventFields::SecurityAudit(fields);
+
+        let ecs = EcsAlert::from(&alert);
+        assert!(ecs.source_ip.is_none());
+        assert!(ecs.related_ip.is_none());
+        assert!(ecs.process_executable.is_none());
+        assert!(ecs.user_name.is_none());
+        assert_eq!(
+            ecs.edr_security
+                .as_ref()
+                .and_then(|fields| fields.get("IpAddress"))
+                .map(String::as_str),
+            Some("-")
+        );
+    }
+
+    #[test]
+    fn test_ecs_dns_mapping() {
+        let alert = Alert {
+            severity: AlertSeverity::Low,
+            rule_name: "DNS Test".to_string(),
+            rule_description: None,
+            rule_id: None,
+            sigma_metadata: None,
+            engine: DetectionEngine::Sigma,
+            event: NormalizedEvent {
+                timestamp: "2026-01-06T00:00:00Z".to_string(),
+                source_seq: None,
+                ingest_seq: 0,
+                platform: Platform::Linux,
+                provider: "ebpf".to_string(),
+                category: EventCategory::Dns,
+                event_id: 22,
+                event_id_string: "22".to_string(),
+                opcode: 0,
+                fields: EventFields::DnsQuery(DnsQueryFields {
+                    query_truncated: None,
+                    user: None,
+                    query_name: Some("example.com".to_string()),
+                    query_results: Some("1.1.1.1".to_string()),
+                    record_type: Some("A".to_string()),
+                    query_status: Some("NOERROR".to_string()),
+                    process_id: None,
+                    image: None,
+                }),
+                process_name: None,
+                provenance: Default::default(),
+                process_context: None,
+            },
+            match_details: None,
+        };
+
+        let ecs = EcsAlert::from(&alert);
+        assert_eq!(ecs.event_category, vec!["network".to_string()]);
+        assert_eq!(ecs.event_type, vec!["protocol".to_string()]);
+        assert_eq!(ecs.network_protocol, Some("dns".to_string()));
+        assert_eq!(ecs.network_direction, Some("egress".to_string()));
+        assert_eq!(ecs.event_provider, "ebpf");
+        assert_eq!(ecs.host_os_type, "linux");
+        assert_eq!(ecs.host_os_family, "linux");
+        assert_eq!(ecs.dns_query, Some("example.com".to_string()));
+        let answers = ecs.dns_answers.expect("dns.answers should be set");
+        assert_eq!(answers.len(), 1);
+        assert_eq!(answers[0].data, "1.1.1.1");
+        assert_eq!(ecs.dns_resolved_ip, Some(vec!["1.1.1.1".to_string()]));
+        assert_eq!(ecs.related_ip, Some(vec!["1.1.1.1".to_string()]));
+        assert_eq!(ecs.dns_response_code, Some("NOERROR".to_string()));
+    }
+
+    #[test]
+    fn test_ecs_file_enrichment() {
+        let alert = Alert {
+            severity: AlertSeverity::Low,
+            rule_name: "File Test".to_string(),
+            rule_description: None,
+            rule_id: None,
+            sigma_metadata: None,
+            engine: DetectionEngine::Sigma,
+            event: NormalizedEvent {
+                timestamp: "2026-01-06T00:00:00Z".to_string(),
+                source_seq: None,
+                ingest_seq: 0,
+                platform: Platform::Windows,
+                provider: "etw".to_string(),
+                category: EventCategory::File,
+                event_id: 11,
+                event_id_string: "11".to_string(),
+                opcode: 64,
+                fields: EventFields::FileEvent(FileEventFields {
+                    source_filename: None,
+                    target_filename: Some(r"C:\Users\alice\evil.ps1".to_string()),
+                    process_id: Some("777".to_string()),
+                    image: Some(r"C:\Windows\System32\cmd.exe".to_string()),
+                    creation_utc_time: Some("2026-01-06T00:00:00Z".to_string()),
+                    previous_creation_utc_time: None,
+                    user: Some("ALICE".to_string()),
+                    file_identity: None,
+                    path_truncated: None,
+                }),
+                process_name: None,
+                provenance: Default::default(),
+                process_context: None,
+            },
+            match_details: None,
+        };
+
+        let ecs = EcsAlert::from(&alert);
+        assert_eq!(ecs.event_dataset, "edr.file");
+        assert_eq!(ecs.file_name.as_deref(), Some("evil.ps1"));
+        assert_eq!(ecs.file_extension.as_deref(), Some("ps1"));
+        assert_eq!(ecs.related_user, Some(vec!["ALICE".to_string()]));
+    }
+
+    #[test]
+    fn test_ecs_match_details_serialization() {
+        let alert = Alert {
+            severity: AlertSeverity::Low,
+            rule_name: "Match Details".to_string(),
+            rule_description: None,
+            rule_id: None,
+            sigma_metadata: None,
+            engine: DetectionEngine::Sigma,
+            event: NormalizedEvent {
+                timestamp: "2026-02-04T00:00:00Z".to_string(),
+                source_seq: None,
+                ingest_seq: 0,
+                platform: Platform::Windows,
+                provider: "etw".to_string(),
+                category: EventCategory::Process,
+                event_id: 1,
+                event_id_string: "1".to_string(),
+                opcode: 1,
+                fields: EventFields::Generic(HashMap::new()),
+                process_name: None,
+                provenance: Default::default(),
+                process_context: None,
+            },
+            match_details: Some(MatchDetails {
+                summary: "condition matched: selection1".to_string(),
+                sigma: None,
+                correlation: None,
+                yara: None,
+            }),
+        };
+
+        let ecs = EcsAlert::from(&alert);
+        let json = serde_json::to_value(&ecs).unwrap();
+        let match_obj = json.get("edr.match").unwrap();
+        assert_eq!(
+            match_obj.get("summary").unwrap(),
+            "condition matched: selection1"
+        );
+    }
+}

@@ -1,0 +1,1378 @@
+use super::dns_name;
+use super::{CanonicalField, CanonicalValue, EventFields, FieldView, FieldViewName};
+use crate::vocab::Platform;
+use serde::{Deserialize, Serialize};
+
+/// Known limitation on the evidentiary fidelity of a populated field.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Fidelity {
+    Derived,
+    BestEffort,
+    Truncated,
+    Stale,
+}
+
+/// Compact identifiers for fields with known reconstruction paths. Unknown
+/// names remain round-trippable for recordings from newer collectors.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub enum FieldId {
+    Image,
+    CommandLine,
+    ProcessId,
+    ProcessStartTime,
+    ParentProcessId,
+    ParentImage,
+    ParentCommandLine,
+    ParentUser,
+    User,
+    OriginalFileName,
+    Product,
+    Description,
+    Company,
+    FileVersion,
+    CurrentDirectory,
+    IntegrityLevel,
+    DestinationHostname,
+    TargetFilename,
+    SourceFilename,
+    TargetObject,
+    EventID,
+    WindowsLiveCommandLine,
+    Other(String),
+}
+
+impl FieldId {
+    pub fn as_str(&self) -> &str {
+        match self {
+            Self::Image => "Image",
+            Self::CommandLine => "CommandLine",
+            Self::ProcessId => "ProcessId",
+            Self::ProcessStartTime => "ProcessStartTime",
+            Self::ParentProcessId => "ParentProcessId",
+            Self::ParentImage => "ParentImage",
+            Self::ParentCommandLine => "ParentCommandLine",
+            Self::ParentUser => "ParentUser",
+            Self::User => "User",
+            Self::OriginalFileName => "OriginalFileName",
+            Self::Product => "Product",
+            Self::Description => "Description",
+            Self::Company => "Company",
+            Self::FileVersion => "FileVersion",
+            Self::CurrentDirectory => "CurrentDirectory",
+            Self::IntegrityLevel => "IntegrityLevel",
+            Self::DestinationHostname => "DestinationHostname",
+            Self::TargetFilename => "TargetFilename",
+            Self::SourceFilename => "SourceFilename",
+            Self::TargetObject => "TargetObject",
+            Self::EventID => "EventID",
+            Self::WindowsLiveCommandLine => "WindowsProcessMetadata.conflicting_live_command_line",
+            Self::Other(name) => name,
+        }
+    }
+}
+
+impl From<&str> for FieldId {
+    fn from(name: &str) -> Self {
+        match name {
+            "Image" => Self::Image,
+            "CommandLine" => Self::CommandLine,
+            "ProcessId" => Self::ProcessId,
+            "ProcessStartTime" => Self::ProcessStartTime,
+            "ParentProcessId" => Self::ParentProcessId,
+            "ParentImage" => Self::ParentImage,
+            "ParentCommandLine" => Self::ParentCommandLine,
+            "ParentUser" => Self::ParentUser,
+            "User" => Self::User,
+            "OriginalFileName" => Self::OriginalFileName,
+            "Product" => Self::Product,
+            "Description" => Self::Description,
+            "Company" => Self::Company,
+            "FileVersion" => Self::FileVersion,
+            "CurrentDirectory" => Self::CurrentDirectory,
+            "IntegrityLevel" => Self::IntegrityLevel,
+            "DestinationHostname" => Self::DestinationHostname,
+            "TargetFilename" => Self::TargetFilename,
+            "SourceFilename" => Self::SourceFilename,
+            "TargetObject" => Self::TargetObject,
+            "EventID" => Self::EventID,
+            "WindowsProcessMetadata.conflicting_live_command_line" => Self::WindowsLiveCommandLine,
+            _ => Self::Other(name.to_string()),
+        }
+    }
+}
+
+impl std::ops::Deref for FieldId {
+    type Target = str;
+    fn deref(&self) -> &str {
+        self.as_str()
+    }
+}
+
+impl std::fmt::Display for FieldId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl PartialEq<&str> for FieldId {
+    fn eq(&self, other: &&str) -> bool {
+        self.as_str() == *other
+    }
+}
+
+impl Serialize for FieldId {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for FieldId {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let name = String::deserialize(deserializer)?;
+        Ok(Self::from(name.as_str()))
+    }
+}
+
+/// One fidelity limitation attached to a populated event field.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FieldProvenance {
+    pub field: FieldId,
+    pub fidelity: Fidelity,
+}
+
+/// Sparse field-level provenance. Empty means no fidelity limitation is known.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct Provenance(smallvec::SmallVec<[FieldProvenance; 2]>);
+
+impl Provenance {
+    /// Preserve independent limitations: a reconstructed value can also be
+    /// truncated or stale. Repeated identical evidence is idempotent.
+    pub fn mark(&mut self, field: &str, fidelity: Fidelity) {
+        if self
+            .0
+            .iter()
+            .any(|entry| entry.field == field && entry.fidelity == fidelity)
+        {
+            return;
+        }
+        self.0.push(FieldProvenance {
+            field: field.into(),
+            fidelity,
+        });
+    }
+
+    pub fn mark_derived(&mut self, field: &str) {
+        self.mark(field, Fidelity::Derived);
+    }
+
+    pub fn has(&self, field: &str, fidelity: Fidelity) -> bool {
+        self.0
+            .iter()
+            .any(|entry| entry.field == field && entry.fidelity == fidelity)
+    }
+
+    /// Copy limitations along with a cached value, renaming parent fields.
+    pub fn inherit(&mut self, source: &Self, from: &str, to: &str) {
+        for entry in source.entries().iter().filter(|entry| entry.field == from) {
+            self.mark(to, entry.fidelity);
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    pub fn entries(&self) -> &[FieldProvenance] {
+        &self.0
+    }
+}
+
+/// Stable schema-v2 event rendering.
+///
+/// Rust members use Rustinel's canonical vocabulary. Serde preserves the
+/// historical Sysmon-compatible recording and alert shape, while detection
+/// field names are supplied by [`FieldView`].
+///
+/// Deserialization is hand-written rather than derived so a recorded event comes
+/// back exactly as it was written: [`EventFields`] is dispatched on the recorded
+/// category instead of guessed at structurally, and the derived
+/// [`event_id_string`](Self::event_id_string) cache is rebuilt from `event_id`.
+/// See [`EventFields::from_recorded`].
+#[derive(Debug, Clone, Serialize)]
+pub struct NormalizedEvent {
+    /// Native event timestamp.
+    #[serde(rename = "event_time")]
+    pub timestamp: String,
+    /// Native source ordering token, when the source exposes one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_seq: Option<u64>,
+    /// Strictly increasing order in which this process canonicalized events.
+    pub ingest_seq: u64,
+    /// Sensor platform that produced the underlying event.
+    pub platform: Platform,
+    /// Sensor provider name (for example `etw` or `ebpf`).
+    pub provider: String,
+    /// Event category (Process, Network, File, Registry, DNS, ImageLoad)
+    pub category: EventCategory,
+    /// Sensor-supplied event ID used by downstream detectors and output.
+    /// Provider-native IDs are retained when rules select them directly.
+    pub event_id: u16,
+    /// Cached string representation of event_id for zero-copy flatten()
+    #[serde(skip)]
+    pub event_id_string: String,
+    /// Sensor-supplied action code preserved for downstream compatibility logic.
+    pub opcode: u8,
+    /// Event-specific fields
+    pub fields: EventFields,
+    /// Known fidelity limitations on populated fields.
+    #[serde(default, skip_serializing_if = "Provenance::is_empty")]
+    pub provenance: Provenance,
+    /// Native short name, kept separate from the executable path.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub process_name: Option<String>,
+    /// Optional process context for non-process events (alert enrichment only)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub process_context: Option<ProcessContext>,
+}
+
+impl<'de> Deserialize<'de> for NormalizedEvent {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        /// The event exactly as it appears on the wire, with the field payload
+        /// left untyped until the category has been read.
+        #[derive(Deserialize)]
+        struct RecordedEvent {
+            #[serde(alias = "timestamp")]
+            event_time: String,
+            #[serde(default)]
+            source_seq: Option<u64>,
+            #[serde(default)]
+            ingest_seq: u64,
+            platform: Platform,
+            provider: String,
+            category: EventCategory,
+            event_id: u16,
+            opcode: u8,
+            fields: serde_json::Value,
+            #[serde(default)]
+            provenance: Provenance,
+            #[serde(default)]
+            process_name: Option<String>,
+            #[serde(default)]
+            process_context: Option<ProcessContext>,
+        }
+
+        let recorded = RecordedEvent::deserialize(deserializer)?;
+        let fields = EventFields::from_recorded(recorded.category, recorded.fields)
+            .map_err(serde::de::Error::custom)?;
+
+        let event = Self {
+            timestamp: recorded.event_time,
+            source_seq: recorded.source_seq,
+            ingest_seq: recorded.ingest_seq,
+            platform: recorded.platform,
+            provider: recorded.provider,
+            category: recorded.category,
+            event_id: recorded.event_id,
+            // Rebuilt rather than read: the cache is skipped on the wire, and
+            // `get_field("EventID")` reads it directly.
+            event_id_string: recorded.event_id.to_string(),
+            opcode: recorded.opcode,
+            fields,
+            provenance: recorded.provenance,
+            process_name: recorded.process_name,
+            process_context: recorded.process_context,
+        };
+        event
+            .validate_provenance()
+            .map_err(serde::de::Error::custom)?;
+        Ok(event)
+    }
+}
+
+/// Cached process context used to enrich alerts for non-process events
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProcessContext {
+    #[serde(rename = "Image", skip_serializing_if = "Option::is_none")]
+    pub image: Option<String>,
+
+    #[serde(rename = "CommandLine", skip_serializing_if = "Option::is_none")]
+    pub command_line: Option<String>,
+
+    #[serde(rename = "ProcessId", skip_serializing_if = "Option::is_none")]
+    pub process_id: Option<String>,
+
+    #[serde(rename = "ProcessStartTime", skip_serializing_if = "Option::is_none")]
+    pub process_start_time: Option<u64>,
+
+    #[serde(rename = "ParentProcessId", skip_serializing_if = "Option::is_none")]
+    pub parent_process_id: Option<String>,
+
+    #[serde(rename = "ParentImage", skip_serializing_if = "Option::is_none")]
+    pub parent_image: Option<String>,
+
+    #[serde(rename = "ParentCommandLine", skip_serializing_if = "Option::is_none")]
+    pub parent_command_line: Option<String>,
+
+    #[serde(rename = "OriginalFileName", skip_serializing_if = "Option::is_none")]
+    pub original_file_name: Option<String>,
+
+    #[serde(rename = "Product", skip_serializing_if = "Option::is_none")]
+    pub product: Option<String>,
+
+    #[serde(rename = "Description", skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+
+    #[serde(rename = "Company", skip_serializing_if = "Option::is_none")]
+    pub company: Option<String>,
+
+    #[serde(rename = "FileVersion", skip_serializing_if = "Option::is_none")]
+    pub file_version: Option<String>,
+
+    #[serde(rename = "CurrentDirectory", skip_serializing_if = "Option::is_none")]
+    pub current_directory: Option<String>,
+
+    #[serde(rename = "IntegrityLevel", skip_serializing_if = "Option::is_none")]
+    pub integrity_level: Option<String>,
+
+    #[serde(rename = "User", skip_serializing_if = "Option::is_none")]
+    pub user: Option<String>,
+}
+
+impl NormalizedEvent {
+    /// Reject evidence attached to absent values. Used at the canonical boundary
+    /// in debug builds and available to recording/diagnostic consumers.
+    pub fn validate_provenance(&self) -> Result<(), String> {
+        if self.provenance.is_empty() {
+            return Ok(());
+        }
+        let roots = self.provenance_roots()?;
+        for entry in self.provenance.entries() {
+            if !Self::populated_in(&roots, &entry.field) {
+                return Err(format!("provenance for absent field {}", entry.field));
+            }
+        }
+        Ok(())
+    }
+
+    /// Copy limitations from `source` onto the fields this event populates.
+    /// Entries for fields this event lacks are dropped, so the result still
+    /// satisfies [`validate_provenance`](Self::validate_provenance).
+    pub fn inherit_populated_provenance(&mut self, source: &Provenance) {
+        let missing: smallvec::SmallVec<[&FieldProvenance; 2]> = source
+            .entries()
+            .iter()
+            .filter(|entry| !self.provenance.has(&entry.field, entry.fidelity))
+            .collect();
+        if missing.is_empty() {
+            return;
+        }
+        let Ok(roots) = self.provenance_roots() else {
+            return;
+        };
+        for entry in missing {
+            if Self::populated_in(&roots, &entry.field) {
+                self.provenance.mark(&entry.field, entry.fidelity);
+            }
+        }
+    }
+
+    fn provenance_roots(&self) -> Result<[serde_json::Value; 2], String> {
+        let fields = serde_json::to_value(&self.fields).map_err(|error| error.to_string())?;
+        let context =
+            serde_json::to_value(&self.process_context).map_err(|error| error.to_string())?;
+        Ok([fields, context])
+    }
+
+    fn populated_in(roots: &[serde_json::Value; 2], field: &str) -> bool {
+        field == "EventID"
+            || roots.iter().any(|root| {
+                field
+                    .split('.')
+                    .try_fold(root, |value, key| value.get(key))
+                    .is_some_and(|value| !value.is_null())
+            })
+    }
+
+    /// Render the event through a named detection field vocabulary.
+    pub fn field_view(&self, view: FieldViewName) -> FieldView<'_> {
+        FieldView::new(self, view)
+    }
+
+    /// Backward-compatible accessor for the default Sysmon field view.
+    pub fn get_field(&self, key: &str) -> Option<&str> {
+        match self.field_view(FieldViewName::DEFAULT).get(key)? {
+            CanonicalValue::String(value) => Some(value),
+            CanonicalValue::Bool(value) => Some(if value { "true" } else { "false" }),
+            CanonicalValue::U64(_) | CanonicalValue::Strs(_) | CanonicalValue::Pair(..) => None,
+        }
+    }
+
+    /// The audit-record facts of a Linux exec or file event.
+    ///
+    /// An exec stands for the `SYSCALL`, `EXECVE` and `PATH` records auditd
+    /// would write, a file event for `SYSCALL` and `PATH`. Facts that differ
+    /// between those records are projections or multi-values, never one
+    /// invented scalar. Anything this view cannot measure is absent.
+    fn audit_value(&self, key: CanonicalField) -> Option<CanonicalValue<'_>> {
+        use CanonicalField as Field;
+        use CanonicalValue as Value;
+
+        if key == Field::AuditComm {
+            return self.process_name.as_deref().map(Value::String);
+        }
+        match &self.fields {
+            EventFields::ProcessCreation(f) => match key {
+                Field::AuditType => Some(Value::Strs(&["SYSCALL", "EXECVE", "PATH"])),
+                Field::AuditSyscall => f.exec.as_ref()?.exec_syscall.as_deref().map(Value::String),
+                Field::AuditArg(index) => f
+                    .exec
+                    .as_ref()?
+                    .argv
+                    .as_ref()?
+                    .get(usize::from(index))
+                    .map(|argument| Value::String(argument)),
+                Field::AuditName => f.image.as_deref().map(Value::String),
+                Field::AuditEuid => f
+                    .linux_identity
+                    .effective_user_id
+                    .as_deref()
+                    .map(Value::String),
+                _ => None,
+            },
+            EventFields::FileEvent(f) => match key {
+                Field::AuditType => Some(Value::Strs(&["SYSCALL", "PATH"])),
+                Field::AuditName => {
+                    match (f.source_filename.as_deref(), f.target_filename.as_deref()) {
+                        (Some(source), Some(target)) => Some(Value::Pair(source, target)),
+                        (None, Some(path)) | (Some(path), None) => Some(Value::String(path)),
+                        (None, None) => None,
+                    }
+                }
+                Field::AuditNameType => {
+                    use crate::models::event_actions::{row_for_code, row_for_event_id};
+                    use crate::vocab::SensorAction;
+                    let row = row_for_event_id(EventCategory::File, self.event_id)
+                        .or_else(|| row_for_code(EventCategory::File, self.opcode))?;
+                    match row.action {
+                        SensorAction::Create => Some(Value::String("CREATE")),
+                        SensorAction::Delete => Some(Value::String("DELETE")),
+                        SensorAction::Modify => Some(Value::String("NORMAL")),
+                        SensorAction::Rename => Some(Value::Pair("DELETE", "CREATE")),
+                        _ => None,
+                    }
+                }
+                Field::AuditEuid => f.user.as_deref().map(Value::String),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    /// Read one semantic field without applying a view's availability policy.
+    pub(crate) fn canonical_value(
+        &self,
+        key: CanonicalField,
+        view: FieldViewName,
+    ) -> Option<CanonicalValue<'_>> {
+        use CanonicalField as Field;
+        use CanonicalValue as Value;
+
+        if view == FieldViewName::AUDITD {
+            if let Some(value) = self.audit_value(key) {
+                return Some(value);
+            }
+        }
+
+        match key {
+            Field::Timestamp => return Some(Value::String(&self.timestamp)),
+            Field::EventId => return Some(Value::String(&self.event_id_string)),
+            Field::Channel => {
+                return crate::field_availability::channel_for_event(view, self).map(Value::String);
+            }
+            _ => {}
+        }
+
+        match &self.fields {
+            EventFields::ProcessCreation(f) => match key {
+                Field::Signed => f
+                    .exec
+                    .as_ref()
+                    .and_then(|exec| exec.signed.as_deref())
+                    .map(Value::String),
+                Field::PreExecImage => f
+                    .exec
+                    .as_ref()
+                    .and_then(|exec| exec.pre_exec_image.as_deref())
+                    .map(Value::String),
+                Field::RealUserId => f
+                    .exec
+                    .as_ref()
+                    .and_then(|exec| exec.real_user_id.as_deref())
+                    .map(Value::String),
+                Field::Script => f
+                    .exec
+                    .as_ref()
+                    .and_then(|exec| exec.script.as_deref())
+                    .map(Value::String),
+                Field::SignatureStatus => f
+                    .exec
+                    .as_ref()
+                    .and_then(|exec| exec.signature_status.as_deref())
+                    .map(Value::String),
+                Field::SigningId => f
+                    .exec
+                    .as_ref()
+                    .and_then(|exec| exec.signing_id.as_deref())
+                    .map(Value::String),
+                Field::TeamId => f
+                    .exec
+                    .as_ref()
+                    .and_then(|exec| exec.team_id.as_deref())
+                    .map(Value::String),
+                Field::CdHash => f
+                    .exec
+                    .as_ref()
+                    .and_then(|exec| exec.cdhash.as_deref())
+                    .map(Value::String),
+                Field::CodeSigningFlags => f
+                    .exec
+                    .as_ref()
+                    .and_then(|exec| exec.codesigning_flags.as_deref())
+                    .map(Value::String),
+                Field::IsPlatformBinary => f
+                    .exec
+                    .as_ref()
+                    .and_then(|exec| exec.is_platform_binary)
+                    .map(Value::Bool),
+                Field::ProcessImage => f.image.as_deref().map(Value::String),
+                Field::ImageSource => f.image_source.as_deref().map(Value::String),
+                Field::ImageTruncated => f.image_truncated.map(Value::Bool),
+                Field::OriginalFileName => f.original_file_name.as_deref().map(Value::String),
+                Field::Product => f.product.as_deref().map(Value::String),
+                Field::Description => f.description.as_deref().map(Value::String),
+                Field::Company => f.company.as_deref().map(Value::String),
+                Field::FileVersion => f.file_version.as_deref().map(Value::String),
+                Field::Hashes => f.hashes.as_deref().map(Value::String),
+                Field::Imphash => f.imphash.as_deref().map(Value::String),
+                Field::CommandLine => f.command_line.as_deref().map(Value::String),
+                Field::ProcessId => f.process_id.as_deref().map(Value::String),
+                Field::ProcessStartTime => f.process_start_time.map(Value::U64),
+                Field::CgroupId => f.cgroup_id.as_deref().map(Value::String),
+                Field::CgroupPath => f.container.cgroup_path.as_deref().map(Value::String),
+                Field::ContainerId => f.container.container_id.as_deref().map(Value::String),
+                Field::ContainerRuntime => {
+                    f.container.container_runtime.as_deref().map(Value::String)
+                }
+                Field::RealGroupId => f.linux_identity.real_group_id.as_deref().map(Value::String),
+                Field::EffectiveUserId => f
+                    .linux_identity
+                    .effective_user_id
+                    .as_deref()
+                    .map(Value::String),
+                Field::EffectiveGroupId => f
+                    .linux_identity
+                    .effective_group_id
+                    .as_deref()
+                    .map(Value::String),
+                Field::MountNamespace => f
+                    .linux_identity
+                    .mount_namespace
+                    .as_deref()
+                    .map(Value::String),
+                Field::PidNamespace => f.linux_identity.pid_namespace.as_deref().map(Value::String),
+                Field::NetworkNamespace => f
+                    .linux_identity
+                    .network_namespace
+                    .as_deref()
+                    .map(Value::String),
+                Field::SessionId => f.linux_identity.session_id.as_deref().map(Value::String),
+                Field::KernelStartBoottime => {
+                    f.linux_identity.kernel_start_boottime.map(Value::U64)
+                }
+                Field::ControllingTty => f
+                    .linux_identity
+                    .controlling_tty
+                    .as_deref()
+                    .map(Value::String),
+                Field::ParentProcessId => f.parent_process_id.as_deref().map(Value::String),
+                Field::ParentImage => f.parent_image.as_deref().map(Value::String),
+                Field::ParentCommandLine => f.parent_command_line.as_deref().map(Value::String),
+                Field::ParentUser => f.parent_user.as_deref().map(Value::String),
+                Field::User => f.user.as_deref().map(Value::String),
+                Field::LogonId => f.logon_id.as_deref().map(Value::String),
+                Field::IntegrityLevel => f.integrity_level.as_deref().map(Value::String),
+                Field::CurrentDirectory => f.current_directory.as_deref().map(Value::String),
+                Field::TargetImage => f.target_image.as_deref().map(Value::String),
+                _ => None,
+            },
+            EventFields::FileEvent(f) => match key {
+                Field::SourceFilename => f.source_filename.as_deref().map(Value::String),
+                Field::TargetFilename => f.target_filename.as_deref().map(Value::String),
+                Field::ProcessImage => f.image.as_deref().map(Value::String),
+                Field::ProcessId => f.process_id.as_deref().map(Value::String),
+                Field::User => f.user.as_deref().map(Value::String),
+                Field::CreationTime => f.creation_utc_time.as_deref().map(Value::String),
+                Field::PreviousCreationTime => {
+                    f.previous_creation_utc_time.as_deref().map(Value::String)
+                }
+                Field::PathTruncated => f.path_truncated.as_deref().map(Value::String),
+                _ => None,
+            },
+            EventFields::NetworkConnection(f) => match key {
+                Field::DestinationIp => f.destination_ip.as_deref().map(Value::String),
+                Field::SourceIp => f.source_ip.as_deref().map(Value::String),
+                Field::DestinationPort => f.destination_port.as_deref().map(Value::String),
+                Field::SourcePort => f.source_port.as_deref().map(Value::String),
+                Field::ProcessImage => f.image.as_deref().map(Value::String),
+                Field::User => f.user.as_deref().map(Value::String),
+                Field::DestinationHostname => f.destination_hostname.as_deref().map(Value::String),
+                Field::Protocol => f.protocol.as_deref().map(Value::String),
+                Field::ProcessId => f.process_id.as_deref().map(Value::String),
+                Field::Initiated => f.initiated.map(Value::Bool),
+                _ => None,
+            },
+            EventFields::RegistryEvent(f) => match key {
+                Field::TargetObject => f.target_object.as_deref().map(Value::String),
+                Field::Details => f.details.as_deref().map(Value::String),
+                Field::ProcessImage => f.image.as_deref().map(Value::String),
+                Field::EventType => f.event_type.as_deref().map(Value::String),
+                Field::NewName => f.new_name.as_deref().map(Value::String),
+                Field::ProcessId => f.process_id.as_deref().map(Value::String),
+                Field::User => f.user.as_deref().map(Value::String),
+                _ => None,
+            },
+            EventFields::DnsQuery(f) => match key {
+                Field::User => f.user.as_deref().map(Value::String),
+                Field::DnsQueryName => f.query_name.as_deref().map(Value::String),
+                Field::DnsQueryResults => f.query_results.as_deref().map(Value::String),
+                Field::DnsRegisteredDomain => f
+                    .derivable_query_name()
+                    .and_then(dns_name::registered_domain)
+                    .map(Value::String),
+                Field::DnsLabelCount => f
+                    .derivable_query_name()
+                    .filter(|name| !name.is_empty())
+                    .map(|name| Value::U64(dns_name::label_count(name))),
+                Field::DnsLongestLabel => f
+                    .derivable_query_name()
+                    .filter(|name| !name.is_empty())
+                    .map(|name| Value::U64(dns_name::longest_label(name))),
+                Field::DnsNameLength => f
+                    .derivable_query_name()
+                    .filter(|name| !name.is_empty())
+                    .map(|name| Value::U64(dns_name::name_length(name))),
+                Field::DnsRecordType => f.record_type.as_deref().map(Value::String),
+                Field::DnsQueryStatus => f.query_status.as_deref().map(Value::String),
+                Field::DnsQueryTruncated => f.query_truncated.as_deref().map(Value::String),
+                Field::ProcessImage => f.image.as_deref().map(Value::String),
+                Field::ProcessId => f.process_id.as_deref().map(Value::String),
+                _ => None,
+            },
+            EventFields::ImageLoad(f) => match key {
+                Field::ImageLoaded => f.image_loaded.as_deref().map(Value::String),
+                Field::ProcessImage => f.image.as_deref().map(Value::String),
+                Field::OriginalFileName => f.original_file_name.as_deref().map(Value::String),
+                Field::Product => f.product.as_deref().map(Value::String),
+                Field::Description => f.description.as_deref().map(Value::String),
+                Field::Company => f.company.as_deref().map(Value::String),
+                Field::FileVersion => f.file_version.as_deref().map(Value::String),
+                Field::Hashes => f.hashes.as_deref().map(Value::String),
+                Field::Imphash => f.imphash.as_deref().map(Value::String),
+                Field::Signed => f.signed.as_deref().map(Value::String),
+                Field::Signature => f.signature.as_deref().map(Value::String),
+                Field::SignatureStatus => f.signature_status.as_deref().map(Value::String),
+                Field::ProcessId => f.process_id.as_deref().map(Value::String),
+                Field::User => f.user.as_deref().map(Value::String),
+                _ => None,
+            },
+            EventFields::PowerShellScript(f) => match key {
+                Field::ScriptBlockText => f.script_block_text.as_deref().map(Value::String),
+                Field::ScriptBlockId => f.script_block_id.as_deref().map(Value::String),
+                Field::MessageNumber => f.message_number.as_deref().map(Value::String),
+                Field::MessageTotal => f.message_total.as_deref().map(Value::String),
+                Field::Path => f.path.as_deref().map(Value::String),
+                Field::ProcessId => f.process_id.as_deref().map(Value::String),
+                Field::ProcessImage => f.image.as_deref().map(Value::String),
+                Field::User => f.user.as_deref().map(Value::String),
+                _ => None,
+            },
+            EventFields::PowerShellModule(f) => match key {
+                Field::ContextInfo => f.context_info.as_deref().map(Value::String),
+                Field::Payload => f.payload.as_deref().map(Value::String),
+                Field::ProcessId => f.process_id.as_deref().map(Value::String),
+                Field::ProcessImage => f.image.as_deref().map(Value::String),
+                Field::User => f.user.as_deref().map(Value::String),
+                _ => None,
+            },
+            EventFields::PowerShellClassicStart(f) => match key {
+                Field::Data => f.data.as_deref().map(Value::String),
+                _ => None,
+            },
+            EventFields::WmiEvent(f) => match key {
+                Field::Code => f.result_code.as_deref().map(Value::String),
+                Field::Operation => f.operation.as_deref().map(Value::String),
+                Field::User => f.user.as_deref().map(Value::String),
+                Field::Query => f.query.as_deref().map(Value::String),
+                Field::ProcessId => f.process_id.as_deref().map(Value::String),
+                Field::ProcessImage => f.image.as_deref().map(Value::String),
+                Field::EventNamespace => f.event_namespace.as_deref().map(Value::String),
+                Field::EventType => f.event_type.as_deref().map(Value::String),
+                Field::DestinationHostname => f.destination_hostname.as_deref().map(Value::String),
+                Field::ConsumerClass => f.consumer_class.as_deref().map(Value::String),
+                Field::ConsumerName => f.consumer_name.as_deref().map(Value::String),
+                Field::ConsumerText => f.consumer_text.as_deref().map(Value::String),
+                Field::Destination => f.destination.as_deref().map(Value::String),
+                Field::FilterName => f.filter_name.as_deref().map(Value::String),
+                Field::PossibleCause => f.possible_cause.as_deref().map(Value::String),
+                Field::ProviderName => f.provider_name.as_deref().map(Value::String),
+                Field::ProviderPath => f.provider_path.as_deref().map(Value::String),
+                Field::HostProcess => f.host_process.as_deref().map(Value::String),
+                Field::Component => f.component.as_deref().map(Value::String),
+                Field::ResultCode => f.result_code.as_deref().map(Value::String),
+                _ => None,
+            },
+            EventFields::ServiceCreation(f) => match key {
+                Field::ProviderName => f.provider_name.as_deref().map(Value::String),
+                Field::ServiceName => f.service_name.as_deref().map(Value::String),
+                Field::ServiceFileName => f.service_file_name.as_deref().map(Value::String),
+                Field::ServiceType => f.service_type.as_deref().map(Value::String),
+                Field::StartType => f.start_type.as_deref().map(Value::String),
+                Field::AccountName => f.account_name.as_deref().map(Value::String),
+                Field::User => f.user.as_deref().map(Value::String),
+                Field::ProcessId => f.process_id.as_deref().map(Value::String),
+                Field::ProcessImage => f.image.as_deref().map(Value::String),
+                _ => None,
+            },
+            EventFields::TaskCreation(f) => match key {
+                Field::TaskName => f.task_name.as_deref().map(Value::String),
+                Field::TaskContent => f.task_content.as_deref().map(Value::String),
+                Field::UserName => f.user_name.as_deref().map(Value::String),
+                Field::User => f.user.as_deref().map(Value::String),
+                Field::ProcessId => f.process_id.as_deref().map(Value::String),
+                Field::ProcessImage => f.image.as_deref().map(Value::String),
+                _ => None,
+            },
+            EventFields::SecurityAudit(_)
+            | EventFields::ApplicationEvent(_)
+            | EventFields::Generic(_) => None,
+        }
+    }
+}
+
+/// Event categories matching ETW providers
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum EventCategory {
+    Process,
+    Network,
+    File,
+    Registry,
+    Dns,
+    ImageLoad,
+    /// A kernel image (driver) load. Carries [`ImageLoadFields`].
+    DriverLoad,
+    Scripting,
+    PowerShellModule,
+    PowerShellClassicStart,
+    Wmi,
+    Service,
+    Task,
+    Security,
+    Defender,
+    Application,
+}
+
+impl EventCategory {
+    /// Every category, for tables that must cover each one.
+    pub const ALL: [Self; 16] = [
+        Self::Process,
+        Self::Network,
+        Self::File,
+        Self::Registry,
+        Self::Dns,
+        Self::ImageLoad,
+        Self::DriverLoad,
+        Self::Scripting,
+        Self::PowerShellModule,
+        Self::PowerShellClassicStart,
+        Self::Wmi,
+        Self::Service,
+        Self::Task,
+        Self::Security,
+        Self::Defender,
+        Self::Application,
+    ];
+}
+
+#[cfg(test)]
+mod round_trip_tests {
+    //! A recorded event must come back exactly as it went out. Replay is only
+    //! as trustworthy as this: an event that changes category or loses a field
+    //! on the way back in would be evaluated against different rules than the
+    //! ones live protection would have used.
+
+    use super::*;
+    use crate::models::{
+        FileEventFields, NetworkConnectionFields, ProcessCreationFields, ServiceCreationFields,
+    };
+
+    fn round_trip(event: &NormalizedEvent) -> NormalizedEvent {
+        let line = serde_json::to_string(event).expect("event serializes");
+        serde_json::from_str(&line).expect("event deserializes")
+    }
+
+    fn file_event() -> NormalizedEvent {
+        NormalizedEvent {
+            timestamp: "2026-08-16T09:41:03.402Z".to_string(),
+            source_seq: None,
+            ingest_seq: 0,
+            platform: Platform::Windows,
+            provider: "etw".to_string(),
+            category: EventCategory::File,
+            event_id: 11,
+            event_id_string: "11".to_string(),
+            opcode: 64,
+            fields: EventFields::FileEvent(FileEventFields {
+                source_filename: None,
+                target_filename: Some(r"C:\Temp\rustinel.txt".to_string()),
+                process_id: Some("6120".to_string()),
+                image: Some(r"C:\Windows\System32\cmd.exe".to_string()),
+                creation_utc_time: None,
+                previous_creation_utc_time: None,
+                user: None,
+                file_identity: None,
+                path_truncated: None,
+            }),
+            process_name: None,
+            provenance: Default::default(),
+            process_context: None,
+        }
+    }
+
+    #[test]
+    fn a_minimal_file_event_does_not_come_back_as_a_process_event() {
+        // `{"TargetFilename":..,"ProcessId":..,"Image":..}` is structurally a
+        // valid process event too, because every field of every variant is
+        // optional. Only the recorded category tells the two apart.
+        let event = round_trip(&file_event());
+
+        assert!(
+            matches!(event.fields, EventFields::FileEvent(_)),
+            "a file event must stay a file event: {:?}",
+            event.fields
+        );
+        assert_eq!(event.category, EventCategory::File);
+        assert_eq!(
+            event.get_field("TargetFilename"),
+            Some(r"C:\Temp\rustinel.txt"),
+            "reading it back as a process event would silently drop this field"
+        );
+    }
+
+    #[test]
+    fn the_event_id_string_cache_is_rebuilt_on_the_way_back_in() {
+        // The cache is skipped on the wire; a derived `Default` would leave it
+        // empty and every `EventID` rule would stop matching.
+        let event = round_trip(&file_event());
+
+        assert_eq!(event.event_id_string, "11");
+        assert_eq!(event.get_field("EventID"), Some("11"));
+    }
+
+    #[test]
+    fn recording_uses_the_three_field_time_and_order_contract() {
+        let mut event = file_event();
+        event.source_seq = Some(44);
+        event.ingest_seq = 7;
+
+        let json = serde_json::to_value(&event).expect("event serializes");
+
+        assert_eq!(json["event_time"], event.timestamp);
+        assert_eq!(json["source_seq"], 44);
+        assert_eq!(json["ingest_seq"], 7);
+        assert!(json.get("timestamp").is_none());
+    }
+
+    #[test]
+    fn recording_omits_a_source_sequence_when_the_source_has_none() {
+        let json = serde_json::to_value(file_event()).expect("event serializes");
+
+        assert!(json.get("source_seq").is_none());
+    }
+
+    #[test]
+    fn sparse_provenance_stays_inline_and_retains_independent_limitations() {
+        let mut provenance = Provenance::default();
+        assert!(provenance.is_empty());
+        assert!(!provenance.0.spilled());
+        provenance.mark_derived("Image");
+        provenance.mark("Image", Fidelity::Truncated);
+        provenance.mark_derived("Image");
+        assert_eq!(provenance.entries().len(), 2);
+        assert!(!provenance.0.spilled());
+        assert!(provenance.has("Image", Fidelity::Derived));
+        assert!(provenance.has("Image", Fidelity::Truncated));
+    }
+
+    #[test]
+    fn provenance_cannot_claim_an_absent_field_is_populated() {
+        let mut event = file_event();
+        event.provenance.mark_derived("CommandLine");
+        assert_eq!(event.get_field("CommandLine"), None);
+        assert!(event.validate_provenance().is_err());
+
+        let recorded = serde_json::to_value(event).expect("invalid event still serializes");
+        let error = serde_json::from_value::<NormalizedEvent>(recorded)
+            .expect_err("recording must reject provenance for an absent field");
+        assert!(error
+            .to_string()
+            .contains("provenance for absent field CommandLine"));
+    }
+
+    #[test]
+    fn inherited_provenance_keeps_only_populated_fields() {
+        let mut source = Provenance::default();
+        source.mark_derived("Image");
+        source.mark("Image", Fidelity::Truncated);
+        source.mark_derived("CommandLine");
+        let mut event = file_event();
+        event.inherit_populated_provenance(&source);
+        event.inherit_populated_provenance(&source);
+        assert_eq!(event.provenance.entries().len(), 2);
+        assert!(event.provenance.has("Image", Fidelity::Derived));
+        assert!(event.provenance.has("Image", Fidelity::Truncated));
+        assert!(!event.provenance.has("CommandLine", Fidelity::Derived));
+        event
+            .validate_provenance()
+            .expect("inherited provenance stays valid");
+    }
+
+    #[test]
+    fn all_fidelities_and_native_process_name_round_trip_without_sigma_exposure() {
+        let mut original = file_event();
+        original.process_name = Some("touch".into());
+        for fidelity in [
+            Fidelity::Derived,
+            Fidelity::BestEffort,
+            Fidelity::Truncated,
+            Fidelity::Stale,
+        ] {
+            original.provenance.mark("TargetFilename", fidelity);
+        }
+        let recorded = round_trip(&original);
+        assert_eq!(recorded.provenance, original.provenance);
+        assert_eq!(recorded.process_name.as_deref(), Some("touch"));
+        for field in [
+            "process_name",
+            "provenance",
+            "Fidelity",
+            "edr.event.provenance",
+        ] {
+            assert_eq!(recorded.get_field(field), None);
+        }
+        let measured = serde_json::to_value(file_event()).unwrap();
+        assert!(measured.get("provenance").is_none());
+        assert!(measured.get("process_name").is_none());
+    }
+
+    #[test]
+    fn recording_round_trips_field_provenance() {
+        let mut original = file_event();
+        original.provenance.mark_derived("Image");
+
+        let json = serde_json::to_value(&original).expect("event serializes");
+        assert_eq!(json["provenance"][0]["field"], "Image");
+        assert_eq!(json["provenance"][0]["fidelity"], "derived");
+
+        let replayed = round_trip(&original);
+        assert_eq!(replayed.provenance, original.provenance);
+    }
+
+    #[test]
+    fn every_recorded_field_survives_the_round_trip() {
+        let mut original = NormalizedEvent {
+            timestamp: "2026-08-16T09:41:02.884Z".to_string(),
+            source_seq: None,
+            ingest_seq: 0,
+            platform: Platform::MacOS,
+            provider: "esf".to_string(),
+            category: EventCategory::Process,
+            event_id: 1,
+            event_id_string: "1".to_string(),
+            opcode: 1,
+            fields: EventFields::ProcessCreation(ProcessCreationFields {
+                hashes: None,
+                imphash: None,
+                container: Default::default(),
+                linux_identity: Default::default(),
+                cgroup_id: None,
+                exec: Default::default(),
+                parent_process_id_derived: false,
+                windows: Default::default(),
+                image: Some("/bin/zsh".to_string()),
+                image_source: None,
+                image_truncated: None,
+                original_file_name: Some("zsh".to_string()),
+                product: Some("shell".to_string()),
+                description: Some("Z shell".to_string()),
+                company: None,
+                file_version: None,
+                target_image: None,
+                command_line: Some("zsh -c whoami".to_string()),
+                process_id: Some("7448".to_string()),
+                process_start_time: Some(123_456_789),
+                parent_process_id: Some("6120".to_string()),
+                parent_image: Some("/usr/bin/login".to_string()),
+                parent_command_line: Some("login -pf analyst".to_string()),
+                parent_user: Some("root".to_string()),
+                current_directory: Some("/Users/analyst".to_string()),
+                integrity_level: None,
+                logon_id: None,
+                user: Some("analyst".to_string()),
+            }),
+            process_name: None,
+            provenance: Default::default(),
+            process_context: None,
+        };
+        original.event_id_string = original.event_id.to_string();
+
+        let event = round_trip(&original);
+
+        assert_eq!(event.timestamp, original.timestamp);
+        assert_eq!(event.platform, Platform::MacOS);
+        assert_eq!(event.provider, "esf");
+        assert_eq!(event.category, EventCategory::Process);
+        assert_eq!(event.event_id, 1);
+        assert_eq!(event.opcode, 1);
+        assert_eq!(
+            serde_json::to_value(&event.fields).expect("replayed fields serialize"),
+            serde_json::to_value(&original.fields).expect("original fields serialize"),
+            "the same fields and values must survive the round trip"
+        );
+    }
+
+    #[test]
+    fn each_category_comes_back_as_the_variant_it_was_written_from() {
+        // Every category a sensor can produce, with the smallest payload that
+        // still carries a field, which is where structural inference is least
+        // able to tell the variants apart.
+        /// A category, a field it models, and the variant it must come back as.
+        type Case = (EventCategory, &'static str, fn(&EventFields) -> bool);
+
+        let cases: &[Case] = &[
+            (EventCategory::Process, "Image", |f| {
+                matches!(f, EventFields::ProcessCreation(_))
+            }),
+            (EventCategory::Network, "Image", |f| {
+                matches!(f, EventFields::NetworkConnection(_))
+            }),
+            (EventCategory::File, "Image", |f| {
+                matches!(f, EventFields::FileEvent(_))
+            }),
+            (EventCategory::Registry, "Image", |f| {
+                matches!(f, EventFields::RegistryEvent(_))
+            }),
+            (EventCategory::Dns, "Image", |f| {
+                matches!(f, EventFields::DnsQuery(_))
+            }),
+            (EventCategory::ImageLoad, "Image", |f| {
+                matches!(f, EventFields::ImageLoad(_))
+            }),
+            (EventCategory::Scripting, "Image", |f| {
+                matches!(f, EventFields::PowerShellScript(_))
+            }),
+            (EventCategory::PowerShellModule, "Image", |f| {
+                matches!(f, EventFields::PowerShellModule(_))
+            }),
+            (EventCategory::Wmi, "Image", |f| {
+                matches!(f, EventFields::WmiEvent(_))
+            }),
+            (EventCategory::Service, "Image", |f| {
+                matches!(f, EventFields::ServiceCreation(_))
+            }),
+            (EventCategory::Task, "Image", |f| {
+                matches!(f, EventFields::TaskCreation(_))
+            }),
+            (EventCategory::Security, "ObjectName", |f| {
+                matches!(f, EventFields::SecurityAudit(_))
+            }),
+        ];
+
+        for (category, field, is_expected_variant) in cases {
+            let line = serde_json::json!({
+                "timestamp": "2026-08-16T09:41:02.884Z",
+                "platform": "linux",
+                "provider": "ebpf",
+                "category": category,
+                "event_id": 1,
+                "opcode": 1,
+                "fields": { *field: "/bin/zsh" },
+            })
+            .to_string();
+
+            let event: NormalizedEvent =
+                serde_json::from_str(&line).expect("recorded event deserializes");
+
+            assert!(
+                is_expected_variant(&event.fields),
+                "{category:?} came back as {:?}",
+                event.fields
+            );
+            assert_eq!(event.get_field(field), Some("/bin/zsh"));
+        }
+    }
+
+    fn network_event(initiated: Option<bool>) -> NormalizedEvent {
+        NormalizedEvent {
+            timestamp: "2026-08-16T09:41:05.001Z".to_string(),
+            source_seq: None,
+            ingest_seq: 0,
+            platform: Platform::Windows,
+            provider: "etw".to_string(),
+            category: EventCategory::Network,
+            event_id: 3,
+            event_id_string: "3".to_string(),
+            opcode: 12,
+            fields: EventFields::NetworkConnection(NetworkConnectionFields {
+                destination_ip: Some("198.51.100.10".to_string()),
+                source_ip: Some("10.0.0.5".to_string()),
+                destination_port: Some("443".to_string()),
+                source_port: Some("51324".to_string()),
+                process_id: Some("4188".to_string()),
+                image: Some(r"C:\Windows\System32\curl.exe".to_string()),
+                user: None,
+                destination_hostname: None,
+                protocol: Some("tcp".to_string()),
+                initiated,
+            }),
+            process_name: None,
+            provenance: Default::default(),
+            process_context: None,
+        }
+    }
+
+    #[test]
+    fn initiated_reads_back_as_the_string_a_sigma_rule_writes() {
+        // Rules spell it `Initiated: 'true'`, so the accessor has to hand the
+        // matcher a string even though the model holds a boolean.
+        assert_eq!(
+            network_event(Some(true)).get_field("Initiated"),
+            Some("true")
+        );
+        assert_eq!(
+            network_event(Some(false)).get_field("Initiated"),
+            Some("false")
+        );
+        assert_eq!(network_event(None).get_field("Initiated"), None);
+    }
+
+    #[test]
+    fn an_unknown_direction_stays_absent_rather_than_becoming_false() {
+        // The distinction that matters: a rule asking for `Initiated: 'false'`
+        // must not match an event whose sensor could not tell the direction.
+        let event = round_trip(&network_event(None));
+        assert_eq!(event.get_field("Initiated"), None);
+
+        let line = serde_json::to_string(&network_event(None)).expect("event serializes");
+        assert!(
+            !line.contains("Initiated"),
+            "an absent direction must not be written at all: {line}"
+        );
+    }
+
+    #[test]
+    fn initiated_survives_recording_in_both_directions() {
+        for initiated in [true, false] {
+            let event = network_event(Some(initiated));
+            let line = serde_json::to_string(&event).expect("event serializes");
+            // A JSON boolean, not the string the accessor renders: the
+            // recording is the model, and ECS consumers read it as a boolean.
+            assert!(
+                line.contains(&format!(r#""Initiated":{initiated}"#)),
+                "recorded as a boolean: {line}"
+            );
+
+            let replayed = round_trip(&event);
+            match &replayed.fields {
+                EventFields::NetworkConnection(f) => assert_eq!(f.initiated, Some(initiated)),
+                other => panic!("network event came back as {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn a_recorded_service_event_keeps_both_providers_and_the_image_path_alias() {
+        // `Provider_Name` is stored; `ImagePath` is derived from the stored
+        // `ServiceFileName`. A replay that lost either would silently stop
+        // matching every `service: system` rule.
+        let event = NormalizedEvent {
+            timestamp: "2026-08-25T12:34:56.123Z".to_string(),
+            source_seq: None,
+            ingest_seq: 0,
+            platform: Platform::Windows,
+            provider: "windows_event_log".to_string(),
+            category: EventCategory::Service,
+            event_id: 7045,
+            event_id_string: "7045".to_string(),
+            opcode: 0,
+            fields: EventFields::ServiceCreation(ServiceCreationFields {
+                provider_name: Some("Service Control Manager".to_string()),
+                service_name: Some("RustinelIssue317".to_string()),
+                service_file_name: Some(r"C:\Temp\evil.exe".to_string()),
+                service_type: None,
+                start_type: None,
+                account_name: None,
+                user: None,
+                process_id: None,
+                image: None,
+            }),
+            process_name: None,
+            provenance: Default::default(),
+            process_context: None,
+        };
+
+        let event = round_trip(&event);
+
+        assert_eq!(
+            event.provider, "windows_event_log",
+            "the sensor provider must not be overwritten by the Windows one"
+        );
+        assert_eq!(
+            event.get_field("Provider_Name"),
+            Some("Service Control Manager")
+        );
+        assert_eq!(event.get_field("ImagePath"), Some(r"C:\Temp\evil.exe"));
+        assert_eq!(
+            event.get_field("ServiceFileName"),
+            event.get_field("ImagePath"),
+            "the alias must resolve to the same value it aliases"
+        );
+        // The alias is a read path, not a second stored field.
+        let fields = serde_json::to_value(&event.fields).expect("service fields serialize");
+        assert_eq!(
+            fields
+                .get("Provider_Name")
+                .and_then(serde_json::Value::as_str),
+            Some("Service Control Manager")
+        );
+        assert!(fields.get("ImagePath").is_none());
+    }
+
+    #[test]
+    fn absent_process_identity_fields_are_not_synthesized() {
+        let event = NormalizedEvent {
+            timestamp: "2026-08-16T12:00:00Z".to_string(),
+            source_seq: None,
+            ingest_seq: 0,
+            platform: Platform::Windows,
+            provider: "etw".to_string(),
+            category: EventCategory::Process,
+            event_id: 1,
+            event_id_string: "1".to_string(),
+            opcode: 1,
+            fields: EventFields::ProcessCreation(ProcessCreationFields {
+                hashes: None,
+                imphash: None,
+                container: Default::default(),
+                linux_identity: Default::default(),
+                cgroup_id: None,
+                exec: Default::default(),
+                parent_process_id_derived: false,
+                windows: Default::default(),
+                image: Some(r"C:\Windows\System32\cmd.exe".to_string()),
+                image_source: None,
+                image_truncated: None,
+                command_line: None,
+                process_id: None,
+                process_start_time: None,
+                parent_process_id: None,
+                parent_image: None,
+                parent_command_line: None,
+                parent_user: None,
+                current_directory: None,
+                integrity_level: None,
+                logon_id: None,
+                user: None,
+                original_file_name: None,
+                product: None,
+                description: None,
+                company: None,
+                file_version: None,
+                target_image: None,
+            }),
+            process_name: None,
+            provenance: Default::default(),
+            process_context: None,
+        };
+
+        let fields = serde_json::to_value(&event.fields).expect("process fields serialize");
+        for field in ["ProcessId", "ParentProcessId", "User", "TargetImage"] {
+            assert_eq!(event.get_field(field), None, "{field} should stay absent");
+            assert!(
+                fields.get(field).is_none(),
+                "{field} should not appear in serialized fields"
+            );
+        }
+    }
+
+    #[test]
+    fn unusual_paths_are_preserved_verbatim_in_field_views() {
+        let image = r"\\?\C:\Program Files\ユニコード\tool.exe ";
+        let current_directory = r"\\server\share\folder.with.dots\..\leaf";
+        let mut event = file_event();
+        event.platform = Platform::MacOS;
+        event.provider = "esf".to_string();
+        event.category = EventCategory::Process;
+        event.event_id = 1;
+        event.event_id_string = "1".to_string();
+        event.opcode = 1;
+        event.fields = EventFields::ProcessCreation(ProcessCreationFields {
+            hashes: None,
+            imphash: None,
+            container: Default::default(),
+            linux_identity: Default::default(),
+            cgroup_id: None,
+            exec: Default::default(),
+            parent_process_id_derived: false,
+            windows: Default::default(),
+            image: Some(image.to_string()),
+            image_source: None,
+            image_truncated: None,
+            command_line: None,
+            process_id: None,
+            process_start_time: None,
+            parent_process_id: None,
+            parent_image: None,
+            parent_command_line: None,
+            parent_user: None,
+            current_directory: Some(current_directory.to_string()),
+            integrity_level: None,
+            logon_id: None,
+            user: None,
+            original_file_name: None,
+            product: None,
+            description: None,
+            company: None,
+            file_version: None,
+            target_image: None,
+        });
+
+        assert_eq!(event.get_field("Image"), Some(image));
+        assert_eq!(event.get_field("CurrentDirectory"), Some(current_directory));
+        let fields = serde_json::to_value(&event.fields).expect("process fields serialize");
+        assert_eq!(
+            fields.get("Image").and_then(serde_json::Value::as_str),
+            Some(image)
+        );
+        assert_eq!(
+            fields
+                .get("CurrentDirectory")
+                .and_then(serde_json::Value::as_str),
+            Some(current_directory)
+        );
+    }
+}

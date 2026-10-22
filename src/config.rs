@@ -1,0 +1,1220 @@
+//! Configuration module
+//!
+//! Provides structured configuration for the Rustinel agent.
+//! Configuration can be loaded from:
+//! 1. Default values (hardcoded)
+//! 2. First available config file from explicit path, RUSTINEL_CONFIG,
+//!    managed platform path, executable directory, then current directory
+//! 3. Environment variables with EDR__ prefix
+//!
+//! Example environment variable override:
+//! EDR__LOGGING__LEVEL=debug
+//! EDR__SCANNER__SIGMA_RULES_PATH=custom/path
+
+use serde::{Deserialize, Serialize};
+use std::path::{Path, PathBuf};
+use std::time::Duration;
+
+use crate::models::MatchDebugLevel;
+
+/// Controls which Sigma detection matches become alerts.
+///
+/// Correlation always receives every matching detection, independently of
+/// this presentation setting.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SigmaMatchMode {
+    /// Emit only the deterministic highest-ranked detection from each pass.
+    #[default]
+    Best,
+    /// Emit one alert for every matching detection rule.
+    All,
+}
+
+/// Default timeout per file or across one process's memory reads and scans.
+pub const DEFAULT_SCAN_TIMEOUT_MS: u64 = 10_000;
+/// Default maximum size of a file accepted by `Scanner::scan_file`.
+pub const DEFAULT_MAX_FILE_MB: u64 = 64;
+
+/// Resource guards applied to every scan.
+///
+/// A zero value disables the corresponding guard.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ScanLimits {
+    /// Timeout per file or shared across one process's memory regions.
+    pub timeout: Duration,
+    /// Maximum size of a file accepted by `Scanner::scan_file`.
+    pub max_file_bytes: u64,
+}
+
+impl Default for ScanLimits {
+    fn default() -> Self {
+        Self {
+            timeout: Duration::from_millis(DEFAULT_SCAN_TIMEOUT_MS),
+            max_file_bytes: DEFAULT_MAX_FILE_MB * 1024 * 1024,
+        }
+    }
+}
+
+pub mod reference;
+pub mod security;
+pub use security::SecurityConfig;
+pub mod webhook;
+
+pub use webhook::WebhookConfig;
+
+const CONFIG_FILE_NAME: &str = "config.toml";
+const CONFIG_PATH_ENV: &str = "RUSTINEL_CONFIG";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InstallPlatform {
+    Windows,
+    Linux,
+    Macos,
+}
+
+impl InstallPlatform {
+    pub fn current() -> Self {
+        #[cfg(windows)]
+        {
+            Self::Windows
+        }
+        #[cfg(target_os = "macos")]
+        {
+            Self::Macos
+        }
+        #[cfg(not(any(windows, target_os = "macos")))]
+        {
+            Self::Linux
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InstallLayout {
+    pub platform: InstallPlatform,
+    pub config_file: PathBuf,
+    pub rules_dir: PathBuf,
+    pub sigma_rules_dir: PathBuf,
+    pub yara_rules_dir: PathBuf,
+    pub ioc_dir: PathBuf,
+    pub logs_dir: PathBuf,
+    pub alerts_dir: PathBuf,
+    pub captures_dir: PathBuf,
+    pub state_dir: PathBuf,
+}
+
+impl InstallLayout {
+    pub fn managed(platform: InstallPlatform) -> Self {
+        match platform {
+            InstallPlatform::Windows => Self {
+                platform,
+                config_file: PathBuf::from(r"C:\ProgramData\Rustinel\config.toml"),
+                rules_dir: PathBuf::from(r"C:\ProgramData\Rustinel\rules"),
+                sigma_rules_dir: PathBuf::from(r"C:\ProgramData\Rustinel\rules\current\sigma"),
+                yara_rules_dir: PathBuf::from(r"C:\ProgramData\Rustinel\rules\current\yara"),
+                ioc_dir: PathBuf::from(r"C:\ProgramData\Rustinel\rules\current\ioc"),
+                logs_dir: PathBuf::from(r"C:\ProgramData\Rustinel\logs"),
+                alerts_dir: PathBuf::from(r"C:\ProgramData\Rustinel\logs"),
+                captures_dir: PathBuf::from(r"C:\ProgramData\Rustinel\captures"),
+                state_dir: PathBuf::from(r"C:\ProgramData\Rustinel\state"),
+            },
+            InstallPlatform::Linux => Self::from_roots(
+                platform,
+                PathBuf::from("/etc/rustinel/config.toml"),
+                PathBuf::from("/var/lib/rustinel/rules"),
+                PathBuf::from("/var/log/rustinel"),
+                PathBuf::from("/var/lib/rustinel/captures"),
+                PathBuf::from("/var/lib/rustinel/state"),
+            ),
+            InstallPlatform::Macos => Self::from_roots(
+                platform,
+                PathBuf::from("/Library/Application Support/Rustinel/config.toml"),
+                PathBuf::from("/Library/Application Support/Rustinel/rules"),
+                PathBuf::from("/Library/Logs/Rustinel"),
+                PathBuf::from("/Library/Application Support/Rustinel/captures"),
+                PathBuf::from("/Library/Application Support/Rustinel/state"),
+            ),
+        }
+    }
+
+    pub fn portable(exe_dir: impl Into<PathBuf>) -> Self {
+        let root = exe_dir.into();
+        let platform = InstallPlatform::current();
+        let rules_dir = root.join("rules");
+        let logs_dir = root.join("logs");
+        Self {
+            platform,
+            config_file: root.join(CONFIG_FILE_NAME),
+            rules_dir: rules_dir.clone(),
+            sigma_rules_dir: rules_dir.join("sigma"),
+            yara_rules_dir: rules_dir.join("yara"),
+            ioc_dir: rules_dir.join("ioc"),
+            alerts_dir: logs_dir.clone(),
+            logs_dir,
+            captures_dir: root.join("captures"),
+            state_dir: root.join("state"),
+        }
+    }
+
+    pub fn managed_current() -> Self {
+        Self::managed(InstallPlatform::current())
+    }
+
+    pub fn managed_config(&self) -> AppConfig {
+        let mut cfg = AppConfig::default();
+        cfg.scanner.sigma_rules_path = self.sigma_rules_dir.clone();
+        cfg.scanner.yara_rules_path = self.yara_rules_dir.clone();
+        cfg.logging.directory = self.logs_dir.clone();
+        cfg.alerts.directory = self.alerts_dir.clone();
+        cfg.capture.directory = self.captures_dir.clone();
+        cfg.agent.directory = self.state_dir.clone();
+        cfg.ioc.hashes_path = layout_join(self.platform, &self.ioc_dir, "hashes.txt");
+        cfg.ioc.ips_path = layout_join(self.platform, &self.ioc_dir, "ips.txt");
+        cfg.ioc.domains_path = layout_join(self.platform, &self.ioc_dir, "domains.txt");
+        cfg.ioc.paths_regex_path = layout_join(self.platform, &self.ioc_dir, "paths_regex.txt");
+        cfg
+    }
+
+    fn from_roots(
+        platform: InstallPlatform,
+        config_file: PathBuf,
+        rules_dir: PathBuf,
+        logs_dir: PathBuf,
+        captures_dir: PathBuf,
+        state_dir: PathBuf,
+    ) -> Self {
+        let current_dir = layout_join(platform, &rules_dir, "current");
+        let ioc_dir = layout_join(platform, &current_dir, "ioc");
+        Self {
+            platform,
+            config_file,
+            rules_dir: rules_dir.clone(),
+            sigma_rules_dir: layout_join(platform, &current_dir, "sigma"),
+            yara_rules_dir: layout_join(platform, &current_dir, "yara"),
+            ioc_dir,
+            alerts_dir: logs_dir.clone(),
+            logs_dir,
+            captures_dir,
+            state_dir,
+        }
+    }
+}
+
+pub(crate) fn layout_join(platform: InstallPlatform, base: &Path, child: &str) -> PathBuf {
+    let separator = match platform {
+        InstallPlatform::Windows => r"\",
+        InstallPlatform::Linux | InstallPlatform::Macos => "/",
+    };
+    let base = base.to_string_lossy();
+    let base = base.trim_end_matches(['/', '\\']);
+    PathBuf::from(format!("{base}{separator}{child}"))
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConfigLoadOptions {
+    pub explicit_config: Option<PathBuf>,
+    pub env_config: Option<PathBuf>,
+    pub managed_config: PathBuf,
+    pub exe_config: Option<PathBuf>,
+    pub cwd_config: PathBuf,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConfigSource {
+    Explicit,
+    Environment,
+    Managed,
+    Executable,
+    CurrentDirectory,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SelectedConfig {
+    pub source: ConfigSource,
+    pub path: PathBuf,
+}
+
+impl ConfigLoadOptions {
+    pub fn from_runtime(explicit_config: Option<PathBuf>) -> Self {
+        Self {
+            explicit_config,
+            env_config: std::env::var_os(CONFIG_PATH_ENV).map(PathBuf::from),
+            managed_config: InstallLayout::managed_current().config_file,
+            exe_config: exe_dir_config_base().map(|base| base.with_extension("toml")),
+            cwd_config: PathBuf::from(CONFIG_FILE_NAME),
+        }
+    }
+
+    pub fn selected_config(&self) -> Option<SelectedConfig> {
+        if let Some(path) = &self.explicit_config {
+            return Some(SelectedConfig {
+                source: ConfigSource::Explicit,
+                path: path.clone(),
+            });
+        }
+
+        if let Some(path) = &self.env_config {
+            return Some(SelectedConfig {
+                source: ConfigSource::Environment,
+                path: path.clone(),
+            });
+        }
+
+        if self.managed_config.exists() {
+            return Some(SelectedConfig {
+                source: ConfigSource::Managed,
+                path: self.managed_config.clone(),
+            });
+        }
+
+        if let Some(path) = &self.exe_config {
+            if path.exists() {
+                return Some(SelectedConfig {
+                    source: ConfigSource::Executable,
+                    path: path.clone(),
+                });
+            }
+        }
+
+        if self.cwd_config.exists() {
+            return Some(SelectedConfig {
+                source: ConfigSource::CurrentDirectory,
+                path: self.cwd_config.clone(),
+            });
+        }
+
+        None
+    }
+}
+
+/// Compute the extension-less config file base path next to the running
+/// executable (e.g. `C:\Rustinel\config`). The `config` crate appends the
+/// supported extensions (`.toml`, `.yaml`, ...) when searching.
+fn exe_dir_config_base() -> Option<PathBuf> {
+    let exe_path = std::env::current_exe().ok()?;
+    let exe_dir = exe_path.parent()?;
+    Some(exe_dir.join("config"))
+}
+
+/// Default trusted paths for the allowlist, chosen per platform.
+/// These prevent YARA, IOC hash scanning, and active response from acting
+/// on binaries shipped with the OS.
+fn default_allowlist_paths() -> Vec<String> {
+    #[cfg(windows)]
+    {
+        vec![
+            "C:\\Windows\\System32\\".to_string(),
+            "C:\\Windows\\SysWOW64\\".to_string(),
+            "C:\\Windows\\WinSxS\\".to_string(),
+            "C:\\Program Files\\".to_string(),
+            "C:\\Program Files (x86)\\".to_string(),
+        ]
+    }
+    #[cfg(target_os = "macos")]
+    {
+        // OS-shipped directories only. /Applications is intentionally excluded:
+        // it holds user-installed software and is a common location for macOS
+        // malware, so allowlisting it would blind scanning and response there.
+        vec![
+            "/usr/bin/".to_string(),
+            "/usr/sbin/".to_string(),
+            "/usr/libexec/".to_string(), // system helper executables
+            "/bin/".to_string(),
+            "/sbin/".to_string(),
+            "/System/".to_string(), // OS-shipped frameworks and binaries
+        ]
+    }
+    #[cfg(not(any(windows, target_os = "macos")))]
+    {
+        vec![
+            "/usr/bin/".to_string(),
+            "/usr/sbin/".to_string(),
+            "/usr/lib/".to_string(),
+            "/usr/lib64/".to_string(),   // RHEL/Fedora/CentOS
+            "/usr/libexec/".to_string(), // system helper executables
+            "/bin/".to_string(),
+            "/sbin/".to_string(),
+            "/lib/".to_string(),
+            "/lib64/".to_string(),
+        ]
+    }
+}
+
+fn default_allowlist_excluded_paths() -> Vec<String> {
+    #[cfg(windows)]
+    {
+        vec![
+            "C:\\Windows\\Temp\\".to_string(),
+            "C:\\Windows\\Tasks\\".to_string(),
+            "C:\\Windows\\Tracing\\".to_string(),
+            "C:\\Windows\\System32\\Tasks\\".to_string(),
+            "C:\\Windows\\System32\\spool\\drivers\\color\\".to_string(),
+        ]
+    }
+    #[cfg(not(windows))]
+    {
+        Vec::new()
+    }
+}
+
+/// Main application configuration
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct AppConfig {
+    #[serde(default)]
+    pub security: SecurityConfig,
+    pub scanner: ScannerConfig,
+    pub logging: LogConfig,
+    pub alerts: AlertConfig,
+    pub allowlist: AllowlistConfig,
+    pub response: ResponseConfig,
+    pub process: ProcessConfig,
+    pub ioc: IocConfig,
+    pub reload: ReloadConfig,
+    pub dedup: DedupConfig,
+    pub capture: CaptureConfig,
+    #[serde(default)]
+    pub agent: AgentConfig,
+    pub telemetry: TelemetryConfig,
+    #[serde(default)]
+    pub heartbeat: HeartbeatConfig,
+    pub windows: WindowsConfig,
+}
+
+/// Scanner configuration (Sigma and YARA rules)
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ScannerConfig {
+    pub sigma_enabled: bool,
+    pub sigma_rules_path: PathBuf,
+    /// Extra Sigma directories loaded after the pack and never touched by `rules install` or `rules update`.
+    pub sigma_local_rules_paths: Vec<PathBuf>,
+    pub sigma_match_mode: SigmaMatchMode,
+    pub yara_enabled: bool,
+    pub yara_rules_path: PathBuf,
+    /// Extra YARA directories loaded after the pack and never touched by `rules install` or `rules update`.
+    pub yara_local_rules_paths: Vec<PathBuf>,
+    pub yara_allowlist_paths: Vec<String>,
+    /// Timeout per file or across one process's memory regions. 0 disables it.
+    pub yara_scan_timeout_ms: u64,
+    /// Maximum size of a file accepted by an on-disk scan. 0 disables the guard.
+    pub yara_max_file_mb: u64,
+    pub yara_memory_enabled: bool,
+    pub yara_memory_queue_capacity: usize,
+    pub yara_memory_delay_ms: u64,
+    pub yara_memory_max_process_mb: u64,
+    pub yara_memory_max_region_mb: u64,
+    pub yara_memory_include_private: bool,
+    pub yara_memory_include_image: bool,
+    pub yara_memory_include_mapped: bool,
+}
+
+impl ScannerConfig {
+    /// Resource guards applied to every YARA scan.
+    pub fn yara_scan_limits(&self) -> ScanLimits {
+        ScanLimits {
+            timeout: std::time::Duration::from_millis(self.yara_scan_timeout_ms),
+            max_file_bytes: self.yara_max_file_mb.saturating_mul(1024 * 1024),
+        }
+    }
+}
+
+/// Global allowlist configuration shared across modules
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct AllowlistConfig {
+    /// Trusted directory prefixes, applied to response/IOC hash/YARA scan
+    pub paths: Vec<String>,
+    /// Directory prefixes that take precedence over trusted paths
+    pub excluded_paths: Vec<String>,
+}
+
+/// Operational logging configuration (application debug logs)
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct LogConfig {
+    pub level: String,
+    /// Optional tracing filter expression. If set, overrides `level`.
+    pub filter: Option<String>,
+    pub directory: PathBuf,
+    pub filename: String,
+    pub console_output: bool,
+}
+
+/// Security alerts configuration (JSON output for SIEM)
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct AlertConfig {
+    pub directory: PathBuf,
+    pub filename: String,
+    pub match_debug: MatchDebugLevel,
+    /// HTTP destinations that also receive every alert written to the file.
+    #[serde(default)]
+    pub webhook: Vec<WebhookConfig>,
+}
+
+/// Active response configuration (optional prevention/termination)
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ResponseConfig {
+    pub enabled: bool,
+    pub prevention_enabled: bool,
+    pub min_severity: String,
+    pub channel_capacity: usize,
+    pub allowlist_images: Vec<String>,
+    pub allowlist_paths: Vec<String>,
+}
+
+/// Process metadata cache configuration
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ProcessConfig {
+    /// Maximum number of process metadata entries retained
+    pub max_entries: usize,
+}
+
+/// Atomic IOC detection configuration
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct IocConfig {
+    pub enabled: bool,
+    pub hashes_path: PathBuf,
+    pub ips_path: PathBuf,
+    pub domains_path: PathBuf,
+    pub paths_regex_path: PathBuf,
+    pub default_severity: String,
+    pub max_file_size_mb: u64,
+    pub hash_allowlist_paths: Vec<String>,
+}
+
+/// Rule hot-reload configuration
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ReloadConfig {
+    pub enabled: bool,
+    pub debounce_ms: u64,
+    pub fallback_poll_interval_ms: u64,
+}
+
+/// Alert deduplication / aggregation configuration
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct DedupConfig {
+    /// Enable fixed-window alert deduplication anchored to first occurrence
+    pub enabled: bool,
+    /// Window length in seconds; repeats do not extend the first-seen window
+    pub window_secs: u64,
+    /// Maximum number of distinct alert keys to track simultaneously
+    pub max_entries: usize,
+}
+
+/// Agent identity configuration
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct AgentConfig {
+    /// Directory holding the persistent `agent-id` file. Kept apart from logs
+    /// so log rotation or cleanup never changes the installation identity.
+    pub directory: PathBuf,
+}
+
+impl Default for AgentConfig {
+    fn default() -> Self {
+        Self {
+            directory: PathBuf::from("state"),
+        }
+    }
+}
+
+/// Behavioral recording configuration
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct CaptureConfig {
+    /// Directory holding behavioral recordings written by `rustinel capture`.
+    /// Kept apart from alert and operational log output, and restricted to the
+    /// owner because recordings describe endpoint activity in detail.
+    pub directory: PathBuf,
+}
+
+/// Pipeline telemetry accounting configuration
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct TelemetryConfig {
+    /// Write the pipeline drop-counter snapshot that `rustinel doctor` reads.
+    /// The in-memory counters and their rate-limited warnings are always on;
+    /// this only controls whether they are persisted for another process.
+    pub enabled: bool,
+    /// How often the snapshot is refreshed, in seconds. A shutdown snapshot is
+    /// always written regardless of where the interval fell.
+    pub snapshot_interval_secs: u64,
+    /// Length in seconds of the window over which sensor event drops are
+    /// aggregated into one loss alert per category. Zero turns the alert off;
+    /// the counters and `rustinel doctor` are unaffected.
+    pub loss_alert_interval_secs: u64,
+}
+
+/// Agent heartbeat configuration
+///
+/// The heartbeat itself is written whenever `telemetry.enabled` is, on the
+/// `telemetry.snapshot_interval_secs` timer.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+pub struct HeartbeatConfig {
+    /// Also send each heartbeat line to the configured alert webhooks.
+    pub webhooks: bool,
+}
+
+/// Windows telemetry configuration. It is present on every platform so one
+/// managed configuration can be distributed to a mixed fleet.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct WindowsConfig {
+    /// Periodically hand partially filled ETW buffers to the consumer on the
+    /// main session. Zero disables forced flushing there and restores ETW's
+    /// one-second timer.
+    pub etw_flush_interval_ms: u64,
+    /// The same, for the dedicated Kernel-Process session.
+    ///
+    /// Deliberately a separate option rather than a share of
+    /// [`Self::etw_flush_interval_ms`]: on the main session the interval trades
+    /// alert latency against a periodic syscall, and either answer is
+    /// defensible. On the process session it decides whether `CommandLine` is
+    /// collected at all - the field is read from the live process, and the
+    /// default 5 ms captured 99.9% of short-lived processes against 61.5% at
+    /// the main session's 20 ms. Zero disables it, and gives up roughly 83% of
+    /// short-lived command lines with it.
+    pub etw_process_flush_interval_ms: u64,
+    /// Subscribe to the per-connection Windows Filtering Platform audit events:
+    /// 5156 (connection allowed), 5157 (connection blocked) and 5152 (packet
+    /// dropped).
+    ///
+    /// Off by default because, once the host audits them, Windows writes one
+    /// record per connection and per dropped packet, the Security channel's
+    /// highest-volume families by far. Enabling this does not enable the audit
+    /// subcategories themselves; Rustinel never changes host policy.
+    pub security_filtering_platform_connections: bool,
+
+    /// Subscribe to the Security long tail: 4672 (special privileges
+    /// assigned to a new logon), 5140 (network share accessed) and 4799 (local
+    /// group membership enumerated).
+    ///
+    /// Off by default because 4672 is written for every administrative logon
+    /// and 5140 for every share connection, so their rate follows logon and
+    /// file-server traffic rather than attacker activity. Enabling this does
+    /// not enable the audit subcategories themselves.
+    pub security_long_tail_events: bool,
+
+    /// Subscribe to the domain-controller Security family: 4768 and 4769
+    /// (Kerberos ticket requests), 4662 (operation on a directory object),
+    /// 4742 (computer account changed), 4661 (handle to a SAM or directory
+    /// object), 4673 (privileged service called), 5137 and 5141 (directory
+    /// object created, deleted).
+    ///
+    /// Off by default because a domain controller audits 4662, 4768 and 4769 by
+    /// default and writes one per Kerberos request or directory read, so the
+    /// rate follows the size of the domain, not attacker activity. Enabling
+    /// this does not enable the audit subcategories themselves.
+    pub security_domain_controller_events: bool,
+}
+
+impl AppConfig {
+    /// Load configuration from defaults, config.toml, and environment variables
+    pub fn new() -> Result<Self, config::ConfigError> {
+        Self::from_options(ConfigLoadOptions::from_runtime(None))
+    }
+
+    pub fn from_config_path(config_path: Option<PathBuf>) -> Result<Self, config::ConfigError> {
+        Self::from_options(ConfigLoadOptions::from_runtime(config_path))
+    }
+
+    pub fn resolve_config_path(config_path: Option<PathBuf>) -> Option<PathBuf> {
+        let options = ConfigLoadOptions::from_runtime(config_path);
+        options
+            .selected_config()
+            .map(|selected| absolute_config_path(selected.path))
+    }
+
+    pub fn from_options(options: ConfigLoadOptions) -> Result<Self, config::ConfigError> {
+        Self::from_options_with_environment(options, None)
+    }
+
+    // `None` preserves runtime environment discovery. Tests can provide a
+    // controlled map without mutating the process environment.
+    fn from_options_with_environment(
+        options: ConfigLoadOptions,
+        environment: Option<config::Map<String, String>>,
+    ) -> Result<Self, config::ConfigError> {
+        let selected_config = options
+            .selected_config()
+            .map(|selected| absolute_config_path(selected.path));
+        let config_dir = selected_config
+            .as_deref()
+            .and_then(Path::parent)
+            .map(Path::to_path_buf);
+        let (file_source, security) = security::load_config(selected_config.as_deref())?;
+
+        let builder = config::Config::builder()
+            // --- Defaults ---
+            // Scanner
+            .set_default("scanner.sigma_enabled", true)?
+            .set_default("scanner.sigma_rules_path", "rules/current/sigma")?
+            .set_default("scanner.sigma_local_rules_paths", Vec::<String>::new())?
+            .set_default("scanner.sigma_match_mode", "best")?
+            .set_default("scanner.yara_enabled", true)?
+            .set_default("scanner.yara_rules_path", "rules/current/yara")?
+            .set_default("scanner.yara_local_rules_paths", Vec::<String>::new())?
+            .set_default("scanner.yara_allowlist_paths", Vec::<String>::new())?
+            .set_default(
+                "scanner.yara_scan_timeout_ms",
+                DEFAULT_SCAN_TIMEOUT_MS as i64,
+            )?
+            .set_default("scanner.yara_max_file_mb", DEFAULT_MAX_FILE_MB as i64)?
+            .set_default("scanner.yara_memory_enabled", false)?
+            .set_default("scanner.yara_memory_queue_capacity", 64i64)?
+            .set_default("scanner.yara_memory_delay_ms", 750i64)?
+            .set_default("scanner.yara_memory_max_process_mb", 64i64)?
+            .set_default("scanner.yara_memory_max_region_mb", 8i64)?
+            .set_default("scanner.yara_memory_include_private", true)?
+            .set_default("scanner.yara_memory_include_image", false)?
+            .set_default("scanner.yara_memory_include_mapped", false)?
+            // Logging
+            .set_default("logging.level", "info")?
+            .set_default("logging.directory", "logs")?
+            .set_default("logging.filename", "rustinel.log")?
+            .set_default("logging.console_output", false)?
+            // Alerts
+            .set_default("alerts.directory", "logs")?
+            .set_default("alerts.filename", "alerts.json")?
+            .set_default("alerts.match_debug", "off")?
+            // Global allowlist, platform-specific trusted paths.
+            // These are the default values only; override via config.toml or
+            // EDR__ALLOWLIST__PATHS environment variable.
+            .set_default("allowlist.paths", default_allowlist_paths())?
+            .set_default(
+                "allowlist.excluded_paths",
+                default_allowlist_excluded_paths(),
+            )?
+            // Active Response
+            .set_default("response.enabled", false)?
+            .set_default("response.prevention_enabled", false)?
+            .set_default("response.min_severity", "critical")?
+            .set_default("response.channel_capacity", 128)?
+            .set_default("response.allowlist_images", Vec::<String>::new())?
+            .set_default("response.allowlist_paths", Vec::<String>::new())?
+            // Process cache
+            .set_default("process.max_entries", 65536i64)?
+            // IOC
+            .set_default("ioc.enabled", true)?
+            .set_default("ioc.hashes_path", "rules/current/ioc/hashes.txt")?
+            .set_default("ioc.ips_path", "rules/current/ioc/ips.txt")?
+            .set_default("ioc.domains_path", "rules/current/ioc/domains.txt")?
+            .set_default("ioc.paths_regex_path", "rules/current/ioc/paths_regex.txt")?
+            .set_default("ioc.default_severity", "high")?
+            .set_default("ioc.max_file_size_mb", 50)?
+            .set_default("ioc.hash_allowlist_paths", Vec::<String>::new())?
+            // Hot Reload
+            .set_default("reload.enabled", true)?
+            .set_default("reload.debounce_ms", 2000)?
+            .set_default("reload.fallback_poll_interval_ms", 60000i64)?
+            // Alert deduplication
+            .set_default("dedup.enabled", true)?
+            .set_default("dedup.window_secs", 60i64)?
+            .set_default("dedup.max_entries", 10000i64)?
+            // Behavioral recording
+            .set_default("capture.directory", "captures")?
+            // Agent identity
+            .set_default("agent.directory", "state")?
+            // Telemetry
+            .set_default("telemetry.enabled", true)?
+            .set_default("telemetry.snapshot_interval_secs", 30i64)?
+            .set_default("telemetry.loss_alert_interval_secs", 60i64)?
+            .set_default("heartbeat.webhooks", false)?
+            // Windows ETW delivery latency
+            .set_default("windows.etw_flush_interval_ms", 20i64)?
+            .set_default("windows.etw_process_flush_interval_ms", 5i64)?
+            .set_default("windows.security_filtering_platform_connections", false)?
+            .set_default("windows.security_long_tail_events", false)?
+            .set_default("windows.security_domain_controller_events", false)?;
+
+        let builder = builder.add_source(file_source);
+        let environment_source = config::Environment::with_prefix("EDR")
+            .separator("__")
+            .source(environment.clone());
+        let s = builder
+            .add_source(environment_source)
+            .build()
+            .map_err(redact_config_error)?;
+
+        reject_unknown_keys(&s)?;
+        let mut cfg: Self = s.try_deserialize().map_err(redact_config_error)?;
+        if cfg.security.integration_group != security.integration_group
+            || cfg.security.integration_rules_directory != security.integration_rules_directory
+        {
+            return Err(config::ConfigError::Message(
+                "security integration settings must come from the config file, not environment overrides".into(),
+            ));
+        }
+        cfg.security = security;
+        if let Some(config_dir) = config_dir {
+            cfg.resolve_relative_paths(&config_dir, environment.as_ref());
+        }
+        cfg.apply_allowlist_fallbacks();
+        cfg.validate()?;
+        Ok(cfg)
+    }
+
+    /// Checks that deserialization cannot express, made at load time so a bad
+    /// value stops startup instead of failing later at runtime.
+    pub fn validate(&self) -> Result<(), config::ConfigError> {
+        webhook::validate_all(&self.alerts.webhook).map_err(config::ConfigError::Message)?;
+        if !matches!(
+            self.response
+                .min_severity
+                .trim()
+                .to_ascii_lowercase()
+                .as_str(),
+            "critical" | "high" | "medium" | "low"
+        ) {
+            return Err(config::ConfigError::Message(
+                "response.min_severity must be critical, high, medium, or low".to_string(),
+            ));
+        }
+        if self.response.enabled
+            && self
+                .response
+                .allowlist_paths
+                .iter()
+                .all(|path| path.starts_with('!'))
+        {
+            return Err(config::ConfigError::Message(
+                "active response needs allowlist.paths or response.allowlist_paths".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn resolve_relative_paths(
+        &mut self,
+        base_dir: &Path,
+        environment: Option<&config::Map<String, String>>,
+    ) {
+        resolve_path_from_config(
+            &mut self.scanner.sigma_rules_path,
+            base_dir,
+            "SCANNER__SIGMA_RULES_PATH",
+            environment,
+        );
+        resolve_path_from_config(
+            &mut self.scanner.yara_rules_path,
+            base_dir,
+            "SCANNER__YARA_RULES_PATH",
+            environment,
+        );
+        for path in self
+            .scanner
+            .sigma_local_rules_paths
+            .iter_mut()
+            .chain(self.scanner.yara_local_rules_paths.iter_mut())
+        {
+            resolve_path(path, base_dir);
+        }
+        resolve_path_from_config(
+            &mut self.logging.directory,
+            base_dir,
+            "LOGGING__DIRECTORY",
+            environment,
+        );
+        resolve_path_from_config(
+            &mut self.alerts.directory,
+            base_dir,
+            "ALERTS__DIRECTORY",
+            environment,
+        );
+        for webhook in &mut self.alerts.webhook {
+            if let Some(ca_file) = &mut webhook.ca_file {
+                resolve_path(ca_file, base_dir);
+            }
+        }
+        resolve_path_from_config(
+            &mut self.capture.directory,
+            base_dir,
+            "CAPTURE__DIRECTORY",
+            environment,
+        );
+        resolve_path_from_config(
+            &mut self.agent.directory,
+            base_dir,
+            "AGENT__DIRECTORY",
+            environment,
+        );
+        resolve_path_from_config(
+            &mut self.ioc.hashes_path,
+            base_dir,
+            "IOC__HASHES_PATH",
+            environment,
+        );
+        resolve_path_from_config(
+            &mut self.ioc.ips_path,
+            base_dir,
+            "IOC__IPS_PATH",
+            environment,
+        );
+        resolve_path_from_config(
+            &mut self.ioc.domains_path,
+            base_dir,
+            "IOC__DOMAINS_PATH",
+            environment,
+        );
+        resolve_path_from_config(
+            &mut self.ioc.paths_regex_path,
+            base_dir,
+            "IOC__PATHS_REGEX_PATH",
+            environment,
+        );
+        resolve_path_list_from_config(
+            &mut self.allowlist.paths,
+            base_dir,
+            "ALLOWLIST__PATHS",
+            environment,
+        );
+        self.allowlist
+            .excluded_paths
+            .retain(|path| !path.trim().is_empty());
+        resolve_path_list_from_config(
+            &mut self.allowlist.excluded_paths,
+            base_dir,
+            "ALLOWLIST__EXCLUDED_PATHS",
+            environment,
+        );
+        resolve_path_list_from_config(
+            &mut self.response.allowlist_paths,
+            base_dir,
+            "RESPONSE__ALLOWLIST_PATHS",
+            environment,
+        );
+        resolve_path_list_from_config(
+            &mut self.scanner.yara_allowlist_paths,
+            base_dir,
+            "SCANNER__YARA_ALLOWLIST_PATHS",
+            environment,
+        );
+        resolve_path_list_from_config(
+            &mut self.ioc.hash_allowlist_paths,
+            base_dir,
+            "IOC__HASH_ALLOWLIST_PATHS",
+            environment,
+        );
+    }
+
+    fn apply_allowlist_fallbacks(&mut self) {
+        self.allowlist
+            .excluded_paths
+            .retain(|path| !path.trim().is_empty());
+        if self.response.allowlist_paths.is_empty() {
+            self.response.allowlist_paths = self.allowlist.paths.clone();
+        }
+
+        if self.ioc.hash_allowlist_paths.is_empty() {
+            self.ioc.hash_allowlist_paths = self.allowlist.paths.clone();
+        }
+
+        if self.scanner.yara_allowlist_paths.is_empty() {
+            self.scanner.yara_allowlist_paths = self.allowlist.paths.clone();
+        }
+
+        for path in &self.allowlist.excluded_paths {
+            let excluded = format!("!{path}");
+            self.response.allowlist_paths.push(excluded.clone());
+            self.ioc.hash_allowlist_paths.push(excluded.clone());
+            self.scanner.yara_allowlist_paths.push(excluded);
+        }
+    }
+}
+
+const WEBHOOK_KEYS: &[&str] = &[
+    "name",
+    "url",
+    "headers",
+    "secret",
+    "timeout_ms",
+    "tls_verify",
+    "ca_file",
+    "queue_capacity",
+    "max_attempts",
+    "retry_initial_ms",
+    "retry_max_ms",
+    "max_payload_bytes",
+];
+
+fn reject_unknown_keys(config: &config::Config) -> Result<(), config::ConfigError> {
+    let value: serde_json::Value = config
+        .clone()
+        .try_deserialize()
+        .map_err(redact_config_error)?;
+    let Some(sections) = value.as_object() else {
+        return Ok(());
+    };
+    for (section, options) in sections {
+        if !reference::CONFIG_SECTIONS
+            .iter()
+            .any(|known| known.name == section)
+        {
+            return Err(unknown_key(
+                section,
+                section,
+                reference::CONFIG_SECTIONS.iter().map(|s| s.name),
+            ));
+        }
+        let Some(options) = options.as_object() else {
+            continue;
+        };
+        let prefix = format!("{section}.");
+        let known = || {
+            reference::CONFIG_OPTIONS
+                .iter()
+                .filter_map(|option| option.key.strip_prefix(&prefix))
+        };
+        for (key, value) in options {
+            let path = format!("{section}.{key}");
+            if !reference::CONFIG_OPTIONS
+                .iter()
+                .any(|option| option.key == path)
+            {
+                return Err(unknown_key(&path, key, known()));
+            }
+            if path == "alerts.webhook" {
+                if let Some(webhooks) = value.as_array() {
+                    for (index, webhook) in webhooks.iter().enumerate() {
+                        if let Some(fields) = webhook.as_object() {
+                            for field in fields.keys() {
+                                if !WEBHOOK_KEYS.contains(&field.as_str()) {
+                                    let path = format!("alerts.webhook[{index}].{field}");
+                                    return Err(unknown_key(
+                                        &path,
+                                        field,
+                                        WEBHOOK_KEYS.iter().copied(),
+                                    ));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn unknown_key<'a>(
+    path: &str,
+    key: &str,
+    candidates: impl Iterator<Item = &'a str>,
+) -> config::ConfigError {
+    let suggestion = candidates
+        .min_by_key(|candidate| edit_distance(key, candidate))
+        .unwrap_or("");
+    let parent = path.rsplit_once('.').map_or("", |(parent, _)| parent);
+    let suggestion = if parent.is_empty() {
+        suggestion.to_string()
+    } else {
+        format!("{parent}.{suggestion}")
+    };
+    config::ConfigError::Message(format!(
+        "unknown configuration key {path}; did you mean {suggestion}?"
+    ))
+}
+
+fn edit_distance(left: &str, right: &str) -> usize {
+    let right: Vec<char> = right.chars().collect();
+    let mut previous: Vec<usize> = (0..=right.len()).collect();
+    for (row, left_char) in left.chars().enumerate() {
+        let mut current = vec![row + 1];
+        for (column, right_char) in right.iter().enumerate() {
+            current.push(
+                (previous[column + 1] + 1)
+                    .min(current[column] + 1)
+                    .min(previous[column] + usize::from(left_char != *right_char)),
+            );
+        }
+        previous = current;
+    }
+    previous[right.len()]
+}
+
+// Parser excerpts and deserialization errors can contain credentials before
+// WebhookConfig's validation or redacted formatting gets a chance to run.
+fn redact_config_error(error: config::ConfigError) -> config::ConfigError {
+    use config::ConfigError;
+    match error {
+        ConfigError::FileParse { uri, .. } => ConfigError::FileParse {
+            uri,
+            cause: Box::new(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "invalid configuration syntax (source text omitted to protect credentials)",
+            )),
+        },
+        ConfigError::Type {
+            origin,
+            expected,
+            key,
+            ..
+        } => ConfigError::At {
+            error: Box::new(ConfigError::Message(format!(
+                "invalid type: expected {expected} (value omitted to protect credentials)"
+            ))),
+            origin,
+            key,
+        },
+        ConfigError::At { error, origin, key } => ConfigError::At {
+            error: Box::new(redact_config_error(*error)),
+            origin,
+            key,
+        },
+        ConfigError::Message(_) => ConfigError::Message(
+            "invalid configuration value (value omitted to protect credentials)".to_string(),
+        ),
+        other => other,
+    }
+}
+
+fn resolve_path(path: &mut PathBuf, base_dir: &Path) {
+    if path.is_relative() {
+        *path = base_dir.join(&path);
+    }
+}
+
+fn resolve_path_from_config(
+    path: &mut PathBuf,
+    base_dir: &Path,
+    env_key: &str,
+    environment: Option<&config::Map<String, String>>,
+) {
+    if !environment_contains(environment, env_key) {
+        resolve_path(path, base_dir);
+    }
+}
+
+fn environment_contains(environment: Option<&config::Map<String, String>>, env_key: &str) -> bool {
+    let key = format!("EDR__{env_key}");
+    match environment {
+        Some(values) => values
+            .keys()
+            .any(|candidate| candidate.eq_ignore_ascii_case(&key)),
+        None => std::env::var_os(key).is_some(),
+    }
+}
+
+fn absolute_config_path(path: PathBuf) -> PathBuf {
+    if path.is_absolute() {
+        return path;
+    }
+
+    match std::env::current_dir() {
+        Ok(cwd) => cwd.join(path),
+        Err(_) => path,
+    }
+}
+
+fn resolve_path_list(paths: &mut [String], base_dir: &Path) {
+    for path in paths {
+        let value = PathBuf::from(path.as_str());
+        if value.is_relative() {
+            *path = base_dir.join(value).to_string_lossy().into_owned();
+        }
+    }
+}
+
+fn resolve_path_list_from_config(
+    paths: &mut [String],
+    base_dir: &Path,
+    env_key: &str,
+    environment: Option<&config::Map<String, String>>,
+) {
+    if !environment_contains(environment, env_key) {
+        resolve_path_list(paths, base_dir);
+    }
+}
+
+impl Default for AppConfig {
+    fn default() -> Self {
+        let mut cfg = Self {
+            security: SecurityConfig::default(),
+            scanner: ScannerConfig {
+                sigma_enabled: true,
+                sigma_rules_path: PathBuf::from("rules/current/sigma"),
+                sigma_local_rules_paths: Vec::new(),
+                sigma_match_mode: SigmaMatchMode::Best,
+                yara_enabled: true,
+                yara_rules_path: PathBuf::from("rules/current/yara"),
+                yara_local_rules_paths: Vec::new(),
+                yara_allowlist_paths: Vec::new(),
+                yara_scan_timeout_ms: DEFAULT_SCAN_TIMEOUT_MS,
+                yara_max_file_mb: DEFAULT_MAX_FILE_MB,
+                yara_memory_enabled: false,
+                yara_memory_queue_capacity: 64,
+                yara_memory_delay_ms: 750,
+                yara_memory_max_process_mb: 64,
+                yara_memory_max_region_mb: 8,
+                yara_memory_include_private: true,
+                yara_memory_include_image: false,
+                yara_memory_include_mapped: false,
+            },
+            logging: LogConfig {
+                level: "info".to_string(),
+                filter: None,
+                directory: PathBuf::from("logs"),
+                filename: "rustinel.log".to_string(),
+                console_output: false,
+            },
+            alerts: AlertConfig {
+                directory: PathBuf::from("logs"),
+                filename: "alerts.json".to_string(),
+                match_debug: MatchDebugLevel::Off,
+                webhook: Vec::new(),
+            },
+            allowlist: AllowlistConfig {
+                paths: default_allowlist_paths(),
+                excluded_paths: default_allowlist_excluded_paths(),
+            },
+            response: ResponseConfig {
+                enabled: false,
+                prevention_enabled: false,
+                min_severity: "critical".to_string(),
+                channel_capacity: 128,
+                allowlist_images: Vec::new(),
+                allowlist_paths: Vec::new(),
+            },
+            process: ProcessConfig {
+                max_entries: 65_536,
+            },
+            ioc: IocConfig {
+                enabled: true,
+                hashes_path: PathBuf::from("rules/current/ioc/hashes.txt"),
+                ips_path: PathBuf::from("rules/current/ioc/ips.txt"),
+                domains_path: PathBuf::from("rules/current/ioc/domains.txt"),
+                paths_regex_path: PathBuf::from("rules/current/ioc/paths_regex.txt"),
+                default_severity: "high".to_string(),
+                max_file_size_mb: 50,
+                hash_allowlist_paths: Vec::new(),
+            },
+            reload: ReloadConfig {
+                enabled: true,
+                debounce_ms: 2000,
+                fallback_poll_interval_ms: 60000,
+            },
+            dedup: DedupConfig {
+                enabled: true,
+                window_secs: 60,
+                max_entries: 10_000,
+            },
+            capture: CaptureConfig {
+                directory: PathBuf::from("captures"),
+            },
+            agent: AgentConfig::default(),
+            telemetry: TelemetryConfig {
+                enabled: true,
+                snapshot_interval_secs: 30,
+                loss_alert_interval_secs: 60,
+            },
+            heartbeat: HeartbeatConfig::default(),
+            windows: WindowsConfig {
+                etw_flush_interval_ms: 20,
+                etw_process_flush_interval_ms: 5,
+                security_filtering_platform_connections: false,
+                security_long_tail_events: false,
+                security_domain_controller_events: false,
+            },
+        };
+
+        cfg.apply_allowlist_fallbacks();
+        cfg
+    }
+}
+
+#[cfg(test)]
+mod tests;

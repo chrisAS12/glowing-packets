@@ -1,0 +1,13 @@
+title: Example - Whoami Execution (Windows)
+id: d4f5e6b2-3c7a-4e1b-9f2a-123456789abc
+status: experimental
+description: Detects execution of whoami.exe (demo rule).
+author: Rustinel
+logsource:
+  category: process_creation
+  product: windows
+detection:
+  selection:
+    Image|endswith: '\whoami.exe'
+  condition: selection
+level: low

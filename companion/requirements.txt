@@ -1,0 +1,5 @@
+# Core runtime dependency (process & socket attribution on Windows)
+psutil>=7.2.2,<8.0.0
+
+# Optional build dependency for creating standalone Windows .exe bundles:
+# pyinstaller>=6.10.0,<7.0.0

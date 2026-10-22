@@ -1,0 +1,4 @@
+# IOC Type: Hashes
+# Format: VALUE;COMMENT
+# Example: 0c2674c3a97c53082187d930efb645c2;Malware sample hash
+# Note: Supports MD5, SHA1, and SHA256.

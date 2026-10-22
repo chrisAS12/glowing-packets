@@ -1,0 +1,1909 @@
+//! Sigma detection engine module
+//!
+//! Rustinel evaluates Sigma with the RSigma library: `rsigma-parser` for rule
+//! parsing and `rsigma-eval` for matching. Rustinel keeps ownership of the
+//! surrounding machinery — event normalization, logsource classification and
+//! routing, ECS alerts, hot reload, and the IOC/YARA detectors — and hands
+//! RSigma only the detection logic.
+//!
+//! The module is laid out as:
+//!
+//! - `logsource` — logsource normalization, platform filtering, and the
+//!   event → candidate-logsource routing both loading and matching share.
+//! - `loader` — the rules-directory walk and collection load.
+//! - `store` — one synchronized `rsigma_eval::CorrelationEngine` and the
+//!   descriptions and counts Rustinel keeps beside it.
+//! - `alert` — mapping RSigma evaluation results onto Rustinel's [`Alert`].
+
+mod alert;
+pub mod compatibility;
+mod deferred;
+mod detect;
+mod detectors;
+mod event;
+mod handler;
+mod loader;
+mod logsource;
+mod stats;
+mod store;
+
+pub use deferred::{ArtifactFieldNeeds, DetectionPass};
+pub(crate) use deferred::{
+    HASHES_FIELD, IMPHASH_FIELD, SIGNATURE_FIELD, SIGNATURE_STATUS_FIELD, SIGNED_FIELD,
+};
+pub use detect::EventDetectors;
+pub use detectors::DetectorStore;
+pub use handler::{CanonicalEventDispatcher, DetectionPipeline};
+pub(crate) use logsource::{current_platform, RuleLoadDecision};
+pub use logsource::{LogSource, LogSourceClassification, LogSourceKey, LogSourceStatus};
+pub use stats::{EngineStats, UnsupportedRule, UnsupportedRuleKind};
+pub(crate) use store::CORRELATION_REORDER_BUDGET;
+
+use rsigma_eval::EvaluationResult;
+use std::collections::{HashMap, HashSet};
+use std::time::Instant;
+
+use crate::models::{Alert, AlertSeverity, CanonicalEvent, MatchDebugLevel, NormalizedEvent};
+use crate::vocab::{Platform, ProcessStartKey};
+
+pub(crate) struct SigmaAlert {
+    pub(crate) alert: Alert,
+    pub(crate) process_start_key: Option<ProcessStartKey>,
+}
+
+type CorrelationResult = (EvaluationResult, NormalizedEvent, Option<ProcessStartKey>);
+
+pub use crate::config::SigmaMatchMode;
+
+/// Ranking key for the default one-Sigma-alert-per-event policy.
+///
+/// Several rules can match the same event, and `best` mode emits a single
+/// Sigma alert per pass, so the engine needs a total order over matches. The
+/// policy is:
+///
+/// 1. Highest normalized severity (`critical > high > medium > low`).
+/// 2. On equal severity, rules carrying an `id` win over rules without one.
+/// 3. Then the lexicographically smallest rule id, and finally the smallest
+///    rule title, both compared as byte order.
+///
+/// The tie-breaker deliberately never consults rule load order or directory
+/// traversal order, so the emitted alert is identical no matter how the
+/// ruleset was loaded. The best match is the *smallest* `MatchRank`; a fully
+/// equal rank keeps the first candidate seen.
+///
+/// Correlation results are appended after the selected detection results.
+#[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct MatchRank<'a> {
+    /// Reversed so that a higher severity yields a smaller rank.
+    severity: std::cmp::Reverse<AlertSeverity>,
+    /// `0` for rules with an id, `1` for rules without, then the id itself.
+    rule_id: (u8, &'a str),
+    rule_title: &'a str,
+}
+
+impl<'a> MatchRank<'a> {
+    pub(crate) fn new(
+        severity: AlertSeverity,
+        rule_id: Option<&'a str>,
+        rule_title: &'a str,
+    ) -> Self {
+        Self {
+            severity: std::cmp::Reverse(severity),
+            rule_id: match rule_id {
+                Some(id) => (0, id),
+                None => (1, ""),
+            },
+            rule_title,
+        }
+    }
+}
+
+pub struct Engine {
+    /// Platform whose Sigma logsource rules should be accepted.
+    platform: Platform,
+
+    /// One synchronized RSigma detection and correlation engine.
+    store: store::RuleStore,
+
+    /// Total number of loaded rules
+    rule_count: usize,
+
+    /// Total number of rule files found
+    rule_files_found: usize,
+
+    /// Failed rule paths and error messages (for diagnostics)
+    failed_rules: Vec<(String, String)>,
+
+    /// What each loaded rules directory contributed.
+    directories: Vec<crate::utils::rule_dirs::RuleDirectoryReport>,
+
+    /// Pack rules replaced by a local rule with the same id.
+    collisions: Vec<crate::utils::rule_dirs::RuleCollision>,
+
+    /// Parsed documents dropped because their rule references do not resolve.
+    unsupported_rules: Vec<UnsupportedRule>,
+
+    /// Rules skipped at load time due to unsupported logsource product.
+    skipped_product_rules: usize,
+
+    /// Rules skipped at load time because the logsource family is explicitly deferred.
+    skipped_deferred_rules: usize,
+
+    /// Rules skipped at load time because the logsource shape is unknown.
+    skipped_unknown_logsource_rules: usize,
+
+    /// Rules that loaded successfully but do not currently have an active collector.
+    inactive_collector_rules: usize,
+
+    /// Deferred logsource counts by normalized tuple.
+    deferred_logsource_counts: HashMap<LogSourceKey, usize>,
+
+    /// Unknown logsource counts by normalized tuple.
+    unknown_logsource_counts: HashMap<LogSourceKey, usize>,
+
+    /// Loaded-but-inert rule counts by normalized tuple: the logsource is one
+    /// Rustinel understands, but no collector on this platform feeds it.
+    inactive_collector_counts: HashMap<LogSourceKey, usize>,
+
+    /// Controls whether match debug details are attached to alerts.
+    match_debug: MatchDebugLevel,
+
+    /// Controls which detection matches are presented as alerts.
+    sigma_match_mode: SigmaMatchMode,
+}
+
+impl Engine {
+    /// Creates a new engine instance
+    pub fn new() -> Self {
+        Self::new_for_platform(current_platform())
+    }
+
+    /// Creates a new engine instance for an explicit sensor platform.
+    pub fn new_for_platform(platform: Platform) -> Self {
+        Self::new_inner(platform, MatchDebugLevel::Off)
+    }
+
+    /// Creates a new engine instance for the current platform with an explicit
+    /// match-debug verbosity. Used by the hot-reload worker.
+    pub fn new_with_match_debug(match_debug: MatchDebugLevel) -> Self {
+        Self::new_inner(current_platform(), match_debug)
+    }
+
+    /// Creates a new engine instance for an explicit platform and match-debug
+    /// setting. Used at runtime startup and by `rustinel replay`.
+    pub fn new_for_platform_with_match_debug(
+        platform: Platform,
+        match_debug: MatchDebugLevel,
+    ) -> Self {
+        Self::new_inner(platform, match_debug)
+    }
+
+    fn new_inner(platform: Platform, match_debug: MatchDebugLevel) -> Self {
+        Self {
+            platform,
+            store: store::RuleStore::new(match_debug),
+            rule_count: 0,
+            rule_files_found: 0,
+            failed_rules: Vec::new(),
+            directories: Vec::new(),
+            collisions: Vec::new(),
+            unsupported_rules: Vec::new(),
+            skipped_product_rules: 0,
+            skipped_deferred_rules: 0,
+            skipped_unknown_logsource_rules: 0,
+            inactive_collector_rules: 0,
+            deferred_logsource_counts: HashMap::new(),
+            unknown_logsource_counts: HashMap::new(),
+            inactive_collector_counts: HashMap::new(),
+            match_debug,
+            sigma_match_mode: SigmaMatchMode::Best,
+        }
+    }
+
+    /// Set the detection-alert presentation mode.
+    pub fn with_sigma_match_mode(mut self, sigma_match_mode: SigmaMatchMode) -> Self {
+        self.sigma_match_mode = sigma_match_mode;
+        self
+    }
+
+    /// Evaluate an event against every loaded rule.
+    ///
+    /// Equivalent to [`DetectionPass::All`]: the admission and deferred passes
+    /// of the same event, evaluated back to back.
+    pub fn evaluate_event(&self, event: &NormalizedEvent) -> Vec<Alert> {
+        self.evaluate_event_pass(event, DetectionPass::All)
+    }
+
+    /// Evaluate the rules of one detection pass against an event.
+    ///
+    /// In `best` mode, each pass contributes at most one detection alert,
+    /// selected by `MatchRank` among that pass's rules. In `all` mode, every
+    /// matching detection rule contributes an alert. Every correlation alert
+    /// follows the detection alerts. Detection results are deduplicated before they
+    /// reach the stateful correlation engine because a partial logsource can
+    /// match through more than one concrete event alias. Detection alerts are
+    /// returned immediately. Correlation updates wait behind any earlier
+    /// incomplete deferred pass, so a later call can also return correlations
+    /// whose triggering event was buffered before that call.
+    pub fn evaluate_event_pass(&self, event: &NormalizedEvent, pass: DetectionPass) -> Vec<Alert> {
+        self.evaluate_event_pass_with_origin(event, None, pass)
+            .into_iter()
+            .map(|result| result.alert)
+            .collect()
+    }
+
+    pub(crate) fn evaluate_canonical_event_pass(
+        &self,
+        event: &CanonicalEvent,
+        pass: DetectionPass,
+    ) -> Vec<SigmaAlert> {
+        self.evaluate_event_pass_with_origin(event.normalized(), event.process_start_key, pass)
+    }
+
+    fn evaluate_event_pass_with_origin(
+        &self,
+        event: &NormalizedEvent,
+        process_start_key: Option<ProcessStartKey>,
+        pass: DetectionPass,
+    ) -> Vec<SigmaAlert> {
+        let deferred_rules = self.store.deferred();
+        let (selected, correlations) = {
+            let mut state = self.store.lock();
+            let mut admission = Vec::new();
+            let mut deferred = Vec::new();
+            let mut seen = HashSet::new();
+
+            for route in Self::concrete_logsource_routes_for_event(event) {
+                let logsource = rsigma_parser::LogSource {
+                    product: route.key.product,
+                    service: route.key.service,
+                    category: route.key.category,
+                    ..Default::default()
+                };
+                let adapter = event::RsigmaEvent::with_view(event, route.view);
+
+                for result in state
+                    .engine
+                    .engine()
+                    .evaluate_with_logsource(&adapter, &logsource)
+                    .into_iter()
+                    .filter(EvaluationResult::is_detection)
+                {
+                    let identity = (
+                        result.header.rule_id.clone(),
+                        result.header.rule_title.clone(),
+                    );
+                    if !seen.insert(identity) {
+                        continue;
+                    }
+                    if deferred_rules
+                        .contains(result.header.rule_id.as_deref(), &result.header.rule_title)
+                    {
+                        if pass.includes_deferred() {
+                            deferred.push(result);
+                        }
+                    } else if pass.includes_admission() {
+                        admission.push(result);
+                    }
+                }
+            }
+
+            let mut selected = Vec::new();
+            if pass.includes_admission() {
+                selected.extend(self.select_detections(&admission));
+            }
+            if pass.includes_deferred() {
+                selected.extend(self.select_detections(&deferred));
+            }
+
+            // Correlation only advances on detections, so with no correlation
+            // rules there is nothing to buffer, and an event without
+            // detections can skip the buffer when nothing is queued ahead.
+            let correlating = state.engine.correlation_rule_count() > 0;
+            let skip_buffer = !correlating
+                || (pass == DetectionPass::All
+                    && admission.is_empty()
+                    && deferred.is_empty()
+                    && state.pending.is_empty());
+            if !skip_buffer {
+                let key = correlation_event_key(event);
+                match pass {
+                    DetectionPass::All => state.pending.push_back(store::PendingCorrelation {
+                        key,
+                        event: event.clone(),
+                        process_start_key,
+                        passes: vec![admission, deferred],
+                        complete: true,
+                        evaluate_by: Instant::now(),
+                    }),
+                    DetectionPass::Admission => {
+                        let early = state.early_deferred.remove(&key).and_then(|entry| {
+                            if entry.received_at.elapsed() >= store::CORRELATION_REORDER_BUDGET {
+                                state.early_deferred_evictions += 1;
+                                None
+                            } else {
+                                Some(entry)
+                            }
+                        });
+                        let complete = early.is_some();
+                        let mut passes = vec![admission];
+                        if let Some(early) = early {
+                            passes.push(early.detections);
+                        }
+                        state.pending.push_back(store::PendingCorrelation {
+                            key,
+                            event: event.clone(),
+                            process_start_key,
+                            passes,
+                            complete,
+                            evaluate_by: Instant::now()
+                                .checked_add(store::CORRELATION_REORDER_BUDGET)
+                                .unwrap_or_else(Instant::now),
+                        });
+                    }
+                    DetectionPass::Deferred => {
+                        if !state.expired.remove(&key) {
+                            if let Some(entry) =
+                                state.pending.iter_mut().find(|entry| entry.key == key)
+                            {
+                                if !entry.complete {
+                                    entry.passes.push(deferred);
+                                    entry.complete = true;
+                                }
+                            } else {
+                                if state.early_deferred.len() >= store::CORRELATION_REORDER_CAPACITY
+                                {
+                                    Self::evict_early_deferred(&mut state, Instant::now());
+                                }
+                                if state.early_deferred.len() >= store::CORRELATION_REORDER_CAPACITY
+                                {
+                                    tracing::warn!(
+                                        target: "engine",
+                                        ingest_seq = event.ingest_seq,
+                                        "Deferred Sigma correlation result arrived without admission and the bounded reorder buffer is full"
+                                    );
+                                    state.remember_expired(key);
+                                } else {
+                                    state.early_deferred.entry(key).or_insert(
+                                        store::EarlyDeferred {
+                                            detections: deferred,
+                                            received_at: Instant::now(),
+                                        },
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            let correlations = Self::drain_correlations(&mut state, Instant::now(), false);
+            (selected, correlations)
+        };
+
+        let mut alerts = Vec::with_capacity(selected.len() + correlations.len());
+        for result in selected {
+            alerts.push(SigmaAlert {
+                alert: self.build_alert(result, event),
+                process_start_key,
+            });
+        }
+        alerts.extend(self.correlation_alerts(correlations));
+        alerts
+    }
+
+    /// Drain correlations whose deferred pass reached its deadline, even when
+    /// no further events arrive.
+    pub fn flush_due(&self, now: Instant) -> Vec<Alert> {
+        self.flush_due_with_origins(now)
+            .into_iter()
+            .map(|result| result.alert)
+            .collect()
+    }
+
+    pub(crate) fn flush_due_with_origins(&self, now: Instant) -> Vec<SigmaAlert> {
+        let correlations = {
+            let mut state = self.store.lock();
+            Self::evict_early_deferred(&mut state, now);
+            Self::drain_correlations(&mut state, now, false)
+        };
+        self.correlation_alerts(correlations)
+    }
+
+    pub(crate) fn flush_pending_with_origins(&self) -> Vec<SigmaAlert> {
+        let correlations = {
+            let mut state = self.store.lock();
+            Self::evict_early_deferred(&mut state, Instant::now());
+            Self::drain_correlations(&mut state, Instant::now(), true)
+        };
+        self.correlation_alerts(correlations)
+    }
+
+    fn evict_early_deferred(state: &mut store::CorrelationState, now: Instant) {
+        let before = state.early_deferred.len();
+        state.early_deferred.retain(|_, entry| {
+            now.saturating_duration_since(entry.received_at) < store::CORRELATION_REORDER_BUDGET
+        });
+        state.early_deferred_evictions += (before - state.early_deferred.len()) as u64;
+    }
+
+    fn drain_correlations(
+        state: &mut store::CorrelationState,
+        now: Instant,
+        flush_all: bool,
+    ) -> Vec<CorrelationResult> {
+        let mut correlations = Vec::new();
+        while let Some(front) = state.pending.front() {
+            let forced = !front.complete
+                && (flush_all
+                    || now >= front.evaluate_by
+                    || state.pending.len() > store::CORRELATION_REORDER_CAPACITY);
+            if !front.complete && !forced {
+                break;
+            }
+            let entry = state.pending.pop_front().expect("front exists");
+            if forced {
+                tracing::warn!(
+                    target: "engine",
+                    ingest_seq = entry.event.ingest_seq,
+                    "Deferred Sigma correlation pass missed its reorder budget; continuing without it"
+                );
+                state.remember_expired(entry.key);
+            }
+            let adapter = event::RsigmaEvent::new(&entry.event);
+            for detections in entry.passes {
+                for result in state
+                    .engine
+                    .correlate_detections(&adapter, detections)
+                    .into_iter()
+                    .filter(EvaluationResult::is_correlation)
+                {
+                    correlations.push((result, entry.event.clone(), entry.process_start_key));
+                }
+            }
+        }
+        correlations
+    }
+
+    fn correlation_alerts(&self, correlations: Vec<CorrelationResult>) -> Vec<SigmaAlert> {
+        correlations
+            .into_iter()
+            .map(|(mut result, event, process_start_key)| {
+                self.store.restore_synthetic_detection_id(&mut result);
+                SigmaAlert {
+                    alert: self.build_alert(result, &event),
+                    process_start_key,
+                }
+            })
+            .collect()
+    }
+
+    fn select_detections(&self, results: &[EvaluationResult]) -> Vec<EvaluationResult> {
+        let restore_id = |mut result: EvaluationResult| {
+            self.store.restore_synthetic_detection_id(&mut result);
+            result
+        };
+        if self.sigma_match_mode == SigmaMatchMode::Best {
+            return results
+                .iter()
+                .cloned()
+                .map(restore_id)
+                .min_by(|left, right| alert::result_rank(left).cmp(&alert::result_rank(right)))
+                .into_iter()
+                .collect();
+        }
+
+        let mut results = results.iter().cloned().map(restore_id).collect::<Vec<_>>();
+        results.sort_by(|left, right| alert::result_rank(left).cmp(&alert::result_rank(right)));
+        results
+    }
+
+    /// Artifact fields the deferred pass needs for this event, or empty when
+    /// no loaded rule selects on them for its logsource.
+    pub fn deferred_field_needs(&self, event: &NormalizedEvent) -> ArtifactFieldNeeds {
+        self.store.deferred().needs_for(event)
+    }
+
+    /// Compatibility alias for callers that used the pre-correlation name.
+    pub fn check_event(&self, event: &NormalizedEvent) -> Vec<Alert> {
+        self.evaluate_event(event)
+    }
+}
+
+fn correlation_event_key(event: &NormalizedEvent) -> store::CorrelationEventKey {
+    (
+        event.ingest_seq,
+        event.timestamp.clone(),
+        event.provider.clone(),
+        event.event_id,
+    )
+}
+
+impl Default for Engine {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::models::{EventFields, ProcessCreationFields};
+
+    fn windows_engine() -> Engine {
+        Engine::new_for_platform(Platform::Windows)
+    }
+
+    fn linux_engine() -> Engine {
+        Engine::new_for_platform(Platform::Linux)
+    }
+
+    fn macos_engine() -> Engine {
+        Engine::new_for_platform(Platform::MacOS)
+    }
+
+    fn logsource(
+        product: Option<&str>,
+        service: Option<&str>,
+        category: Option<&str>,
+    ) -> LogSource {
+        LogSource {
+            product: product.map(ToString::to_string),
+            service: service.map(ToString::to_string),
+            category: category.map(ToString::to_string),
+        }
+    }
+
+    /// Load one rule from a temporary file, exercising the real loader.
+    fn engine_with_rule(platform: Platform, rule_yaml: &str) -> Engine {
+        engine_with_rules(platform, &[rule_yaml])
+    }
+
+    /// Load several rules from one temporary directory through the real loader.
+    fn engine_with_rules(platform: Platform, rules_yaml: &[&str]) -> Engine {
+        let dir = tempfile::tempdir().expect("temporary rule directory");
+        for (index, rule_yaml) in rules_yaml.iter().enumerate() {
+            std::fs::write(dir.path().join(format!("rule{index}.yml")), rule_yaml)
+                .expect("write rule");
+        }
+        let mut engine = Engine::new_for_platform(platform);
+        engine.load_rules(dir.path()).expect("rules should load");
+        assert_eq!(
+            engine.stats().failed_rules,
+            Vec::<(String, String)>::new(),
+            "the fixture rules should load cleanly"
+        );
+        engine
+    }
+
+    #[test]
+    fn new_engine_has_no_rules() {
+        let engine = Engine::new();
+        assert_eq!(engine.rule_count, 0);
+        assert_eq!(engine.stats().total_rules, 0);
+    }
+
+    #[test]
+    fn check_event_without_rules_does_not_alert() {
+        let engine = Engine::new_for_platform(Platform::Windows);
+        let event = process_event(
+            Platform::Windows,
+            r"C:\Windows\System32\whoami.exe",
+            "whoami",
+        );
+
+        assert!(engine.check_event(&event).is_empty());
+    }
+
+    #[test]
+    fn non_matching_product_is_classified_as_a_mismatch() {
+        let source = logsource(Some("linux"), None, Some("process_creation"));
+
+        assert_eq!(
+            windows_engine().classify_logsource(&source).status,
+            LogSourceStatus::ProductMismatch
+        );
+        assert_eq!(
+            linux_engine().classify_logsource(&source).status,
+            LogSourceStatus::Supported
+        );
+    }
+
+    #[test]
+    fn unrecognized_service_is_classified_as_unknown() {
+        let source = logsource(
+            Some("windows"),
+            Some("cloudtrail"),
+            Some("process_creation"),
+        );
+
+        assert_eq!(
+            windows_engine().classify_logsource(&source).status,
+            LogSourceStatus::Unknown
+        );
+        assert_eq!(
+            linux_engine().classify_logsource(&source).status,
+            LogSourceStatus::ProductMismatch
+        );
+    }
+
+    #[test]
+    fn unsupported_category_is_classified_as_unknown() {
+        let source = logsource(Some("windows"), None, Some("process_tampering"));
+
+        assert_eq!(
+            windows_engine().classify_logsource(&source).status,
+            LogSourceStatus::Unknown
+        );
+    }
+
+    #[test]
+    fn service_only_logsource_loads_without_a_category() {
+        let classification =
+            linux_engine().classify_logsource(&logsource(Some("linux"), Some("sysmon"), None));
+
+        assert_eq!(classification.status, LogSourceStatus::Supported);
+        assert_eq!(classification.collector_active, Some(true));
+    }
+
+    #[test]
+    fn file_change_has_no_backing_collector_off_windows() {
+        // Sysmon Event ID 2 is a metadata change; neither the eBPF nor the ESF
+        // sensor emits it, so its rules load but are reported as unbacked
+        // rather than counted as covered (issue #293).
+        let source = logsource(None, Some("sysmon"), Some("file_change"));
+
+        for engine in [linux_engine(), macos_engine()] {
+            let classification = engine.classify_logsource(&source);
+            assert_eq!(classification.status, LogSourceStatus::Supported);
+            assert_eq!(classification.collector_active, Some(false));
+        }
+
+        let windows = windows_engine().classify_logsource(&source);
+        assert_eq!(windows.status, LogSourceStatus::Supported);
+        assert_eq!(windows.collector_active, Some(true));
+    }
+
+    #[test]
+    fn platform_qualified_file_change_has_no_backing_collector_off_windows() {
+        for (engine, product) in [(linux_engine(), "linux"), (macos_engine(), "macos")] {
+            let classification = engine.classify_logsource(&logsource(
+                Some(product),
+                Some("sysmon"),
+                Some("file_change"),
+            ));
+
+            assert_eq!(classification.status, LogSourceStatus::Supported);
+            assert_eq!(classification.collector_active, Some(false));
+        }
+    }
+
+    #[test]
+    fn sibling_file_categories_stay_active_off_windows() {
+        // Only `file_change` loses its collector: the rest of the file family
+        // is still emitted by both sensors.
+        for (engine, product) in [(linux_engine(), "linux"), (macos_engine(), "macos")] {
+            for category in ["file_event", "file_create", "file_delete", "file_rename"] {
+                let classification = engine.classify_logsource(&logsource(
+                    Some(product),
+                    Some("sysmon"),
+                    Some(category),
+                ));
+
+                assert_eq!(
+                    classification.collector_active,
+                    Some(true),
+                    "{product}/{category} should stay backed by a collector"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn linux_file_change_rule_is_counted_as_inactive() {
+        let engine = engine_with_rule(
+            Platform::Linux,
+            r#"title: Linux Timestomp
+logsource:
+  product: linux
+  service: sysmon
+  category: file_change
+detection:
+  selection:
+    TargetFilename|endswith: ".sh"
+  condition: selection
+level: medium
+"#,
+        );
+
+        let stats = engine.stats();
+        assert_eq!(stats.total_rules, 1, "the rule still loads");
+        assert_eq!(stats.inactive_collector_rules, 1);
+    }
+
+    #[test]
+    fn inert_rules_are_grouped_by_missing_telemetry_category() {
+        let engine = engine_with_rules(
+            Platform::Linux,
+            &[
+                r#"title: Linux Timestomp
+logsource:
+  product: linux
+  service: sysmon
+  category: file_change
+detection:
+  selection:
+    TargetFilename|endswith: ".sh"
+  condition: selection
+"#,
+                r#"title: Linux Timestomp Two
+logsource:
+  product: linux
+  service: sysmon
+  category: file_change
+detection:
+  selection:
+    TargetFilename|endswith: ".py"
+  condition: selection
+"#,
+                r#"title: Linux DNS Network
+logsource:
+  product: linux
+  service: dns
+detection:
+  selection:
+    query|contains: evil.example
+  condition: selection
+"#,
+                r#"title: Linux Process
+logsource:
+  product: linux
+  service: sysmon
+  category: process_creation
+detection:
+  selection:
+    Image|endswith: bash
+  condition: selection
+"#,
+            ],
+        );
+
+        let stats = engine.stats();
+        assert_eq!(stats.total_rules, 4, "every rule still loads");
+        assert_eq!(stats.inactive_collector_rules, 3);
+        assert_eq!(
+            stats.inactive_collector_categories,
+            std::collections::BTreeMap::from([
+                ("file_change".to_string(), 2),
+                ("service:dns".to_string(), 1),
+            ])
+        );
+        assert_eq!(
+            stats.inactive_collector_summary().as_deref(),
+            Some("file_change (2), service:dns (1)"),
+            "the summary orders the largest telemetry gap first"
+        );
+    }
+
+    #[test]
+    fn a_fully_backed_ruleset_reports_no_inert_rules() {
+        let engine = engine_with_rule(
+            Platform::Linux,
+            r#"title: Linux Process
+logsource:
+  product: linux
+  service: sysmon
+  category: process_creation
+detection:
+  selection:
+    Image|endswith: bash
+  condition: selection
+"#,
+        );
+
+        let stats = engine.stats();
+        assert_eq!(stats.inactive_collector_rules, 0);
+        assert!(stats.inactive_collector_categories.is_empty());
+        assert_eq!(stats.inactive_collector_summary(), None);
+    }
+
+    #[test]
+    fn deferred_linux_logsource_is_reported() {
+        let classification = linux_engine().classify_logsource(&logsource(
+            Some("linux"),
+            Some("sshd"),
+            Some("process_creation"),
+        ));
+
+        assert_eq!(classification.status, LogSourceStatus::Deferred);
+        assert_eq!(classification.collector_active, None);
+    }
+
+    #[test]
+    fn linux_auditd_logsource_is_backed_by_the_auditd_view() {
+        let classification =
+            linux_engine().classify_logsource(&logsource(Some("linux"), Some("auditd"), None));
+
+        assert_eq!(classification.status, LogSourceStatus::Supported);
+        assert_eq!(classification.collector_active, Some(true));
+        // macOS has no auditd view: the product is Linux only.
+        let classification =
+            macos_engine().classify_logsource(&logsource(Some("linux"), Some("auditd"), None));
+        assert_eq!(classification.status, LogSourceStatus::ProductMismatch);
+    }
+
+    fn audit_exec(argv: &[&str], syscall: Option<&str>) -> NormalizedEvent {
+        let mut event = process_event(Platform::Linux, "/usr/bin/xclip", &argv.join(" "));
+        event.provider = "ebpf".to_string();
+        if let EventFields::ProcessCreation(fields) = &mut event.fields {
+            fields.exec = Some(Box::new(crate::models::ExecMetadata {
+                argv: (!argv.is_empty()).then(|| argv.iter().map(ToString::to_string).collect()),
+                exec_syscall: syscall.map(ToString::to_string),
+                ..Default::default()
+            }));
+        }
+        event
+    }
+
+    fn audit_file(
+        action: crate::vocab::SensorAction,
+        source: Option<&str>,
+        target: &str,
+        image: Option<&str>,
+    ) -> NormalizedEvent {
+        let row = crate::models::event_actions::row_for_action(
+            crate::models::EventCategory::File,
+            action,
+        )
+        .expect("file action row");
+        NormalizedEvent {
+            timestamp: "2025-01-01T00:00:00Z".to_string(),
+            source_seq: None,
+            ingest_seq: 0,
+            platform: Platform::Linux,
+            provider: "ebpf".to_string(),
+            category: crate::models::EventCategory::File,
+            event_id: row.event_id,
+            event_id_string: row.event_id.to_string(),
+            opcode: row.action_code,
+            fields: EventFields::FileEvent(crate::models::FileEventFields {
+                source_filename: source.map(ToString::to_string),
+                target_filename: Some(target.to_string()),
+                process_id: Some("4242".to_string()),
+                image: image.map(ToString::to_string),
+                creation_utc_time: None,
+                previous_creation_utc_time: None,
+                user: Some("0".to_string()),
+                file_identity: None,
+                path_truncated: None,
+            }),
+            process_name: None,
+            provenance: Default::default(),
+            process_context: None,
+        }
+    }
+
+    const AUDITD_XCLIP: &str = r#"title: Clipboard Collection
+logsource:
+  product: linux
+  service: auditd
+detection:
+  selection:
+    type: EXECVE
+    a0: xclip
+    a1:
+      - '-selection'
+      - '-sel'
+    a2:
+      - clipboard
+      - clip
+    a3: '-o'
+  condition: selection
+"#;
+
+    #[test]
+    fn auditd_execve_rule_matches_the_captured_argv() {
+        let engine = engine_with_rule(Platform::Linux, AUDITD_XCLIP);
+
+        let hit = audit_exec(&["xclip", "-selection", "clipboard", "-o"], Some("execve"));
+        assert_eq!(engine.check_event(&hit).len(), 1);
+
+        let wrong_argument = audit_exec(&["xclip", "-selection", "primary", "-o"], Some("execve"));
+        assert!(engine.check_event(&wrong_argument).is_empty());
+    }
+
+    #[test]
+    fn auditd_argument_fields_come_from_argv_boundaries_not_the_command_line() {
+        let engine = engine_with_rule(Platform::Linux, AUDITD_XCLIP);
+
+        // The command line reads like a hit, but no argv was captured, so
+        // `a0` is absent rather than re-tokenized from `CommandLine`.
+        let mut event = audit_exec(&[], None);
+        if let EventFields::ProcessCreation(fields) = &mut event.fields {
+            fields.command_line = Some("xclip -selection clipboard -o".to_string());
+        }
+        assert!(engine.check_event(&event).is_empty());
+
+        // One argument that contains spaces is one `a1`, not three.
+        let engine = engine_with_rule(
+            Platform::Linux,
+            r#"title: Space in argument
+logsource:
+  product: linux
+  service: auditd
+detection:
+  selection:
+    type: EXECVE
+    a0: sh
+    a1: '-c id'
+  condition: selection
+"#,
+        );
+        assert_eq!(
+            engine
+                .check_event(&audit_exec(&["sh", "-c id"], Some("execve")))
+                .len(),
+            1
+        );
+        assert!(engine
+            .check_event(&audit_exec(&["sh", "-c", "id"], Some("execve")))
+            .is_empty());
+    }
+
+    #[test]
+    fn auditd_syscall_distinguishes_execve_from_execveat() {
+        let engine = engine_with_rule(
+            Platform::Linux,
+            r#"title: Execveat
+logsource:
+  product: linux
+  service: auditd
+detection:
+  selection:
+    type: SYSCALL
+    SYSCALL: execveat
+  condition: selection
+"#,
+        );
+        assert_eq!(
+            engine
+                .check_event(&audit_exec(&["a"], Some("execveat")))
+                .len(),
+            1
+        );
+        assert!(engine
+            .check_event(&audit_exec(&["a"], Some("execve")))
+            .is_empty());
+        assert!(engine.check_event(&audit_exec(&["a"], None)).is_empty());
+    }
+
+    #[test]
+    fn auditd_exe_selects_exec_and_file_processes() {
+        let engine = engine_with_rule(
+            Platform::Linux,
+            r#"title: Process Run From Tmp
+logsource:
+  product: linux
+  service: auditd
+detection:
+  selection:
+    type: SYSCALL
+    exe|startswith: /tmp/
+  condition: selection
+"#,
+        );
+        let mut exec = audit_exec(&["x"], Some("execve"));
+        if let EventFields::ProcessCreation(fields) = &mut exec.fields {
+            fields.image = Some("/tmp/payload".to_string());
+        }
+        assert_eq!(engine.check_event(&exec).len(), 1);
+
+        let write = audit_file(
+            crate::vocab::SensorAction::Create,
+            None,
+            "/root/x",
+            Some("/tmp/payload"),
+        );
+        assert_eq!(engine.check_event(&write).len(), 1);
+
+        let elsewhere = audit_file(
+            crate::vocab::SensorAction::Create,
+            None,
+            "/root/x",
+            Some("/usr/bin/vi"),
+        );
+        assert!(engine.check_event(&elsewhere).is_empty());
+    }
+
+    #[test]
+    fn auditd_path_rules_use_name_and_nametype() {
+        let engine = engine_with_rule(
+            Platform::Linux,
+            r#"title: Systemd Service Creation
+logsource:
+  product: linux
+  service: auditd
+detection:
+  path:
+    type: PATH
+    nametype: CREATE
+  name:
+    name|startswith: /etc/systemd/system/
+  condition: path and name
+"#,
+        );
+        let created = audit_file(
+            crate::vocab::SensorAction::Create,
+            None,
+            "/etc/systemd/system/evil.service",
+            None,
+        );
+        assert_eq!(engine.check_event(&created).len(), 1);
+
+        let modified = audit_file(
+            crate::vocab::SensorAction::Modify,
+            None,
+            "/etc/systemd/system/evil.service",
+            None,
+        );
+        assert!(engine.check_event(&modified).is_empty());
+
+        // A rename creates its target path.
+        let renamed = audit_file(
+            crate::vocab::SensorAction::Rename,
+            Some("/tmp/evil.service"),
+            "/etc/systemd/system/evil.service",
+            None,
+        );
+        assert_eq!(engine.check_event(&renamed).len(), 1);
+    }
+
+    #[test]
+    fn auditd_rename_carries_the_source_and_target_names() {
+        let engine = engine_with_rule(
+            Platform::Linux,
+            r#"title: Logging Config Change
+logsource:
+  product: linux
+  service: auditd
+detection:
+  selection:
+    type: PATH
+    name: /etc/rsyslog.conf
+  condition: selection
+"#,
+        );
+        let renamed_away = audit_file(
+            crate::vocab::SensorAction::Rename,
+            Some("/etc/rsyslog.conf"),
+            "/tmp/rsyslog.conf.bak",
+            None,
+        );
+        assert_eq!(engine.check_event(&renamed_away).len(), 1);
+    }
+
+    #[test]
+    fn auditd_rule_does_not_see_a_sysmon_view_field() {
+        let engine = engine_with_rule(
+            Platform::Linux,
+            r#"title: Sysmon field in an auditd rule
+logsource:
+  product: linux
+  service: auditd
+detection:
+  selection:
+    Image|endswith: /xclip
+  condition: selection
+"#,
+        );
+        assert!(engine
+            .check_event(&audit_exec(&["xclip"], Some("execve")))
+            .is_empty());
+    }
+
+    #[test]
+    fn auditd_key_is_never_synthesized() {
+        let engine = engine_with_rule(
+            Platform::Linux,
+            r#"title: Audit key
+logsource:
+  product: linux
+  service: auditd
+detection:
+  selection:
+    key: susp_activity
+  condition: selection
+"#,
+        );
+        assert!(engine
+            .check_event(&audit_exec(&["wget"], Some("execve")))
+            .is_empty());
+    }
+
+    #[test]
+    fn auditd_rules_do_not_run_on_sysmon_routed_events_of_other_platforms() {
+        let engine = engine_with_rule(Platform::Windows, AUDITD_XCLIP);
+        assert_eq!(engine.stats().total_rules, 0);
+    }
+
+    #[test]
+    fn linux_sysmon_process_rule_matches_a_process_event() {
+        let engine = engine_with_rule(
+            Platform::Linux,
+            r#"title: Linux Sysmon Process
+logsource:
+  product: linux
+  service: sysmon
+  category: process_creation
+detection:
+  selection:
+    Image|endswith: bash
+  condition: selection
+"#,
+        );
+        let event = process_event(Platform::Linux, "/usr/bin/bash", "/usr/bin/bash -c id");
+
+        assert!(!engine.check_event(&event).is_empty());
+    }
+
+    fn with_container(
+        mut event: NormalizedEvent,
+        container: crate::models::LinuxContainerContext,
+    ) -> NormalizedEvent {
+        if let EventFields::ProcessCreation(fields) = &mut event.fields {
+            *fields.container = container;
+        }
+        event
+    }
+
+    #[test]
+    fn linux_process_rules_select_container_and_host_processes() {
+        const ID: &str = "4f0a3c1b2d5e6f708192a3b4c5d6e7f8091a2b3c4d5e6f708192a3b4c5d6e7f8";
+        let in_container = engine_with_rule(
+            Platform::Linux,
+            r#"title: Shell In Docker Container
+logsource:
+  product: linux
+  category: process_creation
+detection:
+  selection:
+    Image|endswith: /sh
+    ContainerRuntime: docker
+    ContainerId|startswith: 4f0a3c1b2d5e
+  condition: selection
+"#,
+        );
+        let on_host = engine_with_rule(
+            Platform::Linux,
+            r#"title: Shell On Host
+logsource:
+  product: linux
+  category: process_creation
+detection:
+  selection:
+    Image|endswith: /sh
+    CgroupPath|exists: true
+  container:
+    ContainerId|exists: true
+  condition: selection and not container
+"#,
+        );
+
+        let container = with_container(
+            process_event(Platform::Linux, "/bin/sh", "sh -c id"),
+            crate::models::LinuxContainerContext {
+                cgroup_path: Some(format!("/system.slice/docker-{ID}.scope")),
+                container_id: Some(ID.to_string()),
+                container_runtime: Some("docker".to_string()),
+            },
+        );
+        let host = with_container(
+            process_event(Platform::Linux, "/bin/sh", "sh -c id"),
+            crate::models::LinuxContainerContext {
+                cgroup_path: Some("/user.slice/user-1000.slice/session-2.scope".to_string()),
+                ..Default::default()
+            },
+        );
+        // Unresolved context is neither host nor container.
+        let unresolved = process_event(Platform::Linux, "/bin/sh", "sh -c id");
+
+        assert!(!in_container.check_event(&container).is_empty());
+        assert!(in_container.check_event(&host).is_empty());
+        assert!(in_container.check_event(&unresolved).is_empty());
+        assert!(!on_host.check_event(&host).is_empty());
+        assert!(on_host.check_event(&container).is_empty());
+        assert!(on_host.check_event(&unresolved).is_empty());
+    }
+
+    #[test]
+    fn generic_network_rule_matches_a_linux_network_event() {
+        let engine = engine_with_rule(
+            Platform::Linux,
+            r#"title: Generic Network Connection
+logsource:
+  category: network
+  service: connection
+detection:
+  selection:
+    DestinationPort: "443"
+  condition: selection
+"#,
+        );
+
+        let event = NormalizedEvent {
+            timestamp: "2025-01-01T00:00:00Z".to_string(),
+            source_seq: None,
+            ingest_seq: 0,
+            platform: Platform::Linux,
+            provider: "ebpf".to_string(),
+            category: crate::models::EventCategory::Network,
+            event_id: 3,
+            event_id_string: "3".to_string(),
+            opcode: 12,
+            fields: EventFields::NetworkConnection(crate::models::NetworkConnectionFields {
+                destination_ip: Some("198.51.100.10".to_string()),
+                source_ip: Some("10.0.0.5".to_string()),
+                destination_port: Some("443".to_string()),
+                source_port: Some("51234".to_string()),
+                process_id: Some("99".to_string()),
+                image: Some("/usr/bin/curl".to_string()),
+                user: Some("alice".to_string()),
+                destination_hostname: None,
+                protocol: Some("tcp".to_string()),
+                initiated: Some(true),
+            }),
+            process_name: None,
+            provenance: Default::default(),
+            process_context: None,
+        };
+
+        assert!(!engine.check_event(&event).is_empty());
+    }
+
+    #[test]
+    fn file_rename_rule_matches_source_and_target_fields() {
+        let engine = engine_with_rule(
+            Platform::Linux,
+            r#"title: Linux File Rename
+logsource:
+  product: linux
+  category: file_rename
+detection:
+  selection:
+    SourceFilename|endswith: "/old.txt"
+    TargetFilename|endswith: "/new.txt"
+  condition: selection
+"#,
+        );
+
+        let event = NormalizedEvent {
+            timestamp: "2025-01-01T00:00:00Z".to_string(),
+            source_seq: None,
+            ingest_seq: 0,
+            platform: Platform::Linux,
+            provider: "ebpf".to_string(),
+            category: crate::models::EventCategory::File,
+            event_id: 71,
+            event_id_string: "71".to_string(),
+            opcode: 71,
+            fields: EventFields::FileEvent(crate::models::FileEventFields {
+                source_filename: Some("/tmp/old.txt".to_string()),
+                target_filename: Some("/tmp/new.txt".to_string()),
+                process_id: Some("101".to_string()),
+                image: Some("/usr/bin/mv".to_string()),
+                creation_utc_time: None,
+                previous_creation_utc_time: None,
+                user: Some("alice".to_string()),
+                file_identity: None,
+                path_truncated: None,
+            }),
+            process_name: None,
+            provenance: Default::default(),
+            process_context: None,
+        };
+
+        assert!(!engine.check_event(&event).is_empty());
+    }
+
+    #[test]
+    fn generic_dns_rule_matches_via_alias_fields() {
+        let engine = engine_with_rule(
+            Platform::Linux,
+            r#"title: Generic DNS Query
+logsource:
+  category: dns
+detection:
+  selection:
+    query: "example.com"
+    record_type: "A"
+  condition: selection
+"#,
+        );
+
+        let event = NormalizedEvent {
+            timestamp: "2025-01-01T00:00:00Z".to_string(),
+            source_seq: None,
+            ingest_seq: 0,
+            platform: Platform::Linux,
+            provider: "ebpf".to_string(),
+            category: crate::models::EventCategory::Dns,
+            event_id: 22,
+            event_id_string: "22".to_string(),
+            opcode: 0,
+            fields: EventFields::DnsQuery(crate::models::DnsQueryFields {
+                query_truncated: None,
+                user: None,
+                query_name: Some("example.com".to_string()),
+                query_results: Some("1.1.1.1".to_string()),
+                record_type: Some("A".to_string()),
+                query_status: None,
+                process_id: Some("202".to_string()),
+                image: Some("/usr/bin/dig".to_string()),
+            }),
+            process_name: None,
+            provenance: Default::default(),
+            process_context: None,
+        };
+
+        assert!(!engine.check_event(&event).is_empty());
+    }
+
+    const IMAGE_RULE: &str = r#"title: Whoami Image
+id: 44444444-4444-4444-8444-444444444444
+level: medium
+logsource:
+  product: windows
+  category: process_creation
+detection:
+  selection:
+    Image|endswith: \whoami.exe
+  condition: selection
+"#;
+
+    const HASH_RULE: &str = r#"title: Whoami By Hash
+id: 55555555-5555-4555-8555-555555555555
+level: high
+logsource:
+  product: windows
+  category: process_creation
+detection:
+  hash:
+    Hashes|contains: SHA256=ABCDEF
+  image:
+    Image|endswith: \whoami.exe
+  condition: hash or image
+"#;
+
+    fn rule_names(alerts: &[Alert]) -> Vec<String> {
+        alerts.iter().map(|alert| alert.rule_name.clone()).collect()
+    }
+
+    #[test]
+    fn each_pass_evaluates_only_its_own_rules() {
+        let engine = engine_with_rules(Platform::Windows, &[IMAGE_RULE, HASH_RULE]);
+        assert_eq!(engine.stats().deferred_pass_rules, 1);
+        let event = process_event(
+            Platform::Windows,
+            r"C:\Windows\System32\whoami.exe",
+            "whoami",
+        );
+
+        assert_eq!(
+            rule_names(&engine.evaluate_event_pass(&event, DetectionPass::Admission)),
+            vec!["Whoami Image"]
+        );
+        assert_eq!(
+            rule_names(&engine.evaluate_event_pass(&event, DetectionPass::Deferred)),
+            vec!["Whoami By Hash"]
+        );
+        // Replay evaluates both passes, each selecting its own best match, so
+        // it reports what live admission and the deferred pass reported.
+        assert_eq!(
+            rule_names(&engine.evaluate_event_pass(&event, DetectionPass::All)),
+            vec!["Whoami Image", "Whoami By Hash"]
+        );
+    }
+
+    #[test]
+    fn deferred_field_needs_follow_the_event_logsource() {
+        let engine = engine_with_rules(Platform::Windows, &[IMAGE_RULE, HASH_RULE]);
+        let process = process_event(Platform::Windows, r"C:\x.exe", "x");
+        assert_eq!(
+            engine.deferred_field_needs(&process),
+            ArtifactFieldNeeds {
+                sha256: true,
+                ..ArtifactFieldNeeds::default()
+            }
+        );
+
+        let mut network = process;
+        network.category = crate::models::EventCategory::Network;
+        assert!(engine.deferred_field_needs(&network).is_empty());
+        assert!(windows_engine().deferred_field_needs(&network).is_empty());
+    }
+
+    #[test]
+    fn a_correlation_counts_detections_from_both_passes() {
+        let engine = engine_with_rules(
+            Platform::Windows,
+            &[
+                IMAGE_RULE,
+                HASH_RULE,
+                r#"title: Image Then Hash
+id: 66666666-6666-4666-8666-666666666666
+level: critical
+correlation:
+  type: temporal
+  rules:
+    - 44444444-4444-4444-8444-444444444444
+    - 55555555-5555-4555-8555-555555555555
+  group-by:
+    - ProcessId
+  timespan: 1m
+"#,
+            ],
+        );
+        let event = process_event(
+            Platform::Windows,
+            r"C:\Windows\System32\whoami.exe",
+            "whoami",
+        );
+
+        assert!(
+            !rule_names(&engine.evaluate_event_pass(&event, DetectionPass::Admission))
+                .contains(&"Image Then Hash".to_string())
+        );
+        assert!(
+            rule_names(&engine.evaluate_event_pass(&event, DetectionPass::Deferred))
+                .contains(&"Image Then Hash".to_string())
+        );
+    }
+
+    #[test]
+    fn timer_flushes_pending_correlation_without_another_event() {
+        let engine = engine_with_rules(
+            Platform::Windows,
+            &[
+                IMAGE_RULE,
+                r#"title: One Whoami
+id: one-whoami
+correlation:
+  type: event_count
+  rules:
+    - 44444444-4444-4444-8444-444444444444
+  timespan: 1m
+  condition:
+    gte: 1
+"#,
+            ],
+        );
+        let event = process_event(
+            Platform::Windows,
+            r"C:\Windows\System32\whoami.exe",
+            "whoami",
+        );
+        assert_eq!(
+            rule_names(&engine.evaluate_event_pass(&event, DetectionPass::Admission)),
+            vec!["Whoami Image"]
+        );
+        assert!(engine.flush_due(Instant::now()).is_empty());
+        let due = Instant::now() + store::CORRELATION_REORDER_BUDGET;
+        assert_eq!(rule_names(&engine.flush_due(due)), vec!["One Whoami"]);
+        assert!(engine.flush_due(due).is_empty());
+    }
+
+    fn dns_event(name: &str, seq: u64) -> NormalizedEvent {
+        NormalizedEvent {
+            timestamp: format!("2025-01-01T00:00:{seq:02}Z"),
+            source_seq: None,
+            ingest_seq: seq,
+            platform: Platform::Linux,
+            provider: "ebpf".to_string(),
+            category: crate::models::EventCategory::Dns,
+            event_id: 22,
+            event_id_string: "22".to_string(),
+            opcode: 0,
+            fields: EventFields::DnsQuery(crate::models::DnsQueryFields {
+                user: None,
+                query_name: Some(name.to_string()),
+                query_results: None,
+                record_type: Some("TXT".to_string()),
+                query_status: None,
+                query_truncated: None,
+                process_id: Some("202".to_string()),
+                image: Some("/usr/bin/dig".to_string()),
+            }),
+            process_name: None,
+            provenance: Default::default(),
+            process_context: None,
+        }
+    }
+
+    #[test]
+    fn derived_dns_fields_are_absent_for_a_truncated_name() {
+        let mut event = dns_event("a.b.tunnel.co.uk", 1);
+        let EventFields::DnsQuery(fields) = &mut event.fields else {
+            unreachable!()
+        };
+        fields.query_truncated = Some("true".to_string());
+        let adapter = event::RsigmaEvent::new(&event);
+        for name in [
+            "QueryRegisteredDomain",
+            "QueryLabelCount",
+            "QueryLongestLabel",
+            "QueryNameLength",
+        ] {
+            assert!(
+                rsigma_eval::Event::get_field(&adapter, name).is_none(),
+                "{name}"
+            );
+        }
+        assert!(rsigma_eval::Event::get_field(&adapter, "QueryName").is_some());
+    }
+
+    #[test]
+    fn value_count_groups_dns_queries_by_registered_domain() {
+        let engine = engine_with_rules(
+            Platform::Linux,
+            &[
+                r#"title: Any TXT Query
+id: 77777777-7777-4777-8777-777777777777
+logsource:
+  category: dns
+detection:
+  selection:
+    RecordType: TXT
+  condition: selection
+"#,
+                r#"title: Many Subdomains
+id: 88888888-8888-4888-8888-888888888888
+level: high
+correlation:
+  type: value_count
+  rules:
+    - 77777777-7777-4777-8777-777777777777
+  group-by:
+    - QueryRegisteredDomain
+  timespan: 1m
+  condition:
+    field: QueryName
+    gte: 3
+"#,
+            ],
+        );
+        let mut fired = Vec::new();
+        // Three distinct subdomains of one `co.uk` registrant, and three
+        // queries for three different registrants that share the suffix.
+        for (seq, name) in [
+            (1, "a1.tunnel.co.uk"),
+            (2, "a2.tunnel.co.uk"),
+            (3, "a3.tunnel.co.uk."),
+            (4, "x.one.co.uk"),
+            (5, "x.two.co.uk"),
+            (6, "x.three.co.uk"),
+        ] {
+            fired.extend(rule_names(&engine.evaluate_event_pass(
+                &dns_event(name, seq),
+                DetectionPass::Admission,
+            )));
+        }
+        fired.extend(
+            engine
+                .flush_pending_with_origins()
+                .into_iter()
+                .map(|alert| alert.alert.rule_name),
+        );
+        let titles: Vec<_> = fired
+            .into_iter()
+            .filter(|name| name == "Many Subdomains")
+            .collect();
+        assert_eq!(
+            titles.len(),
+            1,
+            "only the shared registrant crosses the threshold"
+        );
+    }
+
+    #[test]
+    fn shutdown_flushes_pending_correlation() {
+        let engine = engine_with_rules(
+            Platform::Windows,
+            &[
+                IMAGE_RULE,
+                r#"title: One Whoami
+id: one-whoami
+correlation:
+  type: event_count
+  rules:
+    - 44444444-4444-4444-8444-444444444444
+  timespan: 1m
+  condition:
+    gte: 1
+"#,
+            ],
+        );
+        let event = process_event(
+            Platform::Windows,
+            r"C:\Windows\System32\whoami.exe",
+            "whoami",
+        );
+        engine.evaluate_event_pass(&event, DetectionPass::Admission);
+        let alerts = engine.flush_pending_with_origins();
+        assert_eq!(alerts.len(), 1);
+        assert_eq!(alerts[0].alert.rule_name, "One Whoami");
+        assert!(engine.flush_pending_with_origins().is_empty());
+    }
+
+    #[test]
+    fn events_skip_the_correlation_buffer_unless_something_can_correlate() {
+        let whoami = process_event(
+            Platform::Windows,
+            r"C:\Windows\System32\whoami.exe",
+            "whoami",
+        );
+        let other = process_event(Platform::Windows, r"C:\Windows\notepad.exe", "notepad");
+
+        // No correlation rules: nothing is buffered, whatever the pass.
+        let plain = engine_with_rule(Platform::Windows, IMAGE_RULE);
+        assert_eq!(
+            plain.evaluate_event_pass(&whoami, DetectionPass::All).len(),
+            1
+        );
+        plain.evaluate_event_pass(&whoami, DetectionPass::Admission);
+        plain.evaluate_event_pass(&whoami, DetectionPass::Deferred);
+        {
+            let state = plain.store.lock();
+            assert!(state.pending.is_empty());
+            assert!(state.early_deferred.is_empty());
+        }
+
+        // With correlation rules, only an event that matched is buffered.
+        let correlating = engine_with_rules(
+            Platform::Windows,
+            &[
+                IMAGE_RULE,
+                r#"title: One Whoami
+id: one-whoami
+correlation:
+  type: event_count
+  rules:
+    - 44444444-4444-4444-8444-444444444444
+  timespan: 1m
+  condition:
+    gte: 1
+"#,
+            ],
+        );
+        correlating.evaluate_event_pass(&other, DetectionPass::All);
+        assert!(correlating.store.lock().pending.is_empty());
+        let alerts = correlating.evaluate_event_pass(&whoami, DetectionPass::All);
+        assert!(alerts.iter().any(|alert| alert.rule_name == "One Whoami"));
+    }
+
+    #[test]
+    fn early_deferred_results_expire_and_are_counted() {
+        let engine = engine_with_rules(
+            Platform::Windows,
+            &[
+                HASH_RULE,
+                r#"title: Hash Count
+id: hash-count
+correlation:
+  type: event_count
+  rules:
+    - 55555555-5555-4555-8555-555555555555
+  timespan: 1m
+  condition:
+    gte: 1
+"#,
+            ],
+        );
+        let event = process_event(
+            Platform::Windows,
+            r"C:\Windows\System32\whoami.exe",
+            "whoami",
+        );
+        engine.evaluate_event_pass(&event, DetectionPass::Deferred);
+        assert_eq!(engine.store.lock().early_deferred.len(), 1);
+        engine.flush_due(Instant::now() + store::CORRELATION_REORDER_BUDGET);
+        assert!(engine.store.lock().early_deferred.is_empty());
+        assert_eq!(engine.stats().early_deferred_evictions, 1);
+    }
+
+    #[test]
+    fn deferred_matches_keep_event_count_windows_in_ingest_order() {
+        let engine = engine_with_rules(
+            Platform::Windows,
+            &[
+                r#"title: Plain
+id: plain
+logsource:
+  product: windows
+  category: process_creation
+detection:
+  selection:
+    Image: later.exe
+  condition: selection
+"#,
+                r#"title: Hashed
+id: hashed
+logsource:
+  product: windows
+  category: process_creation
+detection:
+  selection:
+    Hashes|contains: MD5=AA
+  condition: selection
+"#,
+                r#"title: Three hits
+id: three
+correlation:
+  type: event_count
+  rules:
+    - plain
+    - hashed
+  timespan: 1s
+  condition:
+    gte: 3
+"#,
+            ],
+        );
+        let mut early = process_event(Platform::Windows, "early.exe", "early");
+        early.timestamp = "2025-01-01T00:00:00Z".into();
+        early.ingest_seq = 1;
+        if let EventFields::ProcessCreation(fields) = &mut early.fields {
+            fields.hashes = Some("MD5=AA".into());
+        }
+        let mut middle = process_event(Platform::Windows, "later.exe", "middle");
+        middle.timestamp = "2025-01-01T00:00:01Z".into();
+        middle.ingest_seq = 2;
+        let mut latest = process_event(Platform::Windows, "later.exe", "latest");
+        latest.timestamp = "2025-01-01T00:00:02Z".into();
+        latest.ingest_seq = 3;
+
+        let mut alerts = Vec::new();
+        alerts.extend(engine.evaluate_event_pass(&early, DetectionPass::Admission));
+        alerts.extend(engine.evaluate_event_pass(&middle, DetectionPass::Admission));
+        alerts.extend(engine.evaluate_event_pass(&early, DetectionPass::Deferred));
+        alerts.extend(engine.evaluate_event_pass(&latest, DetectionPass::Admission));
+        alerts.extend(engine.evaluate_event_pass(&middle, DetectionPass::Deferred));
+        alerts.extend(engine.evaluate_event_pass(&latest, DetectionPass::Deferred));
+
+        assert!(
+            !rule_names(&alerts).contains(&"Three hits".to_string()),
+            "the timestamp-zero deferred hit is outside the final one-second window"
+        );
+    }
+
+    #[test]
+    fn mixed_admission_and_deferred_temporal_matches_flush_in_event_order() {
+        let engine = engine_with_rules(
+            Platform::Windows,
+            &[
+                r#"title: Image
+id: image
+logsource:
+  product: windows
+  category: process_creation
+detection:
+  selection:
+    Image|endswith: \whoami.exe
+  condition: selection
+"#,
+                r#"title: Hash
+id: hash
+logsource:
+  product: windows
+  category: process_creation
+detection:
+  selection:
+    Hashes|contains: SHA256=ABCDEF
+  condition: selection
+"#,
+                r#"title: Image Then Hash
+id: image-then-hash
+correlation:
+  type: temporal_ordered
+  rules:
+    - image
+    - hash
+  timespan: 1m
+"#,
+            ],
+        );
+        let mut image = process_event(
+            Platform::Windows,
+            r"C:\Windows\System32\whoami.exe",
+            "whoami",
+        );
+        image.ingest_seq = 1;
+        let mut hashed = process_event(Platform::Windows, r"C:\other.exe", "other");
+        hashed.timestamp = "2025-01-01T00:00:01Z".into();
+        hashed.ingest_seq = 2;
+        if let EventFields::ProcessCreation(fields) = &mut hashed.fields {
+            fields.hashes = Some(
+                "SHA256=ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789".into(),
+            );
+        }
+
+        let mut alerts = engine.evaluate_event_pass(&image, DetectionPass::Admission);
+        alerts.extend(engine.evaluate_event_pass(&hashed, DetectionPass::Admission));
+        alerts.extend(engine.evaluate_event_pass(&image, DetectionPass::Deferred));
+        alerts.extend(engine.evaluate_event_pass(&hashed, DetectionPass::Deferred));
+
+        assert_eq!(
+            rule_names(&alerts)
+                .into_iter()
+                .filter(|name| name == "Image Then Hash")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn product_mismatched_rules_are_skipped_at_load_time() {
+        let engine = engine_with_rule(
+            Platform::Windows,
+            r#"title: Linux Only
+logsource:
+  product: linux
+  category: process_creation
+detection:
+  selection:
+    Image|endswith: bash
+  condition: selection
+"#,
+        );
+
+        let stats = engine.stats();
+        assert_eq!(stats.total_rules, 0);
+        assert_eq!(stats.skipped_product_rules, 1);
+    }
+
+    fn process_event(platform: Platform, image: &str, command_line: &str) -> NormalizedEvent {
+        NormalizedEvent {
+            timestamp: "2025-01-01T00:00:00Z".to_string(),
+            source_seq: None,
+            ingest_seq: 0,
+            platform,
+            provider: "test".to_string(),
+            category: crate::models::EventCategory::Process,
+            event_id: 1,
+            event_id_string: "1".to_string(),
+            opcode: 1,
+            fields: EventFields::ProcessCreation(ProcessCreationFields {
+                hashes: None,
+                imphash: None,
+                container: Default::default(),
+                linux_identity: Default::default(),
+                cgroup_id: None,
+                exec: Default::default(),
+                parent_process_id_derived: false,
+                windows: Default::default(),
+                image: Some(image.to_string()),
+                image_source: None,
+                image_truncated: None,
+                command_line: Some(command_line.to_string()),
+                process_id: Some("1234".to_string()),
+                process_start_time: None,
+                original_file_name: None,
+                product: None,
+                description: None,
+                company: None,
+                file_version: None,
+                target_image: None,
+                parent_process_id: None,
+                parent_image: None,
+                parent_command_line: None,
+                parent_user: None,
+                current_directory: None,
+                integrity_level: None,
+                logon_id: None,
+                user: Some("TestUser".to_string()),
+            }),
+            process_name: None,
+            provenance: Default::default(),
+            process_context: None,
+        }
+    }
+}

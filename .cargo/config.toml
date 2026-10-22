@@ -1,0 +1,12 @@
+[env]
+# YARA-X only needs to regenerate this source when developing its built-in modules.
+# Keeping it disabled avoids read-only filesystem failures during normal project builds.
+YRX_REGENERATE_MODULES_RS = "false"
+
+[target.x86_64-pc-windows-msvc]
+# Increase stack size for large YARA rulesets.
+# Windows default is 1MB; we raise it to 16MB for large rule compilations.
+rustflags = ["-C", "link-args=/STACK:16777216"]
+
+[target.x86_64-pc-windows-gnu]
+rustflags = ["-C", "link-args=-Wl,--stack,16777216"]

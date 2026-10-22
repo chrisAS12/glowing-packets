@@ -1,0 +1,414 @@
+//! Throughput benchmark for `Engine::evaluate_event`.
+//!
+//! ```sh
+//! cargo bench --bench sigma_engine
+//! ```
+
+use std::collections::HashMap;
+use std::hint::black_box;
+
+use criterion::{criterion_group, criterion_main, Criterion};
+use rustinel::engine::{Engine, SigmaMatchMode};
+use rustinel::models::{EventCategory, EventFields, MatchDebugLevel, NormalizedEvent};
+use rustinel::sensor::Platform;
+use tempfile::TempDir;
+
+fn engine(mode: SigmaMatchMode) -> Engine {
+    Engine::new_for_platform_with_match_debug(Platform::Linux, MatchDebugLevel::Off)
+        .with_sigma_match_mode(mode)
+}
+
+fn write_overlapping_rules(dir: &std::path::Path, count: usize) {
+    let documents = (0..count)
+        .map(|index| {
+            format!(
+                "title: Overlapping Process {index}\n\
+                 id: 00000000-0000-0000-0000-{index:012}\n\
+                 logsource:\n  product: linux\n  category: process_creation\n\
+                 detection:\n  selection:\n    Image|endswith: /curl\n\
+                 \x20 condition: selection\nlevel: high\n"
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("---\n");
+    std::fs::write(dir.join("overlapping.yml"), documents).expect("write overlapping rules");
+}
+
+/// A representative Linux ruleset covering the common logsource families and
+/// the modifiers Rustinel rules lean on (`endswith`, `contains`, `cidr`).
+fn write_rules(dir: &std::path::Path) {
+    let rules = [
+        (
+            "process.yml",
+            r#"title: Bench Process Curl
+logsource:
+  product: linux
+  category: process_creation
+detection:
+  selection:
+    Image|endswith: /curl
+    CommandLine|contains: example.test
+  condition: selection
+level: high
+"#,
+        ),
+        (
+            "network.yml",
+            r#"title: Bench Network CIDR
+logsource:
+  product: linux
+  category: network_connection
+detection:
+  selection:
+    DestinationIp|cidr: 198.51.100.0/24
+  condition: selection
+level: medium
+"#,
+        ),
+        (
+            "file.yml",
+            r#"title: Bench File Script
+logsource:
+  product: linux
+  category: file_event
+detection:
+  selection:
+    TargetFilename|endswith: .sh
+  condition: selection
+level: low
+"#,
+        ),
+        (
+            "dns.yml",
+            r#"title: Bench DNS Domain
+logsource:
+  product: linux
+  category: dns_query
+detection:
+  selection:
+    QueryName|contains: example.test
+  condition: selection
+level: medium
+"#,
+        ),
+    ];
+    for (name, yaml) in rules {
+        std::fs::write(dir.join(name), yaml).expect("write bench rule");
+    }
+}
+
+/// Number of synthetic, non-matching rules written per logsource family for the
+/// large-ruleset benchmark. With four families this yields ~4x this many rules,
+/// so each candidate bucket holds a few hundred rules, the regime where an
+/// inverted rule index matters.
+const SYNTHETIC_RULES_PER_FAMILY: usize = 500;
+
+/// Writes the matching ruleset plus a large set of synthetic rules that never
+/// match the sample events, so `evaluate_event` pays the cost of scanning a
+/// realistically sized bucket before its one hit (or miss).
+fn write_scaled_rules(dir: &std::path::Path, per_family: usize) {
+    write_rules(dir);
+    for i in 0..per_family {
+        std::fs::write(
+            dir.join(format!("synth_process_{i}.yml")),
+            format!(
+                "title: Synth Process {i}\n\
+                 logsource:\n  product: linux\n  category: process_creation\n\
+                 detection:\n  selection:\n    Image|endswith: /synthbin{i}\n\
+                 \x20   CommandLine|contains: synthtoken{i}\n  condition: selection\nlevel: low\n"
+            ),
+        )
+        .expect("write synthetic process rule");
+        std::fs::write(
+            dir.join(format!("synth_network_{i}.yml")),
+            format!(
+                "title: Synth Network {i}\n\
+                 logsource:\n  product: linux\n  category: network_connection\n\
+                 detection:\n  selection:\n    DestinationIp|cidr: 203.0.113.{octet}/32\n\
+                 \x20 condition: selection\nlevel: low\n",
+                octet = i % 256
+            ),
+        )
+        .expect("write synthetic network rule");
+        std::fs::write(
+            dir.join(format!("synth_file_{i}.yml")),
+            format!(
+                "title: Synth File {i}\n\
+                 logsource:\n  product: linux\n  category: file_event\n\
+                 detection:\n  selection:\n    TargetFilename|endswith: .synth{i}\n\
+                 \x20 condition: selection\nlevel: low\n"
+            ),
+        )
+        .expect("write synthetic file rule");
+        std::fs::write(
+            dir.join(format!("synth_dns_{i}.yml")),
+            format!(
+                "title: Synth Dns {i}\n\
+                 logsource:\n  product: linux\n  category: dns_query\n\
+                 detection:\n  selection:\n    QueryName|contains: synth{i}.invalid\n\
+                 \x20 condition: selection\nlevel: low\n"
+            ),
+        )
+        .expect("write synthetic dns rule");
+    }
+}
+
+fn event(category: EventCategory, event_id: u16, fields: &[(&str, &str)]) -> NormalizedEvent {
+    let mut map = HashMap::new();
+    for (key, value) in fields {
+        map.insert((*key).to_string(), (*value).to_string());
+    }
+    NormalizedEvent {
+        timestamp: "2026-01-01T00:00:00Z".to_string(),
+        source_seq: None,
+        ingest_seq: 0,
+        platform: Platform::Linux,
+        provider: "bench".to_string(),
+        category,
+        event_id,
+        event_id_string: event_id.to_string(),
+        opcode: 0,
+        fields: EventFields::Generic(map),
+        process_name: None,
+        provenance: Default::default(),
+        process_context: None,
+    }
+}
+
+fn sample_events() -> Vec<NormalizedEvent> {
+    vec![
+        event(
+            EventCategory::Process,
+            1,
+            &[
+                ("Image", "/usr/bin/curl"),
+                ("CommandLine", "/usr/bin/curl https://example.test"),
+                ("User", "alice"),
+            ],
+        ),
+        event(
+            EventCategory::Network,
+            3,
+            &[
+                ("DestinationIp", "198.51.100.10"),
+                ("DestinationPort", "443"),
+                ("SourceIp", "10.0.0.5"),
+            ],
+        ),
+        event(
+            EventCategory::File,
+            11,
+            &[
+                ("TargetFilename", "/tmp/payload.sh"),
+                ("Image", "/usr/bin/bash"),
+            ],
+        ),
+        event(
+            EventCategory::Dns,
+            22,
+            &[
+                ("QueryName", "example.test"),
+                ("QueryResults", "198.51.100.10"),
+            ],
+        ),
+        // A process event that matches nothing, exercising the miss path.
+        event(
+            EventCategory::Process,
+            1,
+            &[("Image", "/usr/bin/ls"), ("CommandLine", "ls -la")],
+        ),
+    ]
+}
+
+fn bench_evaluate_event(c: &mut Criterion) {
+    let tempdir = TempDir::new().expect("bench tempdir");
+    write_rules(tempdir.path());
+    let mut engine = engine(SigmaMatchMode::Best);
+    engine
+        .load_rules(tempdir.path())
+        .expect("bench rules should load");
+    let events = sample_events();
+
+    c.bench_function("evaluate_event/mixed", |b| {
+        b.iter(|| {
+            for ev in &events {
+                black_box(engine.evaluate_event(black_box(ev)));
+            }
+        });
+    });
+}
+
+fn bench_evaluate_event_large(c: &mut Criterion) {
+    let tempdir = TempDir::new().expect("bench tempdir");
+    write_scaled_rules(tempdir.path(), SYNTHETIC_RULES_PER_FAMILY);
+    let mut engine = engine(SigmaMatchMode::Best);
+    engine
+        .load_rules(tempdir.path())
+        .expect("bench rules should load");
+    let events = sample_events();
+
+    c.bench_function("evaluate_event/large", |b| {
+        b.iter(|| {
+            for ev in &events {
+                black_box(engine.evaluate_event(black_box(ev)));
+            }
+        });
+    });
+}
+
+/// Logsources and fields of a SigmaHQ-sized Windows ruleset. Spreading rules
+/// over this many fields is what makes the candidate index probe the event
+/// once per indexed field.
+const WINDOWS_RULE_FIELDS: &[(&str, &[&str])] = &[
+    (
+        "category: process_creation",
+        &[
+            "Image",
+            "CommandLine",
+            "ParentImage",
+            "ParentCommandLine",
+            "OriginalFileName",
+            "User",
+            "IntegrityLevel",
+            "CurrentDirectory",
+            "Product",
+            "Company",
+            "Description",
+            "Hashes",
+        ],
+    ),
+    ("category: file_event", &["TargetFilename", "Image"]),
+    (
+        "category: registry_set",
+        &["TargetObject", "Details", "Image"],
+    ),
+    (
+        "category: image_load",
+        &["ImageLoaded", "Image", "OriginalFileName", "Hashes"],
+    ),
+    (
+        "category: network_connection",
+        &[
+            "DestinationIp",
+            "DestinationPort",
+            "DestinationHostname",
+            "SourcePort",
+            "Image",
+        ],
+    ),
+    ("category: dns_query", &["QueryName", "Image"]),
+    ("category: ps_module", &["ContextInfo", "Payload"]),
+    ("category: wmi_event", &["Destination", "Query", "Consumer"]),
+    (
+        "service: security",
+        &[
+            "TargetUserName",
+            "SubjectUserName",
+            "LogonType",
+            "ProcessName",
+            "IpAddress",
+            "TargetDomainName",
+        ],
+    ),
+];
+
+/// Non-matching Windows rules spread over [`WINDOWS_RULE_FIELDS`], with one
+/// keyword rule per hundred, about SigmaHQ's share.
+fn write_windows_field_rules(dir: &std::path::Path, count: usize) {
+    let pairs: Vec<(&str, &str)> = WINDOWS_RULE_FIELDS
+        .iter()
+        .flat_map(|(logsource, fields)| fields.iter().map(move |field| (*logsource, *field)))
+        .collect();
+    let documents = (0..count)
+        .map(|index| {
+            let (logsource, field) = pairs[index % pairs.len()];
+            if index % 100 == 99 {
+                return format!(
+                    "title: Windows Keyword {index}\n\
+                     logsource:\n  product: windows\n  {logsource}\n\
+                     detection:\n  keywords:\n    - synthkeyword{index}\n\
+                     \x20 condition: keywords\nlevel: low\n"
+                );
+            }
+            format!(
+                "title: Windows Field {index}\n\
+                 logsource:\n  product: windows\n  {logsource}\n\
+                 detection:\n  selection:\n    {field}|contains: synthtoken{index}\n\
+                 \x20 condition: selection\nlevel: low\n"
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("---\n");
+    std::fs::write(dir.join("windows_fields.yml"), documents).expect("write windows rules");
+}
+
+/// One recorded event of every shape in a real Windows capture, as the typed
+/// field views see them. Synthetic `Generic` events skip that path.
+fn recorded_windows_events() -> Vec<NormalizedEvent> {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/field_views/windows.ndjson");
+    std::fs::read_to_string(path)
+        .expect("read recorded Windows shapes")
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("recorded event parses"))
+        .collect()
+}
+
+fn bench_recorded_windows_shapes(c: &mut Criterion) {
+    let events = recorded_windows_events();
+    // A rule pack's size and a SigmaHQ-sized corpus.
+    for rules in [20, 2_000] {
+        let tempdir = TempDir::new().expect("bench tempdir");
+        write_windows_field_rules(tempdir.path(), rules);
+        let mut engine =
+            Engine::new_for_platform_with_match_debug(Platform::Windows, MatchDebugLevel::Off);
+        engine
+            .load_rules(tempdir.path())
+            .expect("windows bench rules should load");
+
+        c.bench_function(
+            &format!("evaluate_event/windows_recorded_shapes/{rules}"),
+            |b| {
+                b.iter(|| {
+                    for ev in &events {
+                        black_box(engine.evaluate_event(black_box(ev)));
+                    }
+                });
+            },
+        );
+    }
+}
+
+fn bench_overlapping_matches(c: &mut Criterion) {
+    const OVERLAPPING_RULES: usize = 250;
+
+    let tempdir = TempDir::new().expect("bench tempdir");
+    write_overlapping_rules(tempdir.path(), OVERLAPPING_RULES);
+    let event = sample_events()
+        .into_iter()
+        .next()
+        .expect("sample process event");
+
+    for mode in [SigmaMatchMode::Best, SigmaMatchMode::All] {
+        let mut engine = engine(mode);
+        engine
+            .load_rules(tempdir.path())
+            .expect("overlapping bench rules should load");
+        let name = match mode {
+            SigmaMatchMode::Best => "evaluate_event/overlapping_best",
+            SigmaMatchMode::All => "evaluate_event/overlapping_all",
+        };
+        c.bench_function(name, |b| {
+            b.iter(|| black_box(engine.evaluate_event(black_box(&event))));
+        });
+    }
+}
+
+criterion_group!(
+    benches,
+    bench_evaluate_event,
+    bench_evaluate_event_large,
+    bench_recorded_windows_shapes,
+    bench_overlapping_matches
+);
+criterion_main!(benches);

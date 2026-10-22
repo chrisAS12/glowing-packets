@@ -1,0 +1,1731 @@
+//! macOS network and DNS sensor backed by `/dev/bpf` packet capture.
+//!
+//! Endpoint Security does not surface network connections or DNS, so the macOS
+//! sensor pairs ESF with a BPF capture device. [`BpfSensor`] opens a `/dev/bpf`
+//! device for each active interface and reads link-layer frames on dedicated
+//! capture threads. Captured frames are parsed into [`RawEvent`] values
+//! (network connections and DNS queries) for the shared pipeline.
+//!
+//! Requirements: root (or access to the bpf device nodes). PID attribution for
+//! captured flows is best-effort via libproc; see the socket helper.
+
+use std::collections::{BTreeMap, BTreeSet};
+use std::ffi::{CStr, CString};
+use std::io;
+use std::os::unix::io::RawFd;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{Receiver, SyncSender, TrySendError};
+use std::sync::{Arc, Mutex};
+use std::thread::JoinHandle;
+use std::time::{Duration, Instant, SystemTime};
+
+use anyhow::{anyhow, Result};
+use tokio::sync::mpsc::Sender;
+use tracing::{error, info, warn};
+
+use super::packet::{self, ParsedPacket, Transport, DLT_EN10MB, TCP_FLAG_ACK, TCP_FLAG_SYN};
+use super::socket;
+use crate::models::{DnsQueryFields, NetworkConnectionFields};
+use crate::sensor::{Platform, RawEvent, RawPayload, Sensor, SensorAction, SensorNormalization};
+
+/// Sysmon-compatible event ID emitted for network-connect events.
+const EVENT_ID_NETWORK_CONNECT: u16 = 3;
+/// Sysmon-compatible event ID emitted for DNS-query events.
+const EVENT_ID_DNS_QUERY: u16 = 22;
+/// Destination port that identifies DNS query traffic.
+const DNS_PORT: u16 = 53;
+
+/// Optional comma-separated capture interface override. Defaults to every
+/// interface marked UP and RUNNING at startup.
+const INTERFACE_ENV: &str = "RUSTINEL_BPF_INTERFACE";
+
+/// Requested BPF read-buffer size, set via `BIOCSBLEN` before binding. The
+/// kernel may cap this; the effective size is read back and used for reads.
+const BPF_BUFFER_LEN: u32 = 1 << 18; // 256 KiB
+
+/// Read timeout so the capture loop wakes periodically to observe shutdown.
+const READ_TIMEOUT: Duration = Duration::from_millis(200);
+
+/// How often the supervisor re-enumerates active interfaces and reconciles
+/// capture workers. A new interface starts capturing within this interval.
+const RECONCILE_INTERVAL: Duration = Duration::from_secs(5);
+/// Supervisor wake-up granularity, so shutdown is observed promptly.
+const SUPERVISOR_TICK: Duration = Duration::from_millis(200);
+/// First delay before restarting a failed worker; doubles per failure.
+const RESTART_BACKOFF_INITIAL: Duration = Duration::from_secs(1);
+/// Upper bound on the restart delay.
+const RESTART_BACKOFF_MAX: Duration = Duration::from_secs(60);
+/// Consecutive failures after which an interface is reported as persistently
+/// failing (in the log and in the interface `error` telemetry).
+const PERSISTENT_FAILURE_THRESHOLD: u32 = 5;
+/// A worker that ran this long is considered healthy and resets its backoff.
+const STABLE_UPTIME: Duration = Duration::from_secs(60);
+
+/// Bound on connection-attribution jobs queued for the worker thread. When the
+/// worker falls behind (a burst of new connections), the capture thread emits
+/// the event unattributed rather than blocking the read loop.
+const ATTRIBUTION_QUEUE_CAP: usize = 1024;
+
+// BPF ioctl request codes for 64-bit macOS, from <net/bpf.h>. Encoded with the
+// _IOW/_IOR/_IOWR macros; verified against the SDK headers.
+const BIOCSBLEN: libc::c_ulong = 0xc004_4266; // _IOWR('B', 102, u_int)
+const BIOCSETF: libc::c_ulong = 0x8010_4267; // _IOW('B', 103, struct bpf_program)
+const BIOCGDLT: libc::c_ulong = 0x4004_426a; // _IOR('B', 106, u_int)
+const BIOCSETIF: libc::c_ulong = 0x8020_426c; // _IOW('B', 108, struct ifreq)
+const BIOCSRTIMEOUT: libc::c_ulong = 0x8010_426d; // _IOW('B', 109, struct timeval)
+const BIOCGSTATS: libc::c_ulong = 0x4008_426f; // _IOR('B', 111, struct bpf_stat)
+const BIOCIMMEDIATE: libc::c_ulong = 0x8004_4270; // _IOW('B', 112, u_int)
+
+// struct bpf_hdr field offsets on 64-bit macOS (sizeof == 20; bh_tstamp is a
+// 32-bit timeval, so caplen/hdrlen sit earlier than a 64-bit timeval suggests).
+// The packet payload starts bh_hdrlen bytes into each record.
+const BH_CAPLEN_OFFSET: usize = 8;
+const BH_HDRLEN_OFFSET: usize = 16;
+/// Smallest prefix needed to read bh_caplen and bh_hdrlen from a record.
+const BPF_HDR_FIELDS_LEN: usize = 18;
+
+#[repr(C)]
+struct IfReq {
+    ifr_name: [libc::c_char; 16],
+    ifr_ifru: [u8; 16],
+}
+
+/// A classic-BPF instruction (`struct bpf_insn`): opcode, two jump offsets, and
+/// a generic operand. Eight bytes, matching the kernel layout.
+#[repr(C)]
+struct BpfInsn {
+    code: u16,
+    jt: u8,
+    jf: u8,
+    k: u32,
+}
+
+/// A classic-BPF filter program (`struct bpf_program`) passed to `BIOCSETF`.
+#[repr(C)]
+struct BpfProgram {
+    bf_len: u32,
+    bf_insns: *const BpfInsn,
+}
+
+/// Coarse in-kernel pre-filter for Ethernet links: accept TCP connection
+/// initiations (SYN set, ACK clear) over IPv4 and IPv6, plus any port-53
+/// traffic, and drop the rest so the kernel never copies the ~99% of frames
+/// userspace would discard. This is the macOS analogue of attaching the Linux
+/// probe to `sys_enter_connect` rather than tapping every packet; [`packet`]
+/// stays the precise tier, so over-matching here is harmless. It must not
+/// *under*-match relative to the parser, which is why the IPv6 SYN term is
+/// spelled out explicitly rather than relying on `tcp[tcpflags]`.
+///
+/// Generated with libpcap against a dead `DLT_EN10MB` handle, equivalent to:
+///   `(tcp[tcpflags] & (tcp-syn|tcp-ack) = tcp-syn)`
+///   `  or (ip6 and ip6[6] = 6 and (ip6[53] & 0x12) = 2)`
+///   `  or port 53`
+/// The `tcp[tcpflags]` primitive only compiles to IPv4 code, so the IPv6 SYN
+/// term is written by hand: `ip6[6]` is the next header and `ip6[53]` the TCP
+/// flags byte (the IPv6 header is a fixed 40 bytes plus the TCP flags at offset
+/// 13). It assumes no IPv6 extension headers, matching `parse_ipv6`'s own
+/// first-next-header-only behavior, so the two tiers stay consistent.
+/// Regenerate if the expression changes; the offsets are Ethernet-specific, so
+/// it is only installed when `BIOCGDLT` reports `DLT_EN10MB`.
+#[rustfmt::skip]
+const BPF_FILTER_EN10MB: [BpfInsn; 37] = [
+    BpfInsn { code: 0x0028, jt: 0,  jf: 0,  k: 0x0000000c },
+    BpfInsn { code: 0x0015, jt: 0,  jf: 19, k: 0x00000800 },
+    BpfInsn { code: 0x0030, jt: 0,  jf: 0,  k: 0x00000017 },
+    BpfInsn { code: 0x0015, jt: 0,  jf: 8,  k: 0x00000006 },
+    BpfInsn { code: 0x0028, jt: 0,  jf: 0,  k: 0x00000014 },
+    BpfInsn { code: 0x0045, jt: 30, jf: 0,  k: 0x00001fff },
+    BpfInsn { code: 0x00b1, jt: 0,  jf: 0,  k: 0x0000000e },
+    BpfInsn { code: 0x0050, jt: 0,  jf: 0,  k: 0x0000001b },
+    BpfInsn { code: 0x0054, jt: 0,  jf: 0,  k: 0x00000012 },
+    BpfInsn { code: 0x0015, jt: 25, jf: 0,  k: 0x00000002 },
+    BpfInsn { code: 0x0048, jt: 0,  jf: 0,  k: 0x0000000e },
+    BpfInsn { code: 0x0015, jt: 23, jf: 7,  k: 0x00000035 },
+    BpfInsn { code: 0x0015, jt: 1,  jf: 0,  k: 0x00000084 },
+    BpfInsn { code: 0x0015, jt: 0,  jf: 22, k: 0x00000011 },
+    BpfInsn { code: 0x0028, jt: 0,  jf: 0,  k: 0x00000014 },
+    BpfInsn { code: 0x0045, jt: 20, jf: 0,  k: 0x00001fff },
+    BpfInsn { code: 0x00b1, jt: 0,  jf: 0,  k: 0x0000000e },
+    BpfInsn { code: 0x0048, jt: 0,  jf: 0,  k: 0x0000000e },
+    BpfInsn { code: 0x0015, jt: 16, jf: 0,  k: 0x00000035 },
+    BpfInsn { code: 0x0048, jt: 0,  jf: 0,  k: 0x00000010 },
+    BpfInsn { code: 0x0015, jt: 14, jf: 15, k: 0x00000035 },
+    BpfInsn { code: 0x0015, jt: 0,  jf: 14, k: 0x000086dd },
+    BpfInsn { code: 0x0030, jt: 0,  jf: 0,  k: 0x00000014 },
+    BpfInsn { code: 0x0015, jt: 0,  jf: 3,  k: 0x00000006 },
+    BpfInsn { code: 0x0030, jt: 0,  jf: 0,  k: 0x00000043 },
+    BpfInsn { code: 0x0054, jt: 0,  jf: 0,  k: 0x00000012 },
+    BpfInsn { code: 0x0015, jt: 8,  jf: 0,  k: 0x00000002 },
+    BpfInsn { code: 0x0030, jt: 0,  jf: 0,  k: 0x00000014 },
+    BpfInsn { code: 0x0015, jt: 2,  jf: 0,  k: 0x00000084 },
+    BpfInsn { code: 0x0015, jt: 1,  jf: 0,  k: 0x00000006 },
+    BpfInsn { code: 0x0015, jt: 0,  jf: 5,  k: 0x00000011 },
+    BpfInsn { code: 0x0028, jt: 0,  jf: 0,  k: 0x00000036 },
+    BpfInsn { code: 0x0015, jt: 2,  jf: 0,  k: 0x00000035 },
+    BpfInsn { code: 0x0028, jt: 0,  jf: 0,  k: 0x00000038 },
+    BpfInsn { code: 0x0015, jt: 0,  jf: 1,  k: 0x00000035 },
+    BpfInsn { code: 0x0006, jt: 0,  jf: 0,  k: 0x00040000 },
+    BpfInsn { code: 0x0006, jt: 0,  jf: 0,  k: 0x00000000 },
+];
+
+/// macOS `/dev/bpf` network/DNS sensor. Implements [`Sensor`].
+pub struct BpfSensor {
+    shutdown: Arc<AtomicBool>,
+    threads: Mutex<Vec<JoinHandle<()>>>,
+    collectors: crate::telemetry::MacosCollectors,
+}
+
+impl BpfSensor {
+    /// Report collector health to `host`, so the runtime's telemetry sees it.
+    pub fn with_host_state(host: &crate::state::HostState) -> Self {
+        Self {
+            collectors: Arc::clone(&host.macos_collectors),
+            ..Self::new()
+        }
+    }
+
+    pub fn new() -> Self {
+        Self {
+            shutdown: Arc::new(AtomicBool::new(false)),
+            threads: Mutex::new(Vec::new()),
+            collectors: Default::default(),
+        }
+    }
+}
+
+impl Default for BpfSensor {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Sensor for BpfSensor {
+    /// Each interface has its own device and capture thread. A failed open
+    /// does not prevent the remaining interfaces from starting. After the
+    /// initial start a supervisor thread reconciles the active interface set
+    /// every [`RECONCILE_INTERVAL`]: it starts capture on new interfaces,
+    /// restarts failed workers with bounded backoff, and stops workers whose
+    /// interface went away.
+    fn start(&self, tx: Sender<RawEvent>) -> Result<()> {
+        let interfaces = capture_interfaces()?;
+        let mut threads = self.threads.lock().expect("bpf thread mutex poisoned");
+        let (attribution_tx, attribution_rx) = std::sync::mpsc::sync_channel(ATTRIBUTION_QUEUE_CAP);
+        let worker_tx = tx.clone();
+        let attribution_worker = std::thread::Builder::new()
+            .name("rustinel-bpf-attr".to_string())
+            .spawn(move || run_attribution_worker(attribution_rx, worker_tx))
+            .map_err(|e| warn!("failed to spawn bpf attribution worker: {e}"))
+            .ok();
+
+        let mut supervisor = Supervisor::new(tx, attribution_tx, Arc::clone(&self.collectors));
+        supervisor.reconcile(&interfaces, Instant::now());
+        let started = supervisor.has_workers();
+        let mut result = if started {
+            Ok(())
+        } else {
+            Err(anyhow!("no capture interfaces available"))
+        };
+        if started {
+            let shutdown = Arc::clone(&self.shutdown);
+            match std::thread::Builder::new()
+                .name("rustinel-bpf-supervisor".to_string())
+                .spawn(move || supervisor.run(shutdown))
+            {
+                Ok(handle) => threads.push(handle),
+                Err(e) => result = Err(anyhow!("failed to spawn bpf supervisor thread: {e}")),
+            }
+        } else {
+            drop(supervisor);
+        }
+        if let Some(worker) = attribution_worker {
+            // Join the supervisor (and so every capture thread) first, then the
+            // shared worker once every sender has closed.
+            threads.push(worker);
+        }
+        result
+    }
+
+    fn shutdown(&self) {
+        self.shutdown.store(true, Ordering::SeqCst);
+        for handle in self
+            .threads
+            .lock()
+            .expect("bpf thread mutex poisoned")
+            .drain(..)
+        {
+            let _ = handle.join();
+        }
+    }
+}
+
+/// A running per-interface capture thread.
+struct Worker {
+    stop: Arc<AtomicBool>,
+    handle: JoinHandle<()>,
+    started: Instant,
+}
+
+/// Restart bookkeeping for an interface that has failed.
+struct Retry {
+    failures: u32,
+    next_attempt: Instant,
+}
+
+/// Owns every capture worker and reconciles them against the interface set.
+struct Supervisor {
+    tx: Sender<RawEvent>,
+    attribution_tx: SyncSender<AttributionJob>,
+    workers: BTreeMap<String, Worker>,
+    retries: BTreeMap<String, Retry>,
+    collectors: crate::telemetry::MacosCollectors,
+}
+
+impl Supervisor {
+    fn new(
+        tx: Sender<RawEvent>,
+        attribution_tx: SyncSender<AttributionJob>,
+        collectors: crate::telemetry::MacosCollectors,
+    ) -> Self {
+        Self {
+            collectors,
+            tx,
+            attribution_tx,
+            workers: BTreeMap::new(),
+            retries: BTreeMap::new(),
+        }
+    }
+
+    fn has_workers(&self) -> bool {
+        !self.workers.is_empty()
+    }
+
+    fn run(mut self, shutdown: Arc<AtomicBool>) {
+        let mut last = Instant::now();
+        while !shutdown.load(Ordering::Relaxed) {
+            std::thread::sleep(SUPERVISOR_TICK);
+            if last.elapsed() < RECONCILE_INTERVAL {
+                continue;
+            }
+            last = Instant::now();
+            match capture_interfaces() {
+                Ok(desired) => self.reconcile(&desired, Instant::now()),
+                // Keep the current workers: a transient getifaddrs failure
+                // must not tear down healthy capture.
+                Err(error) => warn!(%error, "bpf interface enumeration failed"),
+            }
+        }
+        self.stop_all();
+    }
+
+    /// One reconcile pass: reap dead workers, stop workers for interfaces that
+    /// are gone, and start (or retry) capture on the rest.
+    fn reconcile(&mut self, desired: &BTreeSet<String>, now: Instant) {
+        self.reap(now);
+        let running: BTreeSet<String> = self.workers.keys().cloned().collect();
+        let (start, stop) = plan_reconcile(desired, &running);
+        for interface in stop {
+            if let Some(worker) = self.workers.remove(&interface) {
+                worker.stop.store(true, Ordering::SeqCst);
+                let _ = worker.handle.join();
+            }
+            info!(interface = %interface, "bpf interface removed, capture stopped");
+        }
+        // Forget interfaces that are gone, including ones that never started.
+        let gone: Vec<String> = self
+            .retries
+            .keys()
+            .filter(|name| !desired.contains(*name))
+            .cloned()
+            .collect();
+        for interface in gone {
+            self.retries.remove(&interface);
+        }
+        remove_interface_status(&self.collectors, |name| !desired.contains(name));
+        for interface in start {
+            if self
+                .retries
+                .get(&interface)
+                .is_some_and(|retry| retry.next_attempt > now)
+            {
+                continue;
+            }
+            self.start_worker(&interface, now);
+        }
+    }
+
+    /// Collect workers whose thread exited on its own and schedule a restart.
+    fn reap(&mut self, now: Instant) {
+        let finished: Vec<String> = self
+            .workers
+            .iter()
+            .filter(|(_, worker)| worker.handle.is_finished())
+            .map(|(name, _)| name.clone())
+            .collect();
+        for interface in finished {
+            let Some(worker) = self.workers.remove(&interface) else {
+                continue;
+            };
+            let uptime = now.saturating_duration_since(worker.started);
+            let _ = worker.handle.join();
+            warn!(interface = %interface, ?uptime, "bpf capture worker exited, scheduling restart");
+            let previous = self.retries.get(&interface).map_or(0, |r| r.failures);
+            self.record_failure(&interface, now, uptime, previous, None);
+        }
+    }
+
+    fn start_worker(&mut self, interface: &str, now: Instant) {
+        match self.spawn_worker(interface) {
+            Ok(worker) => {
+                if self.retries.contains_key(interface) {
+                    info!(interface = %interface, "bpf capture restarted");
+                    note_restart(&self.collectors, interface);
+                }
+                self.workers.insert(interface.to_string(), worker);
+            }
+            Err(error) => {
+                warn!(interface = %interface, %error, "bpf interface unavailable");
+                let previous = self.retries.get(interface).map_or(0, |r| r.failures);
+                self.record_failure(interface, now, Duration::ZERO, previous, Some(error));
+            }
+        }
+    }
+
+    fn spawn_worker(&self, interface: &str) -> Result<Worker> {
+        let device = BpfDevice::open(interface)?;
+        set_interface_status(
+            &self.collectors,
+            interface,
+            true,
+            Some(device.link_type),
+            None,
+        );
+        info!(interface = %interface, link_type = device.link_type,
+            buffer_len = device.buffer_len, "bpf capture device ready");
+        let stop = Arc::new(AtomicBool::new(false));
+        let worker_stop = Arc::clone(&stop);
+        let tx = self.tx.clone();
+        let attribution_tx = self.attribution_tx.clone();
+        let collectors = Arc::clone(&self.collectors);
+        let handle = std::thread::Builder::new()
+            .name(format!("rustinel-bpf-{interface}"))
+            .spawn(move || run_capture(device, tx, worker_stop, attribution_tx, collectors))
+            .map_err(|e| anyhow!("failed to spawn bpf capture thread: {e}"))?;
+        Ok(Worker {
+            stop,
+            handle,
+            started: Instant::now(),
+        })
+    }
+
+    /// Schedule the next attempt and surface persistent failure in telemetry.
+    fn record_failure(
+        &mut self,
+        interface: &str,
+        now: Instant,
+        uptime: Duration,
+        previous: u32,
+        error: Option<anyhow::Error>,
+    ) {
+        let failures = next_failure_count(previous, uptime);
+        let delay = restart_delay(failures);
+        self.retries.insert(
+            interface.to_string(),
+            Retry {
+                failures,
+                next_attempt: now + delay,
+            },
+        );
+        let persistent = failures >= PERSISTENT_FAILURE_THRESHOLD;
+        if failures == PERSISTENT_FAILURE_THRESHOLD {
+            error!(interface = %interface, failures,
+                "bpf capture is failing persistently, still retrying with backoff");
+        }
+        let cause = error
+            .map(|e| e.to_string())
+            .or_else(|| recorded_interface_error(&self.collectors, interface))
+            .unwrap_or_else(|| "capture worker exited".to_string());
+        let message = format!(
+            "{}{cause} (failure {failures}, retry in {}s)",
+            if persistent {
+                "persistent failure: "
+            } else {
+                ""
+            },
+            delay.as_secs()
+        );
+        set_interface_status(&self.collectors, interface, false, None, Some(message));
+    }
+
+    fn stop_all(&mut self) {
+        for worker in self.workers.values() {
+            worker.stop.store(true, Ordering::SeqCst);
+        }
+        for (_, worker) in std::mem::take(&mut self.workers) {
+            let _ = worker.handle.join();
+        }
+    }
+}
+
+impl Drop for Supervisor {
+    fn drop(&mut self) {
+        // Workers that outlive the supervisor must still observe shutdown.
+        for worker in self.workers.values() {
+            worker.stop.store(true, Ordering::SeqCst);
+        }
+    }
+}
+
+/// Which interfaces need a worker started, and which workers must be stopped.
+fn plan_reconcile(
+    desired: &BTreeSet<String>,
+    running: &BTreeSet<String>,
+) -> (Vec<String>, Vec<String>) {
+    (
+        desired.difference(running).cloned().collect(),
+        running.difference(desired).cloned().collect(),
+    )
+}
+
+/// Consecutive failure count after another failure. A worker that stayed up
+/// for [`STABLE_UPTIME`] is treated as healthy, so its next failure starts a
+/// fresh backoff rather than extending a stale one.
+fn next_failure_count(previous: u32, uptime: Duration) -> u32 {
+    if uptime >= STABLE_UPTIME {
+        1
+    } else {
+        previous.saturating_add(1)
+    }
+}
+
+/// Exponential restart delay: 1s, 2s, 4s, ... capped at [`RESTART_BACKOFF_MAX`].
+fn restart_delay(failures: u32) -> Duration {
+    let shift = failures.saturating_sub(1).min(16);
+    RESTART_BACKOFF_INITIAL
+        .saturating_mul(1u32 << shift)
+        .min(RESTART_BACKOFF_MAX)
+}
+
+fn capture_interfaces() -> Result<BTreeSet<String>> {
+    if let Ok(value) = std::env::var(INTERFACE_ENV) {
+        let names: BTreeSet<_> = value
+            .split(',')
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+            .map(str::to_string)
+            .collect();
+        if names.is_empty() {
+            return Err(anyhow!("{INTERFACE_ENV} contains no interface names"));
+        }
+        return Ok(names);
+    }
+    active_interfaces()
+}
+
+/// getifaddrs can return multiple addresses per interface; collect unique names.
+fn active_interfaces() -> Result<BTreeSet<String>> {
+    let mut first = std::ptr::null_mut();
+    // SAFETY: `first` is a valid out-pointer; the list it receives is freed below.
+    if unsafe { libc::getifaddrs(&mut first) } != 0 {
+        return Err(io::Error::last_os_error().into());
+    }
+    let mut names = BTreeSet::new();
+    let mut current = first;
+    while !current.is_null() {
+        // SAFETY: getifaddrs owns this null-terminated list until freeifaddrs.
+        let entry = unsafe { &*current };
+        let active = (libc::IFF_UP | libc::IFF_RUNNING) as u32;
+        if entry.ifa_flags & active == active && !entry.ifa_name.is_null() {
+            // SAFETY: `ifa_name` is non-null (checked above) and NUL-terminated.
+            let name = unsafe { CStr::from_ptr(entry.ifa_name) }
+                .to_string_lossy()
+                .into_owned();
+            names.insert(name);
+        }
+        current = entry.ifa_next;
+    }
+    // SAFETY: `first` came from the successful getifaddrs call above, and no
+    // entry reference outlives this point.
+    unsafe { libc::freeifaddrs(first) };
+    Ok(names)
+}
+
+fn set_interface_status(
+    collectors: &crate::telemetry::MacosCollectors,
+    interface: &str,
+    active: bool,
+    link_type: Option<u32>,
+    error: Option<String>,
+) {
+    let mut collectors = collectors.lock().unwrap();
+    let bpf = collectors.bpf.get_or_insert_with(Default::default);
+    let entry = bpf.interfaces.entry(interface.to_string()).or_default();
+    entry.active = active;
+    if link_type.is_some() {
+        entry.link_type = link_type;
+    }
+    entry.error = error;
+}
+
+/// The error a capture worker recorded just before it exited, if any.
+fn recorded_interface_error(
+    collectors: &crate::telemetry::MacosCollectors,
+    interface: &str,
+) -> Option<String> {
+    let collectors = collectors.lock().unwrap();
+    collectors
+        .bpf
+        .as_ref()?
+        .interfaces
+        .get(interface)?
+        .error
+        .clone()
+}
+
+/// Drop telemetry entries for interfaces matching `gone`, so a removed
+/// interface does not linger as a stale (or stale-active) entry.
+fn remove_interface_status(
+    collectors: &crate::telemetry::MacosCollectors,
+    gone: impl Fn(&str) -> bool,
+) {
+    let mut collectors = collectors.lock().unwrap();
+    if let Some(bpf) = collectors.bpf.as_mut() {
+        bpf.interfaces.retain(|name, _| !gone(name));
+    }
+}
+
+fn note_restart(collectors: &crate::telemetry::MacosCollectors, interface: &str) {
+    let mut collectors = collectors.lock().unwrap();
+    let bpf = collectors.bpf.get_or_insert_with(Default::default);
+    bpf.interfaces
+        .entry(interface.to_string())
+        .or_default()
+        .restarts += 1;
+}
+
+#[repr(C)]
+#[derive(Default)]
+struct BpfStats {
+    bs_recv: u32,
+    bs_drop: u32,
+}
+
+fn poll_stats(
+    device: &BpfDevice,
+    tracker: &mut crate::telemetry::macos::BpfStatsTracker,
+    collectors: &crate::telemetry::MacosCollectors,
+) {
+    let mut stats = BpfStats::default();
+    // SAFETY: the device fd is open, and `stats` is a writable repr(C) struct of
+    // the layout BIOCGSTATS fills in.
+    let rc = unsafe { libc::ioctl(device.fd, BIOCGSTATS, &mut stats as *mut BpfStats) };
+    let mut counters = collectors.lock().unwrap();
+    let counters = counters.bpf.get_or_insert_with(Default::default);
+    if rc < 0 {
+        counters.stats_errors += 1;
+        counters
+            .interfaces
+            .entry(device.interface.clone())
+            .or_default()
+            .stats_errors += 1;
+    } else {
+        tracker.observe_interface(counters, &device.interface, stats.bs_recv, stats.bs_drop);
+    }
+}
+
+/// An open, configured bpf capture device. Closes its fd on drop.
+struct BpfDevice {
+    interface: String,
+    fd: RawFd,
+    link_type: u32,
+    buffer_len: u32,
+}
+
+impl BpfDevice {
+    fn open(interface: &str) -> Result<Self> {
+        let fd = open_bpf_device()?;
+        // BIOCSBLEN must be set before binding the interface; the kernel may
+        // adjust the requested size, so use the value it reports back.
+        let buffer_len = match set_buffer_len(fd, BPF_BUFFER_LEN) {
+            Ok(len) => len,
+            Err(e) => {
+                close_fd(fd);
+                return Err(anyhow!("BIOCSBLEN failed: {e}"));
+            }
+        };
+        let configure = || -> io::Result<u32> {
+            bind_interface(fd, interface)?;
+            let link_type = get_u32(fd, BIOCGDLT)?;
+            if !packet::supports_link_type(link_type) {
+                return Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    format!("unsupported BPF link type {link_type}"),
+                ));
+            }
+            // Install a coarse kernel filter right after binding so the kernel
+            // drops everything but SYNs and port-53 traffic before it reaches
+            // userspace. The program uses Ethernet offsets, so it is only
+            // applied when the link type matches; other link types fall back to
+            // capturing everything and filtering in userspace.
+            if link_type == DLT_EN10MB {
+                set_filter(fd, &BPF_FILTER_EN10MB)?;
+            }
+            set_u32(fd, BIOCIMMEDIATE, 1)?;
+            set_read_timeout(fd, READ_TIMEOUT)?;
+            Ok(link_type)
+        };
+        match configure() {
+            Ok(link_type) => Ok(Self {
+                interface: interface.to_string(),
+                fd,
+                link_type,
+                buffer_len,
+            }),
+            Err(e) => {
+                close_fd(fd);
+                Err(anyhow!(
+                    "failed to configure bpf device for {interface}: {e}"
+                ))
+            }
+        }
+    }
+}
+
+impl Drop for BpfDevice {
+    fn drop(&mut self) {
+        close_fd(self.fd);
+    }
+}
+
+/// Open the first available `/dev/bpfN` cloning device.
+fn open_bpf_device() -> Result<RawFd> {
+    let mut last_err = io::Error::new(io::ErrorKind::NotFound, "no /dev/bpf device available");
+    for n in 0..256 {
+        let path = CString::new(format!("/dev/bpf{n}")).expect("device path has no NUL");
+        // SAFETY: `path` is a NUL-terminated C string that outlives the call.
+        let fd = unsafe { libc::open(path.as_ptr(), libc::O_RDWR) };
+        if fd >= 0 {
+            return Ok(fd);
+        }
+        let err = io::Error::last_os_error();
+        // EBUSY means the device is taken by another client; try the next one.
+        // Anything else (e.g. EACCES, ENOENT) is recorded and we keep trying a
+        // few more in case only some nodes are restricted.
+        last_err = err;
+    }
+    Err(anyhow!("could not open any /dev/bpf device: {last_err}"))
+}
+
+fn bind_interface(fd: RawFd, interface: &str) -> io::Result<()> {
+    // SAFETY: IfReq is a plain C struct of integers and byte arrays, for which
+    // all-zero bytes is a valid value.
+    let mut req: IfReq = unsafe { std::mem::zeroed() };
+    let bytes = interface.as_bytes();
+    if bytes.len() >= req.ifr_name.len() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "interface name too long",
+        ));
+    }
+    for (slot, byte) in req.ifr_name.iter_mut().zip(bytes) {
+        *slot = *byte as libc::c_char;
+    }
+    // SAFETY: `fd` is an open bpf device, and `req` is a fully initialized
+    // NUL-terminated ifreq that outlives the call.
+    let rc = unsafe { libc::ioctl(fd, BIOCSETIF, &req as *const IfReq) };
+    if rc < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// Install a classic-BPF filter program on the device via `BIOCSETF`.
+fn set_filter(fd: RawFd, program: &[BpfInsn]) -> io::Result<()> {
+    let prog = BpfProgram {
+        bf_len: program.len() as u32,
+        bf_insns: program.as_ptr(),
+    };
+    // SAFETY: `fd` is an open bpf device. `prog` points at `program`, which has
+    // `bf_len` instructions and outlives the call; the kernel copies it.
+    let rc = unsafe { libc::ioctl(fd, BIOCSETF, &prog as *const BpfProgram) };
+    if rc < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+fn set_buffer_len(fd: RawFd, len: u32) -> io::Result<u32> {
+    let mut value: libc::c_uint = len;
+    // SAFETY: `fd` is an open bpf device, and `value` is a writable c_uint, which
+    // is what BIOCSBLEN reads and writes.
+    let rc = unsafe { libc::ioctl(fd, BIOCSBLEN, &mut value as *mut libc::c_uint) };
+    if rc < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(value as u32)
+}
+
+fn set_u32(fd: RawFd, request: libc::c_ulong, value: u32) -> io::Result<()> {
+    let value: libc::c_uint = value;
+    // SAFETY: `fd` is an open bpf device, and `value` is a readable c_uint, which
+    // the u32-valued requests this helper is used with read.
+    let rc = unsafe { libc::ioctl(fd, request, &value as *const libc::c_uint) };
+    if rc < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+fn get_u32(fd: RawFd, request: libc::c_ulong) -> io::Result<u32> {
+    let mut value: libc::c_uint = 0;
+    // SAFETY: `fd` is an open bpf device, and `value` is a writable c_uint, which
+    // the u32-valued requests this helper is used with write.
+    let rc = unsafe { libc::ioctl(fd, request, &mut value as *mut libc::c_uint) };
+    if rc < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(value as u32)
+}
+
+fn set_read_timeout(fd: RawFd, timeout: Duration) -> io::Result<()> {
+    let tv = libc::timeval {
+        tv_sec: timeout.as_secs() as libc::time_t,
+        tv_usec: timeout.subsec_micros() as libc::suseconds_t,
+    };
+    // SAFETY: `fd` is an open bpf device, and `tv` is a readable timeval.
+    let rc = unsafe { libc::ioctl(fd, BIOCSRTIMEOUT, &tv as *const libc::timeval) };
+    if rc < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+fn close_fd(fd: RawFd) {
+    // SAFETY: callers pass a descriptor they own and do not use again.
+    unsafe {
+        libc::close(fd);
+    }
+}
+
+/// A network or DNS event awaiting best-effort process attribution.
+struct AttributionJob {
+    event: RawEvent,
+    flow: socket::Flow,
+}
+
+/// Capture loop: read batches of bpf records and dispatch each packet.
+///
+/// Socket-to-process attribution is offloaded to a dedicated worker so the
+/// `O(processes x descriptors)` scan never blocks draining the bpf device,
+/// which is exactly when the kernel would otherwise drop packets.
+fn run_capture(
+    device: BpfDevice,
+    tx: Sender<RawEvent>,
+    shutdown: Arc<AtomicBool>,
+    attribution_tx: SyncSender<AttributionJob>,
+    collectors: crate::telemetry::MacosCollectors,
+) {
+    let mut stats = crate::telemetry::macos::BpfStatsTracker::default();
+    poll_stats(&device, &mut stats, &collectors);
+    let mut last_poll = Instant::now();
+    let mut buf = vec![0u8; device.buffer_len as usize];
+    while !shutdown.load(Ordering::Relaxed) {
+        if last_poll.elapsed() >= Duration::from_secs(1) {
+            poll_stats(&device, &mut stats, &collectors);
+            last_poll = Instant::now();
+        }
+        // A BPF read timeout may not start until traffic arrives. Poll first
+        // so quiet interfaces still publish statistics and observe shutdown.
+        let mut ready = libc::pollfd {
+            fd: device.fd,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // SAFETY: `ready` is one initialized pollfd that lives for the call.
+        let rc = unsafe { libc::poll(&mut ready, 1, READ_TIMEOUT.as_millis() as i32) };
+        if rc == 0 {
+            continue;
+        }
+        if rc < 0 {
+            let err = io::Error::last_os_error();
+            if err.raw_os_error() != Some(libc::EINTR) {
+                warn!(interface = %device.interface, "bpf poll error: {err}");
+                set_interface_status(
+                    &collectors,
+                    &device.interface,
+                    false,
+                    None,
+                    Some(err.to_string()),
+                );
+                break;
+            }
+            continue;
+        }
+        if ready.revents & libc::POLLIN == 0 {
+            warn!(interface = %device.interface, revents = ready.revents, "bpf device stopped being readable");
+            set_interface_status(
+                &collectors,
+                &device.interface,
+                false,
+                None,
+                Some(format!("capture device poll returned {}", ready.revents)),
+            );
+            break;
+        }
+        // SAFETY: `buf` is writable for `buf.len()` bytes, the length passed.
+        let n = unsafe { libc::read(device.fd, buf.as_mut_ptr().cast(), buf.len()) };
+        if n < 0 {
+            let err = io::Error::last_os_error();
+            match err.raw_os_error() {
+                // EINTR/EAGAIN: interrupted or read timeout elapsed with no
+                // data. Loop back and re-check the shutdown flag.
+                Some(libc::EINTR) | Some(libc::EAGAIN) => continue,
+                _ => {
+                    if !shutdown.load(Ordering::Relaxed) {
+                        warn!(interface = %device.interface, "bpf read error: {err}");
+                        set_interface_status(
+                            &collectors,
+                            &device.interface,
+                            false,
+                            None,
+                            Some(err.to_string()),
+                        );
+                    }
+                    break;
+                }
+            }
+        }
+        if n == 0 {
+            continue;
+        }
+        let data = &buf[..n as usize];
+        for_each_packet(data, |event_time, packet| {
+            handle_packet(device.link_type, event_time, packet, &tx, &attribution_tx)
+        });
+    }
+
+    poll_stats(&device, &mut stats, &collectors);
+
+    let mut collectors = collectors.lock().unwrap();
+    if let Some(entry) = collectors
+        .bpf
+        .as_mut()
+        .and_then(|bpf| bpf.interfaces.get_mut(&device.interface))
+    {
+        entry.active = false;
+    }
+    info!(interface = %device.interface, "bpf sensor shutting down");
+}
+
+/// Attribution worker: receive connection events that still need an owning
+/// process, perform the libproc socket lookup off the capture thread, and
+/// forward the (now best-effort attributed) event to the pipeline. Exits when
+/// the capture thread drops its sender.
+///
+/// Each wake-up drains everything already queued and resolves the whole batch
+/// against one [`socket::SocketOwnerCache`], so a burst of connections costs
+/// one system-wide scan rather than one per connection.
+fn run_attribution_worker(rx: Receiver<AttributionJob>, tx: Sender<RawEvent>) {
+    let mut cache = socket::SocketOwnerCache::new(socket::INVENTORY_TTL);
+    while let Ok(job) = rx.recv() {
+        for mut job in std::iter::once(job).chain(rx.try_iter()) {
+            apply_socket_owner(&mut cache, &mut job.event, job.flow);
+            try_send(&tx, job.event);
+        }
+    }
+}
+
+/// Iterate the packets in a bpf read buffer, calling `handle` with each
+/// captured frame. Records are prefixed with a `struct bpf_hdr` and aligned to
+/// `BPF_ALIGNMENT` (4 bytes) boundaries.
+fn for_each_packet(buf: &[u8], mut handle: impl FnMut(SystemTime, &[u8])) {
+    let mut offset = 0usize;
+    while offset + BPF_HDR_FIELDS_LEN <= buf.len() {
+        let caplen = read_u32(buf, offset + BH_CAPLEN_OFFSET) as usize;
+        let hdrlen = read_u16(buf, offset + BH_HDRLEN_OFFSET) as usize;
+        let seconds = u64::from(read_u32(buf, offset));
+        let micros = read_u32(buf, offset + 4).min(999_999);
+        let event_time = SystemTime::UNIX_EPOCH + Duration::new(seconds, micros * 1_000);
+
+        let start = offset + hdrlen;
+        let end = match start.checked_add(caplen) {
+            Some(end) if end <= buf.len() && start <= buf.len() => end,
+            _ => break,
+        };
+        handle(event_time, &buf[start..end]);
+
+        let advance = bpf_word_align(hdrlen + caplen);
+        if advance == 0 {
+            break;
+        }
+        offset += advance;
+    }
+}
+
+/// Parse a captured frame and emit any resulting [`RawEvent`].
+///
+/// Network and DNS events share the off-thread socket attribution path.
+fn handle_packet(
+    link_type: u32,
+    event_time: SystemTime,
+    frame: &[u8],
+    tx: &Sender<RawEvent>,
+    attribution_tx: &SyncSender<AttributionJob>,
+) {
+    let Some(parsed) = packet::parse(link_type, frame) else {
+        return;
+    };
+    let flow = packet_flow(&parsed);
+    if let Some(event) = build_network_event(&parsed, event_time) {
+        enqueue_attribution(attribution_tx, tx, event, flow);
+    }
+    if let Some(event) = build_dns_event(&parsed, event_time) {
+        enqueue_attribution(attribution_tx, tx, event, flow);
+    }
+}
+
+/// Hand a connection event to the attribution worker, falling back to emitting
+/// it unattributed if the worker is saturated or gone. The capture thread never
+/// blocks and the event is never lost; only its attribution is best-effort.
+fn enqueue_attribution(
+    attribution_tx: &SyncSender<AttributionJob>,
+    tx: &Sender<RawEvent>,
+    event: RawEvent,
+    flow: socket::Flow,
+) {
+    let job = AttributionJob { event, flow };
+    match attribution_tx.try_send(job) {
+        Ok(()) => {}
+        Err(TrySendError::Full(job)) | Err(TrySendError::Disconnected(job)) => {
+            try_send(tx, job.event)
+        }
+    }
+}
+
+/// Best-effort: attribute a connection event to its owning process by matching
+/// the connection's ports against the cached socket inventory. Failures leave
+/// the event unattributed (the normalizer still enriches by destination). Runs
+/// on the attribution worker, never on the capture thread.
+fn apply_socket_owner(
+    cache: &mut socket::SocketOwnerCache,
+    event: &mut RawEvent,
+    flow: socket::Flow,
+) {
+    let Some(owner) = cache.find_socket_owner(flow) else {
+        return;
+    };
+    event.pid = Some(owner.pid);
+    match &mut event.payload {
+        RawPayload::Network(fields) => {
+            fields.process_id = Some(owner.pid.to_string());
+            event.provenance.mark_derived("ProcessId");
+            event
+                .provenance
+                .mark("ProcessId", crate::models::Fidelity::BestEffort);
+            if owner.image.is_some() {
+                event.provenance.mark_derived("Image");
+                event
+                    .provenance
+                    .mark("Image", crate::models::Fidelity::BestEffort);
+            }
+            fields.image = owner.image;
+        }
+        RawPayload::Dns(fields) => {
+            fields.process_id = Some(owner.pid.to_string());
+            event.provenance.mark_derived("ProcessId");
+            event
+                .provenance
+                .mark("ProcessId", crate::models::Fidelity::BestEffort);
+            if owner.image.is_some() {
+                event.provenance.mark_derived("Image");
+                event
+                    .provenance
+                    .mark("Image", crate::models::Fidelity::BestEffort);
+            }
+            fields.image = owner.image;
+        }
+        _ => {}
+    }
+}
+
+fn packet_flow(packet: &ParsedPacket) -> socket::Flow {
+    let (protocol, local_port, remote_port) = match &packet.transport {
+        Transport::Tcp {
+            src_port, dst_port, ..
+        } => (socket::Protocol::Tcp, *src_port, *dst_port),
+        Transport::Udp {
+            src_port, dst_port, ..
+        } => (socket::Protocol::Udp, *src_port, *dst_port),
+    };
+    socket::Flow {
+        protocol,
+        local_port,
+        remote_port,
+        local_ip: packet.src_ip,
+        remote_ip: packet.dst_ip,
+    }
+}
+
+/// Build a network-connection event from a TCP connection initiation.
+///
+/// Only SYN segments with ACK clear are treated as new connections. PID and
+/// image attribution are filled in best-effort by the attribution worker; the
+/// normalizer enriches the rest.
+fn build_network_event(packet: &ParsedPacket, event_time: SystemTime) -> Option<RawEvent> {
+    let Transport::Tcp {
+        src_port,
+        dst_port,
+        flags,
+        ..
+    } = &packet.transport
+    else {
+        return None;
+    };
+    if flags & TCP_FLAG_SYN == 0 || flags & TCP_FLAG_ACK != 0 {
+        return None;
+    }
+
+    Some(RawEvent {
+        process_name: None,
+        provenance: {
+            let mut provenance = crate::models::Provenance::default();
+            provenance.mark("EventID", crate::models::Fidelity::BestEffort);
+            provenance
+        },
+        platform: Platform::MacOS,
+        provider: "bpf",
+        action: SensorAction::Connect,
+        normalization: SensorNormalization {
+            event_id: EVENT_ID_NETWORK_CONNECT,
+            action_code: 0,
+        },
+        pid: None,
+        timestamp: event_time,
+        source_seq: None,
+        process_start_key: None,
+        parent_process_start_key: None,
+        payload: RawPayload::Network(NetworkConnectionFields {
+            destination_ip: Some(packet.dst_ip.to_string()),
+            source_ip: Some(packet.src_ip.to_string()),
+            destination_port: Some(dst_port.to_string()),
+            source_port: Some(src_port.to_string()),
+            process_id: None,
+            image: None,
+            user: None,
+            destination_hostname: None,
+            protocol: Some("tcp".to_string()),
+            // Left unknown on purpose. This is a wire capture, not a syscall
+            // hook: a SYN on the interface is outbound when this host sent it
+            // and inbound when a client did, and the packet alone does not say
+            // which. Guessing `true` would make every inbound connection to a
+            // local listener match an `Initiated: 'true'` rule.
+            initiated: None,
+        }),
+    })
+}
+
+/// Build a DNS-query event from a packet destined to port 53.
+///
+/// Handles UDP queries directly and DNS-over-TCP by skipping the 2-byte length
+/// prefix. Responses are rejected by the shared parser (QR bit).
+fn build_dns_event(packet: &ParsedPacket, event_time: SystemTime) -> Option<RawEvent> {
+    let (dst_port, dns_payload) = match &packet.transport {
+        Transport::Udp {
+            dst_port, payload, ..
+        } => (*dst_port, *payload),
+        Transport::Tcp {
+            dst_port, payload, ..
+        } => (*dst_port, payload.get(2..)?),
+    };
+    if dst_port != DNS_PORT {
+        return None;
+    }
+
+    let (query_name, qtype) = crate::sensor::dns::parse_question(dns_payload)?;
+
+    Some(RawEvent {
+        process_name: None,
+        provenance: Default::default(),
+        platform: Platform::MacOS,
+        provider: "bpf",
+        action: SensorAction::Query,
+        normalization: SensorNormalization {
+            event_id: EVENT_ID_DNS_QUERY,
+            action_code: 0,
+        },
+        pid: None,
+        timestamp: event_time,
+        source_seq: None,
+        process_start_key: None,
+        parent_process_start_key: None,
+        payload: RawPayload::Dns(DnsQueryFields {
+            query_truncated: None,
+            user: None,
+            query_name: Some(query_name),
+            query_results: None,
+            record_type: crate::sensor::dns::record_type_name(qtype).map(str::to_string),
+            query_status: None,
+            process_id: None,
+            image: None,
+        }),
+    })
+}
+
+/// Queue a decoded event, accounting for a drop rather than blocking.
+///
+/// The capture loop reads a fixed-size kernel buffer, so blocking here would
+/// overflow that buffer instead. Overflow is shed and counted — see
+/// [`crate::telemetry`].
+fn try_send(tx: &Sender<RawEvent>, event: RawEvent) {
+    let _ = crate::telemetry::try_send_sensor_event(tx, event);
+}
+
+fn read_u32(buf: &[u8], at: usize) -> u32 {
+    u32::from_ne_bytes([buf[at], buf[at + 1], buf[at + 2], buf[at + 3]])
+}
+
+fn read_u16(buf: &[u8], at: usize) -> u16 {
+    u16::from_ne_bytes([buf[at], buf[at + 1]])
+}
+
+/// Round up to the next `BPF_ALIGNMENT` (4-byte) boundary.
+fn bpf_word_align(value: usize) -> usize {
+    (value + 3) & !3
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Build a bpf record (20-byte header + payload) padded to word alignment.
+    fn bpf_record(payload: &[u8]) -> Vec<u8> {
+        let hdrlen: u16 = 18;
+        let caplen = payload.len() as u32;
+        let mut record = vec![0u8; hdrlen as usize];
+        record[BH_CAPLEN_OFFSET..BH_CAPLEN_OFFSET + 4].copy_from_slice(&caplen.to_ne_bytes());
+        record[BH_HDRLEN_OFFSET..BH_HDRLEN_OFFSET + 2].copy_from_slice(&hdrlen.to_ne_bytes());
+        record.extend_from_slice(payload);
+        record.resize(bpf_word_align(hdrlen as usize + payload.len()), 0);
+        record
+    }
+
+    fn names(items: &[&str]) -> BTreeSet<String> {
+        items.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn plan_reconcile_starts_new_and_stops_removed_interfaces() {
+        let (start, stop) = plan_reconcile(&names(&["en0", "en1"]), &names(&["en0", "utun3"]));
+        assert_eq!(start, vec!["en1".to_string()]);
+        assert_eq!(stop, vec!["utun3".to_string()]);
+
+        let (start, stop) = plan_reconcile(&names(&["en0"]), &names(&["en0"]));
+        assert!(start.is_empty() && stop.is_empty());
+    }
+
+    #[test]
+    fn restart_delay_doubles_and_is_capped() {
+        let delays: Vec<u64> = (1..=8).map(|n| restart_delay(n).as_secs()).collect();
+        assert_eq!(delays, vec![1, 2, 4, 8, 16, 32, 60, 60]);
+        assert_eq!(restart_delay(u32::MAX), RESTART_BACKOFF_MAX);
+    }
+
+    #[test]
+    fn failure_count_resets_after_a_stable_run() {
+        assert_eq!(next_failure_count(3, Duration::from_secs(1)), 4);
+        assert_eq!(next_failure_count(3, STABLE_UPTIME), 1);
+        assert_eq!(next_failure_count(u32::MAX, Duration::ZERO), u32::MAX);
+    }
+
+    fn supervisor() -> Supervisor {
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        let (attribution_tx, _attribution_rx) = std::sync::mpsc::sync_channel(1);
+        Supervisor::new(tx, attribution_tx, Default::default())
+    }
+
+    #[test]
+    fn failed_open_backs_off_and_reports_persistent_failure() {
+        let name = "nonexistent-bpf-test0";
+        let mut supervisor = supervisor();
+        let desired = names(&[name]);
+        let mut now = Instant::now();
+        for failures in 1..=PERSISTENT_FAILURE_THRESHOLD {
+            supervisor.reconcile(&desired, now);
+            assert!(!supervisor.has_workers());
+            assert_eq!(supervisor.retries[name].failures, failures);
+            // Inside the backoff window no new attempt is made.
+            supervisor.reconcile(&desired, now);
+            assert_eq!(supervisor.retries[name].failures, failures);
+            now += restart_delay(failures);
+        }
+        let collectors = supervisor.collectors.lock().unwrap();
+        let entry = &collectors.bpf.as_ref().unwrap().interfaces[name];
+        assert!(!entry.active);
+        assert!(entry
+            .error
+            .as_deref()
+            .unwrap()
+            .starts_with("persistent failure: "));
+        drop(collectors);
+
+        // The interface disappearing clears its retry state and telemetry.
+        supervisor.reconcile(&BTreeSet::new(), now);
+        assert!(supervisor.retries.is_empty());
+        let collectors = supervisor.collectors.lock().unwrap();
+        assert!(!collectors
+            .bpf
+            .as_ref()
+            .unwrap()
+            .interfaces
+            .contains_key(name));
+    }
+
+    #[test]
+    fn bpf_filter_accepts_and_ends_with_a_drop() {
+        // BPF_RET | BPF_K: a terminating return with an immediate operand.
+        const BPF_RET_K: u16 = 0x0006;
+        let last = BPF_FILTER_EN10MB
+            .last()
+            .expect("filter program is not empty");
+        // The program must end by dropping non-matching frames (return 0)...
+        assert_eq!(last.code, BPF_RET_K);
+        assert_eq!(last.k, 0);
+        // ...and must contain at least one accepting return (non-zero length).
+        assert!(BPF_FILTER_EN10MB
+            .iter()
+            .any(|insn| insn.code == BPF_RET_K && insn.k > 0));
+    }
+
+    #[test]
+    fn for_each_packet_yields_each_record() {
+        let mut buf = bpf_record(&[1, 2, 3]);
+        buf.extend(bpf_record(&[9, 8, 7, 6, 5]));
+
+        let mut packets: Vec<Vec<u8>> = Vec::new();
+        for_each_packet(&buf, |_event_time, packet| packets.push(packet.to_vec()));
+
+        assert_eq!(packets, vec![vec![1, 2, 3], vec![9, 8, 7, 6, 5]]);
+    }
+
+    #[test]
+    fn for_each_packet_reads_the_native_bpf_timestamp() {
+        let mut record = bpf_record(&[1, 2, 3]);
+        record[0..4].copy_from_slice(&1_700_000_000u32.to_ne_bytes());
+        record[4..8].copy_from_slice(&123_456u32.to_ne_bytes());
+
+        let mut timestamps = Vec::new();
+        for_each_packet(&record, |event_time, _packet| timestamps.push(event_time));
+
+        assert_eq!(
+            timestamps,
+            vec![SystemTime::UNIX_EPOCH + Duration::new(1_700_000_000, 123_456_000)]
+        );
+    }
+
+    #[test]
+    fn for_each_packet_ignores_trailing_partial_header() {
+        let mut buf = bpf_record(&[1, 2, 3, 4]);
+        buf.extend_from_slice(&[0u8; 5]); // shorter than a header
+
+        let mut count = 0;
+        for_each_packet(&buf, |_event_time, _packet| count += 1);
+        assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn for_each_packet_stops_on_truncated_capture() {
+        let mut buf = vec![0u8; 18];
+        // Claim a 100-byte capture that the buffer cannot satisfy.
+        buf[BH_CAPLEN_OFFSET..BH_CAPLEN_OFFSET + 4].copy_from_slice(&100u32.to_ne_bytes());
+        buf[BH_HDRLEN_OFFSET..BH_HDRLEN_OFFSET + 2].copy_from_slice(&18u16.to_ne_bytes());
+
+        let mut count = 0;
+        for_each_packet(&buf, |_event_time, _packet| count += 1);
+        assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn bpf_word_align_rounds_up_to_four() {
+        assert_eq!(bpf_word_align(0), 0);
+        assert_eq!(bpf_word_align(1), 4);
+        assert_eq!(bpf_word_align(18), 20);
+        assert_eq!(bpf_word_align(20), 20);
+    }
+
+    fn tcp_packet(flags: u8) -> ParsedPacket<'static> {
+        ParsedPacket {
+            src_ip: "10.0.0.5".parse().unwrap(),
+            dst_ip: "93.184.216.34".parse().unwrap(),
+            transport: Transport::Tcp {
+                src_port: 51324,
+                dst_port: 443,
+                flags,
+                payload: &[],
+            },
+        }
+    }
+
+    #[test]
+    fn build_network_event_emits_on_syn() {
+        let event = build_network_event(&tcp_packet(TCP_FLAG_SYN), SystemTime::UNIX_EPOCH)
+            .expect("syn should emit");
+        assert_eq!(event.provider, "bpf");
+        assert_eq!(event.action, SensorAction::Connect);
+        assert_eq!(event.normalization.event_id, EVENT_ID_NETWORK_CONNECT);
+        match event.payload {
+            RawPayload::Network(fields) => {
+                assert_eq!(fields.destination_ip.as_deref(), Some("93.184.216.34"));
+                assert_eq!(fields.source_ip.as_deref(), Some("10.0.0.5"));
+                assert_eq!(fields.destination_port.as_deref(), Some("443"));
+                assert_eq!(fields.protocol.as_deref(), Some("tcp"));
+            }
+            other => panic!("unexpected payload: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn build_network_event_ignores_syn_ack_and_established() {
+        assert!(build_network_event(
+            &tcp_packet(TCP_FLAG_SYN | TCP_FLAG_ACK),
+            SystemTime::UNIX_EPOCH,
+        )
+        .is_none());
+        assert!(build_network_event(&tcp_packet(TCP_FLAG_ACK), SystemTime::UNIX_EPOCH).is_none());
+    }
+
+    #[test]
+    fn enqueue_attribution_emits_unattributed_when_worker_saturated() {
+        // A rendezvous channel with no worker receiving: try_send always reports
+        // the queue full, so the capture thread must emit the event itself
+        // rather than block or drop it.
+        let (attribution_tx, _attribution_rx) = std::sync::mpsc::sync_channel::<AttributionJob>(0);
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<RawEvent>(8);
+
+        let event = build_network_event(&tcp_packet(TCP_FLAG_SYN), SystemTime::UNIX_EPOCH)
+            .expect("syn should emit");
+        enqueue_attribution(
+            &attribution_tx,
+            &tx,
+            event,
+            packet_flow(&tcp_packet(TCP_FLAG_SYN)),
+        );
+
+        let received = rx
+            .try_recv()
+            .expect("event should still reach the pipeline");
+        assert!(received.pid.is_none(), "event should be unattributed");
+        match received.payload {
+            RawPayload::Network(fields) => assert!(fields.process_id.is_none()),
+            other => panic!("unexpected payload: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn packet_flow_distinguishes_tcp_and_udp() {
+        let tcp = packet_flow(&tcp_packet(TCP_FLAG_SYN));
+        assert_eq!(tcp.protocol, socket::Protocol::Tcp);
+        assert_eq!((tcp.local_port, tcp.remote_port), (51324, 443));
+        let udp = packet_flow(&udp_packet(DNS_PORT, vec![]));
+        assert_eq!(udp.protocol, socket::Protocol::Udp);
+        assert_eq!((udp.local_port, udp.remote_port), (51324, DNS_PORT));
+    }
+
+    /// Minimal single-question DNS query payload for `name` with the given qtype.
+    fn dns_query(name: &str, qtype: u16) -> Vec<u8> {
+        let mut payload = vec![0u8; 12];
+        payload[5] = 1; // qdcount = 1
+        for label in name.split('.') {
+            payload.push(label.len() as u8);
+            payload.extend_from_slice(label.as_bytes());
+        }
+        payload.push(0);
+        payload.extend_from_slice(&qtype.to_be_bytes());
+        payload.extend_from_slice(&1u16.to_be_bytes()); // qclass = IN
+        payload
+    }
+
+    fn udp_packet(dst_port: u16, payload: Vec<u8>) -> ParsedPacket<'static> {
+        ParsedPacket {
+            src_ip: "10.0.0.5".parse().unwrap(),
+            dst_ip: "1.1.1.1".parse().unwrap(),
+            transport: Transport::Udp {
+                src_port: 51324,
+                dst_port,
+                payload: Box::leak(payload.into_boxed_slice()),
+            },
+        }
+    }
+
+    #[test]
+    fn build_dns_event_maps_udp_query() {
+        let event = build_dns_event(
+            &udp_packet(DNS_PORT, dns_query("sub.example.test", 28)),
+            SystemTime::UNIX_EPOCH,
+        )
+        .expect("dns query should emit");
+        assert_eq!(event.provider, "bpf");
+        assert_eq!(event.action, SensorAction::Query);
+        assert_eq!(event.normalization.event_id, EVENT_ID_DNS_QUERY);
+        match event.payload {
+            RawPayload::Dns(fields) => {
+                assert_eq!(fields.query_name.as_deref(), Some("sub.example.test"));
+                assert_eq!(fields.record_type.as_deref(), Some("AAAA"));
+            }
+            other => panic!("unexpected payload: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn build_dns_event_ignores_non_dns_port() {
+        assert!(build_dns_event(
+            &udp_packet(123, dns_query("example.test", 1)),
+            SystemTime::UNIX_EPOCH,
+        )
+        .is_none());
+    }
+
+    fn test_normalizer() -> crate::normalizer::Normalizer {
+        use crate::state::HostState;
+        crate::normalizer::Normalizer::new(Arc::new(HostState::default()))
+    }
+
+    #[test]
+    fn macos_dns_query_matches_product_macos_sigma_rule() {
+        use crate::engine::Engine;
+        use crate::sensor::Platform;
+
+        let tempdir = tempfile::tempdir().expect("create sigma tempdir");
+        let rules_dir = tempdir.path().join("sigma");
+        std::fs::create_dir_all(&rules_dir).expect("create sigma rules dir");
+        std::fs::write(
+            rules_dir.join("dns.yml"),
+            r#"title: macOS DNS QueryName
+logsource:
+  product: macos
+  category: dns_query
+detection:
+  selection:
+    QueryName|endswith: ".example.test"
+  condition: selection
+level: high
+"#,
+        )
+        .expect("write sigma rule");
+
+        let mut engine = Engine::new_for_platform(Platform::MacOS);
+        engine.load_rules(&rules_dir).expect("load sigma rule");
+
+        let event = build_dns_event(
+            &udp_packet(DNS_PORT, dns_query("sub.example.test", 1)),
+            SystemTime::UNIX_EPOCH,
+        )
+        .expect("dns event should build");
+        let normalized = test_normalizer()
+            .normalize(&event)
+            .expect("dns event should normalize");
+        assert_eq!(normalized.get_field("QueryName"), Some("sub.example.test"));
+
+        let alert = engine
+            .check_event(&normalized)
+            .into_iter()
+            .next()
+            .expect("macOS dns Sigma rule should match parsed QueryName");
+        assert_eq!(alert.rule_name, "macOS DNS QueryName");
+    }
+    #[test]
+    fn interface_inventory_includes_loopback_once() {
+        let interfaces = active_interfaces().expect("getifaddrs");
+        assert!(interfaces.contains("lo0"));
+    }
+
+    #[test]
+    fn framed_dns_records_receive_the_udp_socket_pid_through_the_worker() {
+        // Exercise the BPF record reader, link parser, attribution worker, and
+        // normalizer without requiring a physical Ethernet adapter.
+        for address in ["127.0.0.1", "::1"] {
+            let udp = std::net::UdpSocket::bind((address, 0)).unwrap();
+            let local = udp.local_addr().unwrap();
+            let dns = dns_query("collector.example.test", 1);
+            let udp_len = (dns.len() + 8) as u16;
+            let (mut ip, ethertype, family) = match local.ip() {
+                std::net::IpAddr::V4(address) => {
+                    let mut ip = vec![0u8; 20];
+                    ip[0] = 0x45;
+                    ip[2..4].copy_from_slice(&(20 + udp_len).to_be_bytes());
+                    ip[8] = 64;
+                    ip[9] = 17;
+                    ip[12..16].copy_from_slice(&address.octets());
+                    ip[16..20].copy_from_slice(&address.octets());
+                    (ip, 0x0800u16, 2u32)
+                }
+                std::net::IpAddr::V6(address) => {
+                    let mut ip = vec![0u8; 40];
+                    ip[0] = 0x60;
+                    ip[4..6].copy_from_slice(&udp_len.to_be_bytes());
+                    ip[6] = 17;
+                    ip[7] = 64;
+                    ip[8..24].copy_from_slice(&address.octets());
+                    ip[24..40].copy_from_slice(&address.octets());
+                    (ip, 0x86ddu16, 30u32)
+                }
+            };
+            ip.extend_from_slice(&local.port().to_be_bytes());
+            ip.extend_from_slice(&53u16.to_be_bytes());
+            ip.extend_from_slice(&udp_len.to_be_bytes());
+            // Checksums are intentionally omitted: this tests decoding a
+            // captured buffer, not injecting packets onto a network.
+            ip.extend_from_slice(&[0, 0]);
+            ip.extend_from_slice(&dns);
+            let mut ethernet = vec![0u8; 12];
+            ethernet.extend_from_slice(&ethertype.to_be_bytes());
+            ethernet.extend_from_slice(&ip);
+            let mut vlan = vec![0u8; 12];
+            vlan.extend_from_slice(&0x8100u16.to_be_bytes());
+            vlan.extend_from_slice(&7u16.to_be_bytes());
+            vlan.extend_from_slice(&ethertype.to_be_bytes());
+            vlan.extend_from_slice(&ip);
+            let mut null = family.to_ne_bytes().to_vec();
+            null.extend_from_slice(&ip);
+            let mut loop_frame = family.to_be_bytes().to_vec();
+            loop_frame.extend_from_slice(&ip);
+            for (dlt, frame) in [
+                (packet::DLT_RAW, ip),
+                (packet::DLT_EN10MB, ethernet),
+                (packet::DLT_EN10MB, vlan),
+                (packet::DLT_NULL, null),
+                (packet::DLT_LOOP, loop_frame),
+            ] {
+                let mut record = vec![0u8; 20];
+                record[BH_CAPLEN_OFFSET..BH_CAPLEN_OFFSET + 4]
+                    .copy_from_slice(&(frame.len() as u32).to_ne_bytes());
+                record[BH_HDRLEN_OFFSET..BH_HDRLEN_OFFSET + 2]
+                    .copy_from_slice(&20u16.to_ne_bytes());
+                record.extend_from_slice(&frame);
+                // Under parallel load, a best-effort libproc scan can miss
+                // this still-open socket. Retry the whole path with a fresh
+                // worker inventory; a wrong PID or extra event still fails
+                // immediately, and missing attribution fails at the deadline.
+                let deadline = Instant::now() + Duration::from_secs(5);
+                let event = loop {
+                    let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+                    let (attribution_tx, attribution_rx) = std::sync::mpsc::sync_channel(8);
+                    for_each_packet(&record, |time, packet| {
+                        handle_packet(dlt, time, packet, &tx, &attribution_tx)
+                    });
+                    drop(attribution_tx);
+                    run_attribution_worker(attribution_rx, tx);
+                    let event = rx.try_recv().expect("DNS event forwarded");
+                    assert!(rx.try_recv().is_err(), "one event per captured record");
+                    if event.pid.is_some() || Instant::now() >= deadline {
+                        break event;
+                    }
+                    std::thread::sleep(Duration::from_millis(25));
+                };
+                assert_eq!(event.pid, Some(std::process::id()), "{address}, DLT {dlt}");
+                let normalized = test_normalizer().normalize(&event).expect("DNS normalizes");
+                assert_eq!(
+                    normalized.get_field("QueryName"),
+                    Some("collector.example.test")
+                );
+                let pid = std::process::id().to_string();
+                assert_eq!(normalized.get_field("ProcessId"), Some(pid.as_str()));
+                assert!(
+                    normalized.get_field("Image").is_some(),
+                    "socket owner image is exposed"
+                );
+            }
+        }
+    }
+
+    /// Run alone as root. The override can include a nonexistent interface to
+    /// verify that its failure does not stop loopback capture.
+    fn interface_status(
+        supervisor: &Supervisor,
+        name: &str,
+    ) -> Option<crate::telemetry::BpfInterfaceSnapshot> {
+        let collectors = supervisor.collectors.lock().unwrap();
+        collectors.bpf.as_ref()?.interfaces.get(name).cloned()
+    }
+
+    #[test]
+    #[ignore = "requires root and BPF access"]
+    fn live_supervisor_restarts_isolates_and_removes_workers() {
+        let mut supervisor = supervisor();
+        let mut now = Instant::now();
+
+        // A bogus interface fails without disturbing healthy loopback capture.
+        supervisor.reconcile(&names(&["lo0", "nonexistent-bpf-live0"]), now);
+        assert!(interface_status(&supervisor, "lo0").unwrap().active);
+        assert!(
+            !interface_status(&supervisor, "nonexistent-bpf-live0")
+                .unwrap()
+                .active
+        );
+
+        // Kill the lo0 worker: it is reaped, then restarted after the backoff.
+        supervisor.workers["lo0"].stop.store(true, Ordering::SeqCst);
+        while !supervisor.workers["lo0"].handle.is_finished() {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        now += Duration::from_secs(1);
+        supervisor.reconcile(&names(&["lo0"]), now);
+        assert!(!supervisor.has_workers());
+        assert!(!interface_status(&supervisor, "lo0").unwrap().active);
+        now += restart_delay(1);
+        supervisor.reconcile(&names(&["lo0"]), now);
+        let lo0 = interface_status(&supervisor, "lo0").unwrap();
+        assert!(lo0.active && lo0.error.is_none());
+        assert_eq!(lo0.restarts, 1);
+
+        // Removing the interface stops the worker and clears its status.
+        supervisor.reconcile(&BTreeSet::new(), now);
+        assert!(!supervisor.has_workers());
+        assert!(interface_status(&supervisor, "lo0").is_none());
+    }
+
+    #[test]
+    #[ignore = "requires root, BPF access, and an available loopback UDP port 53"]
+    fn live_bpf_capture_attributes_dns() {
+        let _server =
+            std::net::UdpSocket::bind("127.0.0.1:53").expect("reserve local DNS test port");
+        let client = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8192);
+        let sensor = BpfSensor::new();
+        if let Err(error) = sensor.start(tx) {
+            sensor.shutdown();
+            panic!("could not start BPF capture: {error}");
+        }
+        let query_name = format!("collector-{}.invalid", std::process::id());
+        let query = dns_query(&query_name, 1);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut found = false;
+        while Instant::now() < deadline && !found {
+            if client.send_to(&query, "127.0.0.1:53").is_err() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+            while let Ok(event) = rx.try_recv() {
+                if let RawPayload::Dns(fields) = event.payload {
+                    found |= fields.query_name.as_deref() == Some(query_name.as_str())
+                        && event.pid == Some(std::process::id())
+                        && fields.process_id == Some(std::process::id().to_string());
+                }
+            }
+        }
+        let collectors = crate::telemetry::macos::snapshot(&sensor.collectors);
+        sensor.shutdown();
+        let bpf = collectors.unwrap().bpf.unwrap();
+        println!("BPF live interfaces: {:?}", bpf.interfaces);
+        assert!(bpf.interfaces["lo0"].active);
+        assert_eq!(
+            bpf.kernel_dropped,
+            bpf.interfaces
+                .values()
+                .map(|i| i.kernel_dropped)
+                .sum::<u64>()
+        );
+        assert!(
+            found,
+            "the captured DNS query should carry this process's PID"
+        );
+    }
+}

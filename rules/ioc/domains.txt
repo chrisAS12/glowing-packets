@@ -1,0 +1,4 @@
+# IOC Type: Domains
+# Format: VALUE;COMMENT
+# Example: evil.example.com;Exact domain
+# Note: Prefix with "." or "*." to match subdomains.

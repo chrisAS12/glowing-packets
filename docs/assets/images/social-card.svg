@@ -1,0 +1,92 @@
+<svg width="1200" height="630" viewBox="0 0 1200 630" fill="none" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Rustinel — Open-source endpoint detection">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1200" y2="630" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#0b0d10"/>
+      <stop offset="1" stop-color="#15110d"/>
+    </linearGradient>
+    <linearGradient id="rust" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#ff7a45"/>
+      <stop offset="1" stop-color="#e6531d"/>
+    </linearGradient>
+    <radialGradient id="glow" cx="0.5" cy="0.5" r="0.5">
+      <stop offset="0" stop-color="#e6531d" stop-opacity="0.35"/>
+      <stop offset="1" stop-color="#e6531d" stop-opacity="0"/>
+    </radialGradient>
+    <filter id="soft" x="-20%" y="-20%" width="140%" height="140%">
+      <feGaussianBlur stdDeviation="6"/>
+    </filter>
+  </defs>
+
+  <!-- Background -->
+  <rect width="1200" height="630" fill="url(#bg)"/>
+
+  <!-- Subtle grid -->
+  <g stroke="#ffffff" stroke-opacity="0.04" stroke-width="1">
+    <path d="M0 105 H1200 M0 210 H1200 M0 315 H1200 M0 420 H1200 M0 525 H1200"/>
+    <path d="M150 0 V630 M300 0 V630 M450 0 V630 M600 0 V630 M750 0 V630 M900 0 V630 M1050 0 V630"/>
+  </g>
+
+  <!-- Ambient glow behind shield -->
+  <ellipse cx="945" cy="315" rx="320" ry="320" fill="url(#glow)"/>
+
+  <!-- Shield emblem (radar / endpoint detection) -->
+  <g transform="translate(945 315)">
+    <path d="M0 -180 L150 -120 V20 C150 110 80 165 0 200 C-80 165 -150 110 -150 20 V-120 Z"
+          fill="#11161c" stroke="url(#rust)" stroke-width="6"/>
+    <!-- radar rings -->
+    <g stroke="url(#rust)" fill="none" stroke-opacity="0.55">
+      <circle cx="0" cy="-10" r="40" stroke-width="4"/>
+      <circle cx="0" cy="-10" r="78" stroke-width="3" stroke-opacity="0.35"/>
+      <circle cx="0" cy="-10" r="116" stroke-width="2" stroke-opacity="0.2"/>
+    </g>
+    <!-- sweep -->
+    <path d="M0 -10 L96 -78 A120 120 0 0 1 96 58 Z" fill="url(#rust)" fill-opacity="0.18"/>
+    <!-- detected blip -->
+    <circle cx="62" cy="38" r="9" fill="url(#rust)" filter="url(#soft)"/>
+    <circle cx="62" cy="38" r="6" fill="#ffd9c7"/>
+    <!-- center -->
+    <circle cx="0" cy="-10" r="9" fill="url(#rust)"/>
+  </g>
+
+  <!-- Accent bar -->
+  <rect x="90" y="150" width="64" height="8" rx="4" fill="url(#rust)"/>
+
+  <!-- Wordmark -->
+  <text x="88" y="300" font-family="'DejaVu Sans','Helvetica Neue',Arial,sans-serif"
+        font-size="118" font-weight="800" fill="#ffffff" letter-spacing="-2">Rustinel</text>
+
+  <!-- Tagline -->
+  <text x="92" y="372" font-family="'DejaVu Sans','Helvetica Neue',Arial,sans-serif"
+        font-size="40" font-weight="500" fill="#c7ccd1">Open-source endpoint detection</text>
+
+  <!-- Tech chips -->
+  <g font-family="'DejaVu Sans Mono','SF Mono',monospace" font-size="24" font-weight="600">
+    <g transform="translate(92 430)">
+      <rect width="84" height="46" rx="10" fill="#1b212a" stroke="#ff7a45" stroke-opacity="0.4"/>
+      <text x="42" y="31" fill="#ff9d73" text-anchor="middle">ETW</text>
+    </g>
+    <g transform="translate(190 430)">
+      <rect width="92" height="46" rx="10" fill="#1b212a" stroke="#ff7a45" stroke-opacity="0.4"/>
+      <text x="46" y="31" fill="#ff9d73" text-anchor="middle">eBPF</text>
+    </g>
+    <g transform="translate(296 430)">
+      <rect width="106" height="46" rx="10" fill="#1b212a" stroke="#ff7a45" stroke-opacity="0.4"/>
+      <text x="53" y="31" fill="#ff9d73" text-anchor="middle">Sigma</text>
+    </g>
+    <g transform="translate(416 430)">
+      <rect width="98" height="46" rx="10" fill="#1b212a" stroke="#ff7a45" stroke-opacity="0.4"/>
+      <text x="49" y="31" fill="#ff9d73" text-anchor="middle">YARA</text>
+    </g>
+    <g transform="translate(528 430)">
+      <rect width="96" height="46" rx="10" fill="#1b212a" stroke="#ff7a45" stroke-opacity="0.4"/>
+      <text x="48" y="31" fill="#ff9d73" text-anchor="middle">Rust</text>
+    </g>
+  </g>
+
+  <!-- Footer URL -->
+  <text x="92" y="560" font-family="'DejaVu Sans Mono','SF Mono',monospace"
+        font-size="26" fill="#7d858f">docs.rustinel.io</text>
+
+  <!-- Frame -->
+  <rect x="3" y="3" width="1194" height="624" rx="18" fill="none" stroke="#ffffff" stroke-opacity="0.06" stroke-width="2"/>
+</svg>

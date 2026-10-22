@@ -1,0 +1,575 @@
+use super::*;
+use crate::sensor::RawPayload;
+use crate::telemetry::EventLogHealth;
+
+#[test]
+fn timestamps_reject_invalid_and_out_of_range_values() {
+    assert_eq!(parse_system_time("1970-01-01T00:00:00Z"), Some(UNIX_EPOCH));
+    assert_eq!(
+        parse_system_time("1970-01-01T00:00:01.1234567Z"),
+        UNIX_EPOCH.checked_add(Duration::new(1, 123_456_700))
+    );
+    for value in ["invalid", "1969-12-31T23:59:59Z", "+262000-01-01T00:00:00Z"] {
+        assert!(parse_system_time(value).is_none());
+    }
+    // Start with valid records so errors must come from timestamp conversion.
+    for (source, provider, event_id, data) in [
+        (
+            application::source(),
+            "Application Error",
+            1000,
+            "<Data>test.exe</Data>",
+        ),
+        (
+            service::source(),
+            "Service Control Manager",
+            7045,
+            "<Data Name='ServiceName'>test</Data><Data Name='ImagePath'>test.exe</Data>",
+        ),
+        (
+            powershell_classic::source(),
+            "PowerShell",
+            400,
+            "<Data>Available</Data><Data>None</Data><Data>HostApplication=test</Data>",
+        ),
+        (
+            security::source(false, false, false),
+            "Microsoft-Windows-Security-Auditing",
+            4624,
+            "<Data Name='TargetUserName'>test</Data>",
+        ),
+        (
+            defender::source(),
+            "Microsoft-Windows-Windows Defender",
+            5007,
+            "<Data Name='New Value'>test</Data>",
+        ),
+    ] {
+        let xml = format!(
+            "<Event><System><Provider Name='{provider}'/><EventID>{event_id}</EventID><Level>2</Level><Channel>{}</Channel><TimeCreated SystemTime='1970-01-01T00:00:00Z'/><EventRecordID>1</EventRecordID></System><EventData>{data}</EventData></Event>",
+            source.channel
+        );
+        assert!((source.decoder)(&xml).is_ok(), "{} fixture", source.channel);
+        for timestamp in ["invalid", "1969-12-31T23:59:59Z", "+262000-01-01T00:00:00Z"] {
+            let invalid = xml.replace("1970-01-01T00:00:00Z", timestamp);
+            let error = (source.decoder)(&invalid).unwrap_err();
+            assert!(
+                error.to_string().contains("timestamp"),
+                "{}: {error}",
+                source.channel
+            );
+        }
+    }
+}
+
+#[test]
+fn callback_panic_fails_source_and_ignores_later_deliveries() {
+    let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+    let source = EventLogSource::new(
+        "test",
+        "callback-panic-test",
+        "*",
+        service::source().decoder,
+    );
+    let log_health = Arc::new(EventLogHealth::default());
+    let context = CallbackContext {
+        source,
+        tx,
+        health: Arc::clone(&log_health),
+        state: Mutex::new(CallbackState {
+            // SAFETY: a null XML argument creates an empty bookmark.
+            bookmark: OwnedEvtHandle(unsafe { EvtCreateBookmark(PCWSTR::null()) }.unwrap()),
+            pending: None,
+            failure: None,
+            failure_code: None,
+            decode_warnings: LogRateLimiter::new(DECODE_WARNING_WINDOW),
+        }),
+    };
+    log_health.update(source.channel, |health| health.active = true);
+    guard_callback(&context, |_| panic!("injected conversion panic"));
+    assert!(context.state.is_poisoned());
+    assert_eq!(
+        context
+            .state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .failure
+            .as_deref(),
+        Some("Event Log callback panicked")
+    );
+    // A failed source must ignore this handle before attempting to render it.
+    // SAFETY: `context` is live for the call, and the callback must not touch
+    // the handle of a failed source.
+    unsafe {
+        assert_eq!(
+            subscription_callback(
+                EvtSubscribeActionDeliver,
+                (&context as *const CallbackContext).cast(),
+                EVT_HANDLE(0)
+            ),
+            0
+        );
+    }
+    assert!(rx.try_recv().is_err());
+    let health = log_health
+        .snapshot()
+        .into_iter()
+        .find(|health| health.channel == source.channel)
+        .unwrap();
+    assert!(!health.active);
+    assert_eq!(health.subscription_errors, 1);
+    assert_eq!(health.decode_errors, 0);
+    assert_eq!(
+        health.last_error.as_deref(),
+        Some("Event Log callback panicked")
+    );
+}
+
+#[test]
+fn retention_only_counts_unavailable_records_after_checkpoint() {
+    assert!(!retention_wrapped(100, 100));
+    assert!(!retention_wrapped(100, 101));
+    assert!(retention_wrapped(100, 102));
+    assert!(!retention_wrapped(u64::MAX, 1));
+}
+
+#[test]
+fn checkpoint_replaces_atomically_and_survives_reopen() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("System.xml");
+    for id in [0, 100, 105, 10_000] {
+        let xml = format!(
+            r#"<BookmarkList><Bookmark Channel="System" RecordId="{id}" IsCurrent="true"/></BookmarkList>"#
+        );
+        write_checkpoint(&path, &xml).unwrap();
+        let saved = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(bookmark_record_id(&saved, "System").unwrap(), id);
+        let wide = wide_string(&saved);
+        // SAFETY: `wide` is a NUL-terminated wide string that outlives the call.
+        let bookmark = OwnedEvtHandle(unsafe { EvtCreateBookmark(PCWSTR(wide.as_ptr())) }.unwrap());
+        assert_eq!(
+            bookmark_record_id(
+                &render_xml(bookmark.0, EvtRenderBookmark.0).unwrap(),
+                "System"
+            )
+            .unwrap(),
+            id
+        );
+    }
+    assert!(bookmark_record_id("<BookmarkList/>", "System").is_err());
+}
+
+#[test]
+fn invalid_checkpoint_fails_startup_without_resetting_it() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("checkpoint.xml");
+    std::fs::write(&path, "invalid bookmark").unwrap();
+    let (tx, _rx) = tokio::sync::mpsc::channel(1);
+    let (startup_tx, _startup_rx) = mpsc::sync_channel(1);
+    let source = EventLogSource::new(
+        "test",
+        "invalid-checkpoint-test",
+        "*",
+        service::source().decoder,
+    );
+    let log_health = Arc::new(EventLogHealth::default());
+    assert!(run_subscription_inner(
+        source,
+        tx,
+        Arc::new(AtomicBool::new(false)),
+        &mut Some(startup_tx),
+        &path,
+        &log_health,
+    )
+    .is_err());
+    assert_eq!(std::fs::read_to_string(path).unwrap(), "invalid bookmark");
+    let health = log_health
+        .snapshot()
+        .into_iter()
+        .find(|health| health.channel == source.channel)
+        .unwrap();
+    assert_eq!(health.checkpoint_errors, 1);
+    assert!(!health.active);
+}
+
+#[test]
+fn callback_errors_are_categorical_and_named() {
+    let (tx, _rx) = tokio::sync::mpsc::channel(1);
+    let source = EventLogSource::new(
+        "test",
+        "callback-error-test",
+        "*",
+        service::source().decoder,
+    );
+    let log_health = Arc::new(EventLogHealth::default());
+    let context = CallbackContext {
+        source,
+        tx,
+        health: Arc::clone(&log_health),
+        state: Mutex::new(CallbackState {
+            // SAFETY: a null XML argument creates an empty bookmark.
+            bookmark: OwnedEvtHandle(unsafe { EvtCreateBookmark(PCWSTR::null()) }.unwrap()),
+            pending: None,
+            failure: None,
+            failure_code: None,
+            decode_warnings: LogRateLimiter::new(DECODE_WARNING_WINDOW),
+        }),
+    };
+    for code in [ERROR_EVT_QUERY_RESULT_STALE.0, 5] {
+        // SAFETY: `context` is live for the call, and an error notification
+        // carries a code in the handle slot rather than a real handle.
+        unsafe {
+            subscription_callback(
+                EvtSubscribeActionError,
+                (&context as *const CallbackContext).cast(),
+                EVT_HANDLE(code as isize),
+            );
+        }
+    }
+    assert_eq!(context.state.lock().unwrap().failure_code, Some(5));
+    let health = log_health
+        .snapshot()
+        .into_iter()
+        .find(|health| health.channel == source.channel)
+        .unwrap();
+    assert_eq!(health.subscription_errors, 2);
+    assert_eq!(health.live_stale, 1);
+    assert_eq!(health.retention_wraps, 0);
+    assert!(health.last_error.unwrap().contains('5'));
+    assert!(!health.active);
+}
+
+fn native_channel() -> &'static str {
+    static CHANNEL: std::sync::LazyLock<String> =
+        std::sync::LazyLock::new(|| format!("R429{}", std::process::id()));
+    CHANNEL.as_str()
+}
+
+fn powershell(script: &str) {
+    let script = script.replace("RustinelEventLog429", native_channel());
+    let output = std::process::Command::new("powershell.exe")
+        .args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            &format!("$ErrorActionPreference = 'Stop'; {script}"),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+fn decode_test_record(xml: &str) -> Result<RawEvent> {
+    let document = roxmltree::Document::parse(xml)?;
+    let id = document
+        .descendants()
+        .find(|n| n.has_tag_name("EventRecordID"))
+        .and_then(|n| n.text())
+        .context("missing ID")?;
+    // Reuse the production decoder to provide a canonical payload for this transport test.
+    (service::source().decoder)(&format!(
+        r#"<Event><System><Provider Name="Service Control Manager"/><EventID>7045</EventID><EventRecordID>{id}</EventRecordID><Channel>System</Channel><TimeCreated SystemTime="2026-09-10T00:00:00Z"/></System><EventData><Data Name="ServiceName">test</Data><Data Name="ImagePath">test.exe</Data></EventData></Event>"#
+    ))
+}
+
+fn receive(rx: &mut tokio::sync::mpsc::Receiver<RawEvent>) -> RawEvent {
+    let deadline = std::time::Instant::now() + Duration::from_secs(15);
+    loop {
+        if let Ok(event) = rx.try_recv() {
+            return event;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "timed out waiting for Event Log callback"
+        );
+        thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// Subscribes to the real classic PowerShell channel and starts a fresh host.
+#[test]
+#[ignore = "requires a Windows lab with the classic PowerShell channel"]
+fn native_powershell_classic_start_subscription() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("Windows PowerShell.xml");
+    let (tx, mut rx) = tokio::sync::mpsc::channel(10);
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let worker = EventLogSubscription::start(
+        powershell_classic::source(),
+        tx,
+        Arc::clone(&shutdown),
+        path,
+        Default::default(),
+    )
+    .unwrap();
+
+    powershell("Write-Output rustinel-323 | Out-Null");
+    let event = receive(&mut rx);
+    assert_eq!(event.normalization.event_id, 400);
+    assert_eq!(event.provider, "windows_event_log");
+    let RawPayload::PowerShellClassicStart(fields) = event.payload else {
+        panic!("expected classic PowerShell start payload");
+    };
+    let data = fields.data.expect("event 400 Data");
+    assert!(data.contains("HostApplication="));
+    assert!(data.contains("EngineVersion="));
+
+    shutdown.store(true, Ordering::Relaxed);
+    worker.join().unwrap();
+}
+
+/// Creates and removes only a dedicated test channel. Requires elevation.
+#[test]
+#[ignore = "requires an elevated Windows lab and creates a temporary Event Log channel"]
+fn native_filtered_subscription_resume_and_retention() {
+    let channel = native_channel();
+    powershell("New-EventLog -LogName RustinelEventLog429 -Source RustinelEventLog429; wevtutil sl RustinelEventLog429 /ms:1048576 /rt:false; if ($LASTEXITCODE -ne 0) { throw 'wevtutil failed' }");
+    struct Cleanup;
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            let _ = std::process::Command::new("powershell.exe")
+                .args([
+                    "-NoProfile",
+                    "-Command",
+                    &format!("Remove-EventLog -LogName {}", native_channel()),
+                ])
+                .status();
+        }
+    }
+    let _cleanup = Cleanup;
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("checkpoint.xml");
+    let source = EventLogSource::new(
+        "native-test",
+        channel,
+        "*[System[EventID=429]]",
+        decode_test_record,
+    );
+    let log_health = Arc::new(EventLogHealth::default());
+    let (tx, mut rx) = tokio::sync::mpsc::channel(100);
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let worker = EventLogSubscription::start(
+        source,
+        tx.clone(),
+        shutdown.clone(),
+        path.clone(),
+        Arc::clone(&log_health),
+    )
+    .unwrap();
+    assert_eq!(
+        bookmark_record_id(&std::fs::read_to_string(&path).unwrap(), channel).unwrap(),
+        0
+    );
+    shutdown.store(true, Ordering::Relaxed);
+    worker.join().unwrap();
+    // Even a previously empty channel must replay its first downtime event.
+    powershell("Write-EventLog -LogName RustinelEventLog429 -Source RustinelEventLog429 -EventId 429 -EntryType Information -Message first");
+    shutdown.store(false, Ordering::Relaxed);
+    let worker = EventLogSubscription::start(
+        source,
+        tx.clone(),
+        shutdown.clone(),
+        path.clone(),
+        Arc::clone(&log_health),
+    )
+    .unwrap();
+    powershell("1..200 | ForEach-Object { Write-EventLog -LogName RustinelEventLog429 -Source RustinelEventLog429 -EventId 430 -EntryType Information -Message excluded }; Write-EventLog -LogName RustinelEventLog429 -Source RustinelEventLog429 -EventId 429 -EntryType Information -Message second");
+    let first = receive(&mut rx).source_seq.unwrap();
+    let second = receive(&mut rx).source_seq.unwrap();
+    assert!(second > first + 1);
+    assert!(rx.try_recv().is_err());
+    shutdown.store(true, Ordering::Relaxed);
+    worker.join().unwrap();
+    assert_eq!(
+        bookmark_record_id(&std::fs::read_to_string(&path).unwrap(), channel).unwrap(),
+        second
+    );
+
+    // A new worker reopens the on-disk bookmark and receives downtime events.
+    powershell("Write-EventLog -LogName RustinelEventLog429 -Source RustinelEventLog429 -EventId 429 -EntryType Information -Message downtime");
+    shutdown.store(false, Ordering::Relaxed);
+    let worker = EventLogSubscription::start(
+        source,
+        tx.clone(),
+        shutdown.clone(),
+        path.clone(),
+        Arc::clone(&log_health),
+    )
+    .unwrap();
+    let third = receive(&mut rx).source_seq.unwrap();
+    assert!(third > second);
+    shutdown.store(true, Ordering::Relaxed);
+    worker.join().unwrap();
+    let health = log_health
+        .snapshot()
+        .into_iter()
+        .find(|health| health.channel == channel)
+        .unwrap();
+    assert_eq!(health.delivered, 3);
+    assert_eq!(health.subscription_errors, 0);
+    assert_eq!(health.live_stale, 0);
+    assert_eq!(health.resume_failures, 0);
+    assert_eq!(health.retention_wraps, 0);
+
+    // Wrap this isolated channel while the subscriber is stopped.
+    powershell("1..600 | ForEach-Object { Write-EventLog -LogName RustinelEventLog429 -Source RustinelEventLog429 -EventId 430 -EntryType Information -Message ([guid]::NewGuid().ToString() * 64) }; Write-EventLog -LogName RustinelEventLog429 -Source RustinelEventLog429 -EventId 429 -EntryType Information -Message retained");
+    // Event Log metadata can lag Write-EventLog completion while buffers flush.
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    loop {
+        let oldest = oldest_record(channel).unwrap();
+        if retention_wrapped(third, oldest) {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "channel did not wrap: bookmark={third}, oldest={oldest}"
+        );
+        thread::sleep(Duration::from_millis(250));
+    }
+    shutdown.store(false, Ordering::Relaxed);
+    let worker =
+        EventLogSubscription::start(source, tx, shutdown.clone(), path, Arc::clone(&log_health))
+            .unwrap();
+    assert!(receive(&mut rx).source_seq.unwrap() > third);
+    shutdown.store(true, Ordering::Relaxed);
+    worker.join().unwrap();
+    let health = log_health
+        .snapshot()
+        .into_iter()
+        .find(|health| health.channel == channel)
+        .unwrap();
+    assert_eq!(health.retention_wraps, 1);
+    assert_eq!(health.resume_failures, 1);
+    assert_eq!(health.live_stale, 0);
+}
+
+/// Unregisters and re-registers a dedicated channel under a live subscription.
+/// Windows raises no 15007 for a classic log here, so this only guards that the
+/// source keeps delivering and never raises the shutdown flag.
+#[test]
+#[ignore = "requires an elevated Windows lab and creates a temporary Event Log channel"]
+fn native_channel_removal_does_not_shut_the_sensor_down() {
+    let channel = native_channel();
+    let create = "New-EventLog -LogName RustinelEventLog429 -Source RustinelEventLog429";
+    let write = "Write-EventLog -LogName RustinelEventLog429 -Source RustinelEventLog429 -EventId 429 -EntryType Information -Message x";
+    powershell(create);
+    struct Cleanup;
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            let _ = std::process::Command::new("powershell.exe")
+                .args([
+                    "-NoProfile",
+                    "-Command",
+                    &format!("Remove-EventLog -LogName {}", native_channel()),
+                ])
+                .status();
+        }
+    }
+    let _cleanup = Cleanup;
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("checkpoint.xml");
+    let source = EventLogSource::new(
+        "native-test",
+        channel,
+        "*[System[EventID=429]]",
+        decode_test_record,
+    );
+    let log_health = Arc::new(EventLogHealth::default());
+    let (tx, mut rx) = tokio::sync::mpsc::channel(100);
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let worker =
+        EventLogSubscription::start(source, tx, shutdown.clone(), path, Arc::clone(&log_health))
+            .unwrap();
+    let snapshot = || {
+        log_health
+            .snapshot()
+            .into_iter()
+            .find(|health| health.channel == channel)
+            .unwrap()
+    };
+    powershell(write);
+    let first = receive(&mut rx).source_seq.unwrap();
+
+    powershell("Remove-EventLog -LogName RustinelEventLog429");
+    thread::sleep(Duration::from_secs(3));
+    assert!(!shutdown.load(Ordering::Relaxed));
+
+    powershell(create);
+    powershell(write);
+    let second = receive(&mut rx).source_seq.unwrap();
+    assert!(second > first || second != 0);
+    assert!(snapshot().active);
+    assert!(!shutdown.load(Ordering::Relaxed));
+    shutdown.store(true, Ordering::Relaxed);
+    worker.join().unwrap();
+}
+
+const MISSING_CHANNEL: &str = "Rustinel-Test-Missing-Channel/Operational";
+
+fn missing_channel_source(query: &'static str) -> EventLogSource {
+    EventLogSource::new("missing-test", MISSING_CHANNEL, query, decode_test_record)
+}
+
+fn channel_health(health: &EventLogHealth, channel: &str) -> crate::telemetry::EventLogSnapshot {
+    health
+        .snapshot()
+        .into_iter()
+        .find(|health| health.channel == channel)
+        .unwrap()
+}
+
+/// 0x80073A9F at startup (CI run 38750169989) must not take the sensor down.
+#[test]
+fn missing_channel_at_startup_is_degraded_not_fatal() {
+    let temp = tempfile::tempdir().unwrap();
+    let log_health = Arc::new(EventLogHealth::default());
+    let (tx, _rx) = tokio::sync::mpsc::channel(1);
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let worker = EventLogSubscription::start(
+        missing_channel_source("*"),
+        tx,
+        shutdown.clone(),
+        temp.path().join("checkpoint.xml"),
+        Arc::clone(&log_health),
+    )
+    .expect("a missing channel is retried, not fatal");
+    let health = channel_health(&log_health, MISSING_CHANNEL);
+    assert!(!health.active);
+    assert!(health.subscription_errors >= 1);
+    assert!(health.last_error.is_some());
+    assert!(!shutdown.load(Ordering::Relaxed));
+    shutdown.store(true, Ordering::Relaxed);
+    worker.join().unwrap();
+}
+
+/// A query the channel rejects will never recover and still fails startup,
+/// naming the source and channel.
+#[test]
+fn invalid_query_at_startup_stays_fatal_and_names_the_source() {
+    let temp = tempfile::tempdir().unwrap();
+    let log_health = Arc::new(EventLogHealth::default());
+    let (tx, _rx) = tokio::sync::mpsc::channel(1);
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let result = EventLogSubscription::start(
+        EventLogSource::new(
+            "invalid-query-test",
+            "Application",
+            "*[[",
+            decode_test_record,
+        ),
+        tx,
+        shutdown,
+        temp.path().join("checkpoint.xml"),
+        log_health,
+    );
+    let message = format!(
+        "{:#}",
+        result.err().expect("invalid query must fail startup")
+    );
+    assert!(message.contains("invalid-query-test"), "{message}");
+    assert!(message.contains("Application"), "{message}");
+}

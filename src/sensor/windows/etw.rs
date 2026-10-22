@@ -1,0 +1,239 @@
+//! Windows ETW sensor lifecycle and public interface.
+//!
+//! ferrisetw owns the native callback boundary for manifest, classic-process,
+//! and file-rundown traces. Its guard catches unwinding panics in development
+//! and tests and exits with status 1. Release uses panic = "abort" and terminates
+//! before that guard can run. Both paths rely on a service manager to restart.
+
+mod classic;
+mod decode;
+mod file_rundown;
+#[cfg(test)]
+mod fixture_tests;
+mod parser;
+mod process;
+pub(crate) mod props;
+mod providers;
+mod routing;
+mod session;
+pub(crate) mod state;
+
+use super::event_log::EventLogSubscriptions;
+use crate::sensor::{RawEvent, Sensor};
+use anyhow::Result;
+use ferrisetw::trace::stop_trace_by_name;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use tokio::sync::mpsc::Sender;
+use tokio::sync::oneshot;
+use tracing::{info, warn};
+
+/// Fixed trace session name for stopping the trace on shutdown.
+pub(super) const TRACE_SESSION_NAME: &str = "rustinel-etw-trace";
+
+/// Session name for the dedicated `Microsoft-Windows-Kernel-Process` trace.
+///
+/// Process events are collected in their own session because they are the only
+/// ones with a *latency* requirement: `CommandLine` is not carried by any
+/// Kernel-Process event version, so it is read back out of the PEB in
+/// [`decode::decode_process`], and that read only succeeds while the process is still
+/// alive. `cmd /c echo` lives 10-30 ms. Every other provider needs the
+/// opposite - the wide buffer pool of [`session::session_properties`], which is what
+/// makes a buffer take a long time to fill and be handed over. One session
+/// cannot satisfy both; two can. See [`session::process_session_properties`] and
+/// [`super::flush`], which flushes this session four times as often.
+pub(super) const PROCESS_TRACE_SESSION_NAME: &str = "rustinel-etw-process";
+
+/// Everything the agent enables on its manifest sessions, for the provider
+/// watch to compare against the live sessions.
+pub(super) fn expected_providers() -> Vec<super::provider_watch::ExpectedProvider> {
+    let sessions = [
+        (TRACE_SESSION_NAME, providers::EtwProviders::main_session()),
+        (
+            PROCESS_TRACE_SESSION_NAME,
+            providers::EtwProviders::process_session(),
+        ),
+    ];
+    sessions
+        .into_iter()
+        .flat_map(|(session, providers)| {
+            providers
+                .into_iter()
+                .map(move |provider| super::provider_watch::ExpectedProvider {
+                    session,
+                    name: provider.name,
+                    guid: session::to_windows_guid(provider.guid),
+                    level: provider.level,
+                    keywords: provider.keywords,
+                    captured_data: provider.guid
+                        == ferrisetw::GUID::from(providers::EtwProviders::KERNEL_REGISTRY_GUID),
+                })
+        })
+        .collect()
+}
+
+/// Windows ETW sensor implementation.
+pub struct EtwSensor {
+    host: Arc<crate::state::HostState>,
+    shutdown: Arc<AtomicBool>,
+    event_log_directory: std::path::PathBuf,
+    loss_counters: Arc<super::loss::LossCounters>,
+    flush_interval_ms: u64,
+    process_flush_interval_ms: u64,
+    security_filtering_platform_connections: bool,
+    security_long_tail_events: bool,
+    security_domain_controller_events: bool,
+}
+
+impl EtwSensor {
+    pub fn new() -> Self {
+        Self::with_flush_intervals(
+            super::flush::DEFAULT_INTERVAL_MS,
+            super::flush::DEFAULT_PROCESS_INTERVAL_MS,
+        )
+    }
+
+    /// The two sessions are configured separately on purpose; see
+    /// [`super::flush::process_interval`].
+    pub fn with_flush_intervals(flush_interval_ms: u64, process_flush_interval_ms: u64) -> Self {
+        Self {
+            host: Arc::new(crate::state::HostState::default()),
+            shutdown: Arc::new(AtomicBool::new(false)),
+            event_log_directory: crate::config::InstallLayout::managed(
+                crate::config::InstallPlatform::Windows,
+            )
+            .logs_dir
+            .join("event-log"),
+            loss_counters: Arc::new(super::loss::LossCounters::new()),
+            flush_interval_ms,
+            process_flush_interval_ms,
+            security_filtering_platform_connections: false,
+            security_long_tail_events: false,
+            security_domain_controller_events: false,
+        }
+    }
+
+    pub fn with_host_state(mut self, host: Arc<crate::state::HostState>) -> Self {
+        self.host = host;
+        self
+    }
+
+    pub fn with_event_log_directory(mut self, directory: std::path::PathBuf) -> Self {
+        self.event_log_directory = directory;
+        self
+    }
+
+    /// See `windows.security_filtering_platform_connections`.
+    pub fn with_security_filtering_platform_connections(mut self, enabled: bool) -> Self {
+        self.security_filtering_platform_connections = enabled;
+        self
+    }
+
+    /// See `windows.security_long_tail_events`.
+    pub fn with_security_long_tail_events(mut self, enabled: bool) -> Self {
+        self.security_long_tail_events = enabled;
+        self
+    }
+
+    /// See `windows.security_domain_controller_events`.
+    pub fn with_security_domain_controller_events(mut self, enabled: bool) -> Self {
+        self.security_domain_controller_events = enabled;
+        self
+    }
+
+    pub fn is_shutdown(&self) -> bool {
+        self.shutdown.load(Ordering::Relaxed)
+    }
+
+    /// Cumulative kernel-buffer loss across all ETW sessions.
+    pub fn events_lost(&self) -> u64 {
+        self.loss_counters.total()
+    }
+
+    /// Start ETW and report when every required collector can admit events.
+    ///
+    /// Unlike [`Sensor::start`], which blocks until shutdown, this gives a
+    /// foreground caller an explicit startup boundary. The result is sent only
+    /// after both ETW sessions, their consumers, and the Event Log
+    /// subscriptions have started. Startup failures are sent through the same
+    /// channel before this method returns them.
+    pub fn start_with_readiness(
+        &self,
+        tx: Sender<RawEvent>,
+        readiness: oneshot::Sender<std::result::Result<(), String>>,
+    ) -> Result<()> {
+        self.start_inner(tx, Some(readiness))
+    }
+
+    fn start_inner(
+        &self,
+        tx: Sender<RawEvent>,
+        mut readiness: Option<oneshot::Sender<std::result::Result<(), String>>>,
+    ) -> Result<()> {
+        info!("Starting ETW sensor...");
+
+        self.shutdown.store(false, Ordering::Relaxed);
+        self.loss_counters.reset();
+        let result = (|| {
+            let event_logs = EventLogSubscriptions::start(
+                tx.clone(),
+                Arc::clone(&self.shutdown),
+                &self.event_log_directory,
+                self.security_filtering_platform_connections,
+                self.security_long_tail_events,
+                self.security_domain_controller_events,
+                Arc::clone(
+                    &self
+                        .host
+                        .extension::<crate::sensor::windows::WindowsHostExtension>()
+                        .counters
+                        .event_log,
+                ),
+            )?;
+
+            // A session left running by a previous process keeps its old buffer
+            // sizing and its old providers, and `start` would then bind to it.
+            let _ = stop_trace_by_name(TRACE_SESSION_NAME);
+            let _ = stop_trace_by_name(PROCESS_TRACE_SESSION_NAME);
+
+            let trace_result = self.run_sessions(&tx, &mut readiness);
+
+            self.shutdown.store(true, Ordering::Relaxed);
+            event_logs.join().and(trace_result)
+        })();
+
+        if let (Err(err), Some(readiness)) = (&result, readiness.take()) {
+            let _ = readiness.send(Err(format!("{err:#}")));
+        }
+        result
+    }
+}
+
+impl Default for EtwSensor {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Sensor for EtwSensor {
+    fn start(&self, tx: Sender<RawEvent>) -> Result<()> {
+        self.start_inner(tx, None)
+    }
+
+    fn shutdown(&self) {
+        info!("Initiating graceful shutdown of ETW sensor...");
+        self.shutdown.store(true, Ordering::Relaxed);
+
+        for session in [TRACE_SESSION_NAME, PROCESS_TRACE_SESSION_NAME] {
+            info!("Stopping ETW trace session '{session}'...");
+            let kind = if session == TRACE_SESSION_NAME {
+                super::loss::Session::Main
+            } else {
+                super::loss::Session::Process
+            };
+            if let Err(err) = super::loss::stop_and_record(session, kind, &self.loss_counters) {
+                warn!("Failed to stop trace session '{session}': {err:?}");
+            }
+        }
+    }
+}
