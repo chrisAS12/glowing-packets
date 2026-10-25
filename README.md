@@ -13,14 +13,16 @@
 
 ## Why `glowing-packets` Exists (And How It Works Alongside Your Built-In OS Antivirus)
 
-Most people avoid third-party commercial antiviruses because they duplicate your operating system's built-in file scanner (causing high CPU/disk lag), nag you with upsells, and ship telemetry to vendor clouds. Meanwhile, packet capture tools like Wireshark show millions of raw packets without telling you *which process* sent them or *whether a domain is malicious*.
+Most people avoid third-party commercial antiviruses because they duplicate your operating system's built-in file scanner (causing high CPU/disk lag), nag you with upsells, and ship telemetry to vendor clouds.
+Meanwhile, packet capture tools like Wireshark show millions of raw packets without telling you *which process* sent them or *whether a domain is malicious*.
 
 **`glowing-packets` is designed as a lightweight, zero-outbound bonus layer that fills the exact blind spots of built-in OS defenses:**
 
 1. **Zero Redundant Disk Bloat**: When your built-in OS real-time protection is active (Windows Defender `WdFilter.sys` or macOS `XProtect`), `glowing-packets` disables continuous file-write scanning so your disk I/O stays at near-0% idle load—only enabling fallback disk scanning if `--setup` detects your OS lacks active protection.
 2. **Real-Time Wire & Process Attribution (`companion/packetsentinel/`)**: Watches outbound **DNS queries**, **TLS `ClientHello` SNI hostnames**, and **active sockets**, correlating every connection to the exact local executable (`.exe`/binary & PID) and checking 95,000+ community GitHub threat indicators in `< 1 microsecond`.
 3. **Behavioral Micro-EDR (`src/`)**: Uses native OS kernel telemetry (**ETW** on Windows, **eBPF** on Linux, **Endpoint Security** on macOS) to evaluate **Sigma** behavioral rules, **YARA** process/memory signatures, and **IOC** lists locally.
-4. **3-Layer Zero-Outbound Egress Airlock**: During live monitoring and MCP execution, outbound traffic is blocked in layers: no webhook/telemetry code paths, a CPython **PEP 578 `sys.addaudithook`** tripwire that rejects socket/HTTP/`ctypes` calls from Python code, and an OS-level rule (`netsh` / `sandbox-exec` / `systemd-run`) that enforces the block outside the process. The OS rule is the real boundary: Python's own docs state audit hooks are not a sandbox.
+4. **3-Layer Zero-Outbound Egress Airlock**: During live monitoring and MCP execution, outbound traffic is blocked in layers: no webhook/telemetry code paths, a CPython **PEP 578 `sys.addaudithook`** tripwire that rejects socket/HTTP/`ctypes` calls from Python code, and an OS-level rule (`netsh` / `sandbox-exec` / `systemd-run`) that enforces the block outside the process.
+   The OS rule is the real boundary: Python's own docs state audit hooks are not a sandbox.
 5. **5-Gate Pre-Model Privacy & DLP MCP Server (`--mcp`)**: Connect your AI coding assistants (Antigravity, Claude Desktop, Cursor, Windsurf) to inspect security alerts or read project files while blocking images/PDFs/binaries/`.env` files and scrubbing OS usernames, hostnames, credit cards (Luhn), IBANs (ISO-7064), emails, API keys, and labeled or configured personal names **before** data enters the AI model's context window.
 
 ---
@@ -149,9 +151,13 @@ If you are exploring this codebase to learn cybersecurity and systems engineerin
 
 The root Rust engine is powered by [Karib0u/rustinel](https://github.com/Karib0u/rustinel) (Apache 2.0):
 
-- **Use Sigma and YARA rules.** Sigma for behavior, YARA for executables and process memory, and IOC lists for hashes, IPs, domains, and paths.
-- **Run on Windows, Linux, and macOS.** One engine, one config format, and the same Sysmon-style ECS field names everywhere.
-- **Keep your data.** The agent sends nothing home. Alerts are local ECS NDJSON files (`logs/alerts.json`).
+- **Use Sigma and YARA rules.**
+  Sigma for behavior, YARA for executables and process memory, and IOC lists for hashes, IPs, domains, and paths.
+- **Run on Windows, Linux, and macOS.**
+  One engine, one config format, and the same Sysmon-style ECS field names everywhere.
+- **Keep your data.**
+  The agent sends nothing home.
+  Alerts are local ECS NDJSON files (`logs/alerts.json`).
 - **Capture once, replay as your rules improve:**
   ```bash
   ./rustinel replay session.ndjson --config config.toml
