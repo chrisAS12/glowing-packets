@@ -116,7 +116,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--ui",
         "--desktop-ui",
         action="store_true",
-        dest="voice_ui",
+        dest="desktop_ui",
         help="Launch the native, 100% offline desktop window with Pre-Model Privacy Scrubber, Wire Monitor, and Process Watchdog.",
     )
     return parser
@@ -273,7 +273,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                 print(f"    - PID {c.child_pid}: {c.child_name} {tag} (cmd: {c.cmdline[:80]})")
         return 0
 
-    if args.voice_ui:
+    if args.desktop_ui:
         print_status_report(config, monitor, feed_stats)
         from .desktop_ui import launch_desktop_app
 
