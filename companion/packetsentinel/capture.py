@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import List, Optional, Set, Tuple
 
 from .config import VERIFIED_TSHARK_PATHS, AppConfig
+from .lots_guard import check_lots_risk
 from .notifier import AlertNotifier
 from .process_mapper import UNKNOWN_PROCESS, ProcessInfo, ProcessMapper
 from .security import (
@@ -26,7 +27,7 @@ from .security import (
     sanitize_display_text,
     validate_ip_address,
 )
-from .threat_intel import ThreatIntelEngine
+from .threat_intel import ThreatIntelEngine, ThreatMatch
 
 logger = logging.getLogger("packetsentinel.capture")
 
@@ -271,12 +272,12 @@ class PacketSentinelMonitor:
                     self._dns_queries_seen += 1
 
                 match = self._threat_engine.check_domain(clean_dom)
+                proc = explicit_process or self._process_mapper.lookup(
+                    protocol="tcp" if "TCP" in protocol.upper() or "TLS" in protocol.upper() else "udp",
+                    local_port=src_port,
+                    remote_ip=dst_ip,
+                )
                 if match:
-                    proc = explicit_process or self._process_mapper.lookup(
-                        protocol="tcp" if "TCP" in protocol.upper() or "TLS" in protocol.upper() else "udp",
-                        local_port=src_port,
-                        remote_ip=dst_ip,
-                    )
                     self._notifier.notify_match(
                         match=match,
                         process=proc,
@@ -284,6 +285,24 @@ class PacketSentinelMonitor:
                         dst_ip=dst_ip or "",
                         dst_port=dst_port,
                         detection_layer=detection_layer,
+                    )
+                    return
+
+                lots_risk = check_lots_risk(proc.name, clean_dom, port=dst_port or 443)
+                if lots_risk and lots_risk.is_threat:
+                    lots_match = ThreatMatch(
+                        indicator=clean_dom,
+                        matched_rule=lots_risk.matched_domain or clean_dom,
+                        source_feed=f"LOTS-Exfil-Guard ({lots_risk.category.upper()})",
+                        match_type=f"lots_{lots_risk.severity.lower()}",
+                    )
+                    self._notifier.notify_match(
+                        match=lots_match,
+                        process=proc,
+                        protocol=protocol,
+                        dst_ip=dst_ip or "",
+                        dst_port=dst_port,
+                        detection_layer="lots-wire",
                     )
                     return
 
