@@ -253,7 +253,15 @@ _LABELED_FINANCIAL_RE = re.compile(
 )
 _US_SSN_RE = re.compile(r"\b(?!000|666|9\d\d)\d{3}-(?!00)\d{2}-(?!0000)\d{4}\b")
 _NATIONAL_ID_CODE_RE = re.compile(
-    r"\b(?:\d{6}[-+A]\d{3,5}[0-9A-Z]?|\d{6}-\d{5})\b"
+    r"\b(?:"
+    r"[A-CEGHJ-PR-TW-Z]{2}[0-9]{6}[A-D]"  # UK NINO
+    r"|[123478][0-9]{2}(?:0[1-9]|1[0-2])(?:[0-9]{2}|2[AB])[0-9]{6}[0-9]{2}"  # French NIR
+    r"|(?:[XYZ]?[0-9]{7,8}[A-Z])"  # Spanish DNI/NIE
+    r"|[A-Z]{6}[0-9]{2}[A-EHLMPR-TVZ][0-9]{2}[A-Z][0-9]{3}[A-Z]"  # Italian Codice Fiscale
+    r"|[0-9]{2}(?:0[1-9]|1[0-2]|2[1-2]|3[1-2]|4[1-2]|5[1-2]|6[1-2]|7[1-2]|8[1-2]|9[1-2])(?:0[1-9]|[1-2][0-9]|3[0-1])[0-9]{5}"  # Polish PESEL
+    r"|[0-9]{6}[-+A][0-9]{3}[0-9A-Z]"  # Finnish/Nordic Personal Identity Code
+    r"|[0-9]{6}-[0-9]{5}"  # Baltic Personal Code
+    r")\b"
 )
 _LABELED_PERSONAL_CODE_RE = re.compile(
     r"""(?i)\b(personal[ _-]?code|id[ _-]?code|identity[ _-]?code|citizen[ _-]?code|national[ _-]?id|tax[ _-]?code|tin|pesel|henkilötunnus|isikukood|asmens[ _-]?kodas|pin[ _-]?code|security[ _-]?code|verification[ _-]?code|backup[ _-]?code)(['"]?\s*[:=#]\s*['"]?)([A-Za-z0-9_-]{4,24})"""

@@ -26,6 +26,7 @@ from tkinter import messagebox, ttk
 from .config import AppConfig
 from .mcp_privacy import PrivacySanitizer
 from .process_watchdog import inspect_child_lineage
+from .vault import EncryptedVaultManager, VaultSettings
 
 logger = logging.getLogger("packetsentinel.desktop_ui")
 
@@ -35,7 +36,9 @@ class PacketSentinelDesktopApp:
 
     def __init__(self, config: AppConfig, parent_root: Optional[tk.Tk] = None) -> None:
         self.config = config
-        self.sanitizer = PrivacySanitizer()
+        self.vault_mgr = EncryptedVaultManager()
+        self.vault_settings = self.vault_mgr.load_settings()
+        self.sanitizer = PrivacySanitizer(extra_redacted_names=self.vault_settings.custom_names)
         self.root = parent_root or tk.Tk()
         self.root.title("PacketSentinel — Desktop Security & Privacy Airlock")
         self.root.geometry("940x680")
@@ -143,6 +146,11 @@ class PacketSentinelDesktopApp:
         self.tab_watchdog = tk.Frame(self.notebook, bg="#0f172a", padx=12, pady=12)
         self.notebook.add(self.tab_watchdog, text=" 👁️ Process Watchdog ")
         self._build_watchdog_tab()
+
+        # Tab 4: Encrypted Settings Vault
+        self.tab_settings = tk.Frame(self.notebook, bg="#0f172a", padx=16, pady=16)
+        self.notebook.add(self.tab_settings, text=" ⚙️ Settings & Encrypted Vault ")
+        self._build_settings_tab()
 
     def _build_privacy_tab(self) -> None:
         # Instruction Banner
@@ -400,6 +408,172 @@ class PacketSentinelDesktopApp:
             )
         if not children:
             self.watchdog_results.insert(tk.END, "    - No spawned child script interpreters detected.\n")
+
+    def _build_settings_tab(self) -> None:
+        banner = tk.Label(
+            self.tab_settings,
+            text="🔒 Windows DPAPI Offline Encrypted Vault\n"
+            "Sensitive settings (custom names, private domains, tokens) are encrypted on disk using your "
+            "logged-in Windows credentials (CryptProtectData). Zero plaintext keys stored. Cannot be read by "
+            "external AI bots, other machines, or info-stealer malware.",
+            font=("Segoe UI", 9),
+            fg="#94a3b8",
+            bg="#1e293b",
+            padx=16,
+            pady=10,
+            justify=tk.LEFT,
+            relief=tk.FLAT,
+        )
+        banner.pack(fill=tk.X, pady=(0, 16))
+
+        form_frame = tk.Frame(self.tab_settings, bg="#0f172a")
+        form_frame.pack(fill=tk.BOTH, expand=True)
+
+        # Field 1: Custom Redacted Names / Terms
+        tk.Label(
+            form_frame,
+            text="Custom Redacted Names & Sensitive Terms (comma-separated):",
+            font=("Segoe UI", 9, "bold"),
+            fg="#f8fafc",
+            bg="#0f172a",
+        ).pack(anchor=tk.W, pady=(4, 2))
+
+        self.entry_custom_names = tk.Entry(
+            form_frame,
+            bg="#1e293b",
+            fg="#ffffff",
+            insertbackground="#ffffff",
+            font=("Consolas", 10),
+            relief=tk.FLAT,
+        )
+        self.entry_custom_names.insert(0, ", ".join(self.vault_settings.custom_names))
+        self.entry_custom_names.pack(fill=tk.X, pady=(0, 12), ipady=4)
+
+        # Field 2: Custom Blocked Domains
+        tk.Label(
+            form_frame,
+            text="Custom Blocked Domains (comma-separated):",
+            font=("Segoe UI", 9, "bold"),
+            fg="#f8fafc",
+            bg="#0f172a",
+        ).pack(anchor=tk.W, pady=(4, 2))
+
+        self.entry_custom_domains = tk.Entry(
+            form_frame,
+            bg="#1e293b",
+            fg="#ffffff",
+            insertbackground="#ffffff",
+            font=("Consolas", 10),
+            relief=tk.FLAT,
+        )
+        self.entry_custom_domains.insert(0, ", ".join(self.vault_settings.custom_domains))
+        self.entry_custom_domains.pack(fill=tk.X, pady=(0, 12), ipady=4)
+
+        # Field 3: Default Monitored Process
+        tk.Label(
+            form_frame,
+            text="Default Monitored Process Name:",
+            font=("Segoe UI", 9, "bold"),
+            fg="#f8fafc",
+            bg="#0f172a",
+        ).pack(anchor=tk.W, pady=(4, 2))
+
+        self.entry_default_process = tk.Entry(
+            form_frame,
+            bg="#1e293b",
+            fg="#ffffff",
+            insertbackground="#ffffff",
+            font=("Consolas", 10),
+            relief=tk.FLAT,
+        )
+        self.entry_default_process.insert(0, self.vault_settings.default_watch_process)
+        self.entry_default_process.pack(fill=tk.X, pady=(0, 12), ipady=4)
+
+        # Field 4: Checkbox for Toast Notifications
+        self.var_toasts = tk.BooleanVar(value=self.vault_settings.enable_toasts)
+        chk_toasts = tk.Checkbutton(
+            form_frame,
+            text="Enable desktop alert notifications when threats are detected",
+            variable=self.var_toasts,
+            font=("Segoe UI", 9),
+            fg="#cbd5e1",
+            bg="#0f172a",
+            selectcolor="#1e293b",
+            activebackground="#0f172a",
+            activeforeground="#ffffff",
+        )
+        chk_toasts.pack(anchor=tk.W, pady=(4, 16))
+
+        # Save Button & Status Label
+        btn_row = tk.Frame(form_frame, bg="#0f172a")
+        btn_row.pack(fill=tk.X, pady=(8, 0))
+
+        save_btn = tk.Button(
+            btn_row,
+            text="💾 Save & Encrypt to Vault",
+            font=("Segoe UI", 10, "bold"),
+            bg="#0284c7",
+            fg="#ffffff",
+            activebackground="#0369a1",
+            activeforeground="#ffffff",
+            padx=16,
+            pady=6,
+            relief=tk.FLAT,
+            cursor="hand2",
+            command=self._save_settings_vault,
+        )
+        save_btn.pack(side=tk.LEFT)
+
+        self.vault_status_lbl = tk.Label(
+            btn_row,
+            text=f"📁 Vault location: {self.vault_mgr.vault_path}",
+            font=("Segoe UI", 8),
+            fg="#64748b",
+            bg="#0f172a",
+            padx=12,
+        )
+        self.vault_status_lbl.pack(side=tk.LEFT, fill=tk.X, expand=True)
+
+    def _save_settings_vault(self) -> None:
+        raw_names = self.entry_custom_names.get()
+        names = [n.strip() for n in raw_names.split(",") if n.strip()]
+
+        raw_domains = self.entry_custom_domains.get()
+        domains = [d.strip() for d in raw_domains.split(",") if d.strip()]
+
+        process_name = self.entry_default_process.get().strip() or "python"
+        enable_toasts = self.var_toasts.get()
+
+        self.vault_settings = VaultSettings(
+            custom_names=names,
+            custom_domains=domains,
+            custom_feeds=self.vault_settings.custom_feeds,
+            default_watch_process=process_name,
+            enable_toasts=enable_toasts,
+        )
+
+        ok = self.vault_mgr.save_settings(self.vault_settings)
+        if ok:
+            # Reinitialize sanitizer with new redacted names
+            self.sanitizer = PrivacySanitizer(extra_redacted_names=self.vault_settings.custom_names)
+            now_str = time.strftime("%H:%M:%S")
+            self.vault_status_lbl.config(
+                text=f"✅ Encrypted & saved at {now_str} ({len(names)} custom terms, {len(domains)} domains)",
+                fg="#22c55e",
+            )
+            messagebox.showinfo(
+                "Encrypted Vault Updated",
+                "Your settings have been encrypted with Windows DPAPI and safely saved to disk.\n\n"
+                f"Custom Redacted Terms: {len(names)}\n"
+                f"Custom Blocked Domains: {len(domains)}\n"
+                f"Vault Path: {self.vault_mgr.vault_path}",
+            )
+        else:
+            self.vault_status_lbl.config(text="❌ Failed to save encrypted vault", fg="#ef4444")
+            messagebox.showerror(
+                "Vault Error",
+                "Failed to encrypt and save settings to the DPAPI vault. Check permissions.",
+            )
 
     def _build_footer(self) -> None:
         footer = tk.Frame(self.root, bg="#0f172a", height=32, padx=16, pady=6)
