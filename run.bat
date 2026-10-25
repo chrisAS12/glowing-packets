@@ -65,7 +65,7 @@ set "PYTHONPATH=%~dp0companion;%PYTHONPATH%"
 
 :: If arguments provided (e.g. run.bat --ui), execute directly
 if not "%~1"=="" (
-    "%PYTHON_EXE%" "%~dp0packetsentinel.py" %*
+    "%PYTHON_EXE%" "%~dp0companion\run_packetsentinel.py" %*
     goto :eof
 )
 
@@ -98,21 +98,21 @@ goto menu
 :launch_ui
 echo.
 echo [*] Launching Native Desktop Security ^& Privacy Airlock...
-"%PYTHON_EXE%" "%~dp0packetsentinel.py" --ui
+"%PYTHON_EXE%" "%~dp0companion\run_packetsentinel.py" --ui
 pause
 goto menu
 
 :launch_monitor
 echo.
 echo [*] Starting live packet capture...
-"%PYTHON_EXE%" "%~dp0packetsentinel.py"
+"%PYTHON_EXE%" "%~dp0companion\run_packetsentinel.py"
 pause
 goto menu
 
 :launch_watchdog
 echo.
 set /p proc="Enter process name or PID to watch (e.g. python or 1234): "
-"%PYTHON_EXE%" "%~dp0packetsentinel.py" --watch-process "%proc%"
+"%PYTHON_EXE%" "%~dp0companion\run_packetsentinel.py" --watch-process "%proc%"
 pause
 goto menu
 

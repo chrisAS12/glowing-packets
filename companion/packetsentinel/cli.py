@@ -117,7 +117,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--desktop-ui",
         action="store_true",
         dest="desktop_ui",
-        help="Launch the native, 100% offline desktop window with Pre-Model Privacy Scrubber, Wire Monitor, and Process Watchdog.",
+        help="Launch the native offline desktop window with Pre-Model Privacy Scrubber, Wire Monitor, and Process Watchdog.",
     )
     return parser
 
