@@ -74,6 +74,8 @@ You will immediately receive a Windows Toast Notification and console alert!
 | `python run_packetsentinel.py --add-domain <domain_or_ip>` | Add a sketchy domain/IP to your local custom blocklist |
 | `python run_packetsentinel.py --add-feed <https_url>` | Add a custom GitHub raw blocklist URL to `config.json` |
 | `python run_packetsentinel.py --test-alert` | Trigger a safe simulated alert notification |
+| `python run_packetsentinel.py --mcp` | Start the Read-Only, 5-Gate Pre-Model Privacy & DLP MCP Server over stdio |
+| `python run_packetsentinel.py --mcp --mcp-workspace <dir>` | Start the MCP server jailed to `<dir>` for safe AI file & alert inspection |
 
 ---
 
@@ -90,4 +92,4 @@ python build_bundle.py
 
 ## License
 
-Released under the [MIT License](LICENSE). See [SECURITY.md](SECURITY.md) for our threat model and security policy.
+Released under the [Apache 2.0 License](LICENSE). See [SECURITY.md](SECURITY.md) for our threat model and security policy.

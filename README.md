@@ -1,119 +1,165 @@
 <p align="center">
-  <img src="docs/images/logo-rustinel.png" alt="Rustinel" width="240">
+  <img src="docs/images/logo-rustinel.png" alt="Glowing Packets / Rustinel" width="240">
 </p>
 
-<h1 align="center">Rustinel</h1>
+<h1 align="center">Glowing Packets (<code>Rustinel</code> + <code>PacketSentinel</code>)</h1>
 
 <p align="center">
-  <b>Open-source endpoint detection. Three platforms. Your rules.</b><br>
-  Run Sigma, YARA, and IOC detections on native Windows, Linux, and macOS telemetry.<br>
-  Written in Rust, with local alerts and no cloud account required.
+  <b>Zero-Outbound, Zero-Monetization Bonus Defense Layer, Personal Micro-EDR & Pre-Model AI Privacy MCP Server.</b><br>
+  Combines native multi-platform endpoint telemetry (<b>Rustinel</b> on Windows, Linux, and macOS) with real-time sketchy DNS/TLS SNI wire inspection and a 5-Gate Pre-Model Data Loss Prevention (DLP) MCP Server (<b>PacketSentinel</b>).
 </p>
 
-<p align="center">
-  <a href="https://github.com/Karib0u/rustinel/actions/workflows/ci.yml"><img src="https://github.com/Karib0u/rustinel/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
-  <a href="https://github.com/Karib0u/rustinel/releases/latest"><img src="https://img.shields.io/github/v/release/Karib0u/rustinel?style=flat-square&color=ff8a3d" alt="Latest release"></a>
-  <a href="https://github.com/Karib0u/rustinel/releases"><img src="https://img.shields.io/github/downloads/Karib0u/rustinel/total?style=flat-square&color=ff8a3d" alt="Downloads"></a>
-  <a href="LICENSE"><img src="https://img.shields.io/badge/license-Apache%202.0-ff8a3d?style=flat-square" alt="Apache 2.0 license"></a>
-</p>
+---
 
-<p align="center">
-  <a href="https://github.com/Karib0u/rustinel/releases/latest">Download</a> |
-  <a href="https://docs.rustinel.io/">Documentation</a> |
-  <a href="https://github.com/Karib0u/rustinel-rules">Detection packs</a> |
-  <a href="https://rustinel.io/">Website</a>
-</p>
+## Why `glowing-packets` Exists (And How It Works Alongside Your Built-In OS Antivirus)
 
-<p align="center">
-  <img src="docs/images/demo.gif" alt="Rustinel demo" width="860">
-</p>
+Most people avoid third-party commercial antiviruses because they duplicate your operating system's built-in file scanner (causing high CPU/disk lag), nag you with upsells, and ship telemetry to vendor clouds. Meanwhile, packet capture tools like Wireshark show millions of raw packets without telling you *which process* sent them or *whether a domain is malicious*.
 
-## Why Rustinel?
+**`glowing-packets` is designed as a lightweight, zero-outbound bonus layer that fills the exact blind spots of built-in OS defenses:**
 
-- **Use Sigma and YARA rules.**
-  Sigma for behavior, YARA for executables and process memory, and IOC lists for hashes, IPs, domains, and paths.
-- **Run on Windows, Linux, and macOS.**
-  One engine, one config format, and the same Sysmon-style field names everywhere.
-  Coverage varies by platform.
-- **Keep your data.**
-  The agent sends nothing home.
-  Alerts are local ECS NDJSON files that Elastic, Splunk, or any log pipeline can ingest.
-- **Test rules against recorded behavior.**
-  Capture activity once, then replay it on any machine as your rules change.
-- **See the gaps.**
-  `rustinel sigma doctor` explains which rules can fire, while `rustinel doctor` reports runtime health and events dropped under load.
+1. **Zero Redundant Disk Bloat**: When your built-in OS real-time protection is active (Windows Defender `WdFilter.sys` or macOS `XProtect`), `glowing-packets` disables continuous file-write scanning so your disk I/O stays at near-0% idle load—only enabling fallback disk scanning if `--setup` detects your OS lacks active protection.
+2. **Real-Time Wire & Process Attribution (`companion/packetsentinel/`)**: Watches outbound **DNS queries**, **TLS `ClientHello` SNI hostnames**, and **active sockets**, correlating every connection to the exact local executable (`.exe`/binary & PID) and checking 95,000+ community GitHub threat indicators in `< 1 microsecond`.
+3. **Behavioral Micro-EDR (`src/`)**: Uses native OS kernel telemetry (**ETW** on Windows, **eBPF** on Linux, **Endpoint Security** on macOS) to evaluate **Sigma** behavioral rules, **YARA** process/memory signatures, and **IOC** lists locally.
+4. **3-Layer Zero-Outbound Egress Airlock**: During live monitoring and MCP execution, outbound traffic is blocked in layers: no webhook/telemetry code paths, a CPython **PEP 578 `sys.addaudithook`** tripwire that rejects socket/HTTP/`ctypes` calls from Python code, and an OS-level rule (`netsh` / `sandbox-exec` / `systemd-run`) that enforces the block outside the process. The OS rule is the real boundary: Python's own docs state audit hooks are not a sandbox.
+5. **5-Gate Pre-Model Privacy & DLP MCP Server (`--mcp`)**: Connect your AI coding assistants (Antigravity, Claude Desktop, Cursor, Windsurf) to inspect security alerts or read project files while blocking images/PDFs/binaries/`.env` files and scrubbing OS usernames, hostnames, credit cards (Luhn), IBANs (ISO-7064), emails, API keys, and labeled or configured personal names **before** data enters the AI model's context window.
 
-## Quickstart
+---
 
-Install into a local `rustinel` folder, then start it.
+## Architecture Overview: How `Rustinel` + `PacketSentinel` + `MCP` Fit Together
 
-**Linux** (kernel 5.8+):
-
-```bash
-curl -fsSL https://rustinel.io/install.sh | sh
-cd rustinel && sudo ./rustinel run
+```
++-----------------------------------------------------------------------------------+
+|                        YOUR COMPUTER (Windows / macOS / Linux)                    |
+|                                                                                   |
+|  +-----------------------------------+   +-------------------------------------+  |
+|  | 1. Rustinel Micro-EDR Engine (Rust)|   | 2. PacketSentinel Companion (Python)|  |
+|  | - Windows ETW / Event Log         |   | - Wireshark tshark / Npcap Wire Tap |  |
+|  | - Linux eBPF / macOS EndpointSec  |   | - Plaintext DNS QNAME & TLS SNI     |  |
+|  | - Sigma Behavioral Rules          |   | - 95,000+ GitHub Threat Indicators  |  |
+|  | - Process & Memory YARA           |   | - PID -> Process Attribution        |  |
+|  +-----------------+-----------------+   +------------------+------------------+  |
+|                    |                                        |                     |
+|                    v                                        v                     |
+|             logs/alerts.json                         logs/alerts.jsonl            |
+|                    \                                       /                      |
+|                     v                                     v                       |
+|  +-----------------------------------------------------------------------------+  |
+|  |      3. Pre-Model Privacy & DLP MCP Airlock (`packetsentinel --mcp`)        |  |
+|  |  [Gate 1] Blocks Images (.png/.jpg/.svg), PDFs, Office Docs, DBs, .env      |  |
+|  |  [Gate 2] Scrubs Banking Info: Luhn Payment Cards, ISO-7064 IBANs, SSNs     |  |
+|  |  [Gate 3] Scrubs Personal Names, OS Usernames, Hostnames, Paths, LAN IPs    |  |
+|  |  [Gate 4] Scrubs API Keys, GitHub PATs, Private Keys, JWTs, Passwords       |  |
+|  |  [Gate 5] Strict ECS Alert Allowlist + <untrusted_network_data> Spotlighting|  |
+|  +--------------------------------------+--------------------------------------+  |
+|                                         | (Stdio JSON-RPC 2.0 — 0 Outbound Net)   |
++-----------------------------------------|-----------------------------------------+
+                                          v
+                           AI Coding Assistant / Agent
+                    (Receives Sanitized Text & Alerts Only)
 ```
 
-**Windows**, in an elevated PowerShell:
+---
+
+## Quick Start: Companion Monitor & Pre-Model Privacy MCP Server (`companion/`)
 
 ```powershell
-irm https://rustinel.io/install.ps1 | iex
-Set-Location rustinel; .\rustinel.exe run
+# 1. Install the single audited Python dependency (psutil)
+pip install -r companion/requirements.txt
+
+# 2. Run the interactive setup, OS defense check, & self-test wizard
+python companion/run_packetsentinel.py --setup
+
+# 3. Start live packet & sketchy DNS monitoring (Zero-Outbound Airlock active)
+python companion/run_packetsentinel.py
+
+# 4. Run the Pre-Model Privacy & DLP MCP Server over stdio
+python companion/run_packetsentinel.py --mcp --mcp-workspace .
 ```
 
-**macOS** (experimental) needs Full Disk Access first, see [macOS permissions](https://docs.rustinel.io/macos-permissions/):
+### Connecting Your AI Agent to the Privacy MCP Server
 
-```bash
-curl -fsSL https://rustinel.io/install.sh | sh
-cd rustinel && sudo ./rustinel run
+Add the following to your AI client's MCP configuration (e.g., Claude Desktop, Cursor, or Antigravity):
+
+```json
+{
+  "mcpServers": {
+    "packetsentinel-privacy": {
+      "command": "python",
+      "args": [
+        "companion/run_packetsentinel.py",
+        "--mcp",
+        "--mcp-workspace",
+        "."
+      ],
+      "env": {
+        "PACKETSENTINEL_REDACT_NAMES": "Your Full Name,Your Nickname"
+      }
+    }
+  }
+}
 ```
 
-Run `whoami` in another terminal.
-The demo rule fires and the alert lands in `rustinel/logs/alerts.json.<date>`.
+#### Available Read-Only MCP Tools
+| Tool Name | What It Does | Privacy Guarantees |
+| :--- | :--- | :--- |
+| `get_sanitized_security_alerts` | Reads recent alerts from both `PacketSentinel` (`alerts.jsonl`) and `Rustinel` (`alerts.json`). | Strips 16 sensitive ECS fields (`user.*`, `host.*`, `process.command_line`, `file.path`), converts CLI flags to boolean risk indicators, and wraps network domains in `<untrusted_network_data>`. |
+| `check_indicator_reputation` | Checks a domain or public IP against 95,000+ offline cached threat indicators. | Runs 100% offline in O(1) memory with PEP 578 network lockdown engaged. |
+| `get_sanitized_system_diagnostics` | Reports loaded feed counts, platform, and active DLP gates. | Exposes zero hostnames, usernames, or filesystem paths. |
+| `read_sanitized_project_text` | Reads lines from a workspace file so your AI can help you code safely. | Blocks images, PDFs, Office docs, databases, and `.env`/`.secrets` (by filename and magic-byte header), and scrubs names, credit cards, IBANs, emails, and tokens **before** returning text to the AI. |
 
-To install it as a service with a real rules pack, stop it with Ctrl-C and run `sudo ./rustinel setup --yes` from the `rustinel` folder (`.\rustinel.exe setup --yes` on Windows).
-See [Deploy on an endpoint](https://docs.rustinel.io/operations/).
+---
 
-## Capture once, replay as your rules improve
+## Plain-English Cybersecurity & Architecture Glossary
 
-```bash
-sudo ./rustinel capture --output ~/captures/session.ndjson   # Ctrl-C when done
-sudo chown -R "$USER" ~/captures
-./rustinel replay ~/captures/session.ndjson
-./rustinel replay ~/captures/session.ndjson --config candidate.toml
-```
+If you are exploring this codebase to learn cybersecurity and systems engineering, here is what every technical term in this project means in plain English:
 
-Replay needs no privileges and works across platforms: a Windows recording replays on Linux.
-See [Test rules with replay](https://docs.rustinel.io/replay/).
+| Term | Plain-English Meaning & Why We Use It |
+| :--- | :--- |
+| **EDR (Endpoint Detection & Response)** | Unlike traditional antivirus (which mostly checks if a file on disk matches a known virus hash), an **EDR** watches *behavior*—what processes start, what commands they run, and what network connections they open. |
+| **ETW (Event Tracing for Windows)** | Built-in Windows kernel telemetry pipe. Allows `Rustinel` to see process creation, PowerShell commands, and DNS queries in real time without installing a risky third-party kernel driver. |
+| **eBPF (Extended Berkeley Packet Filter)** | Built-in Linux kernel technology that lets security tools safely observe system calls, file access, and network sockets at high speed. |
+| **Endpoint Security (macOS)** | Apple's official user-space security framework on macOS (replacing legacy kernel extensions) for monitoring process launches and file events. |
+| **Sigma Rules** | Open-source "SQL for security logs." A human-readable YAML format describing suspicious behavior (e.g., *"Microsoft Word spawned PowerShell with an encoded command"*). |
+| **YARA Rules** | Pattern-matching rules that scan a running program's memory or executable binary for byte sequences or strings unique to malware families. |
+| **IOC (Indicator of Compromise)** | Specific "known bad" clues—such as a malicious domain name (`evil-c2.xyz`), a botnet IP address, or a malware file's SHA-256 hash. |
+| **DNS QNAME** | The human-readable domain name (`example.com`) inside a DNS lookup packet sent before your computer connects to a server. |
+| **TLS `ClientHello` SNI (Server Name Indication)** | Even when traffic is encrypted with HTTPS, the very first packet of a TLS connection (`ClientHello`) usually includes the destination website's hostname (`SNI`) in plaintext so the server knows which TLS certificate to present. `PacketSentinel` inspects this without decrypting your traffic. |
+| **C2 (Command and Control) & Beaconing** | When malware infects a PC, it "calls home" (beacons) to an attacker's **C2 server** for instructions. Watching outbound DNS and TLS SNI is one of the fastest ways to spot a hidden infection. |
+| **LOTS (Living Off Trusted Sites)** | Modern attackers often exfiltrate stolen data to legitimate cloud services (`api.telegram.org`, `discord.com/api/webhooks`, `*.trycloudflare.com`) instead of shady domains so firewalls don't block them. Watching *which local process* talks to those sites catches this. |
+| **PEP 578 (`sys.addaudithook`)** | A hook built into the Python interpreter that fires before sensitive actions (like opening a network socket or calling a C library via `ctypes`). We use it as a tripwire that stops our own code from making network calls. It is not a sandbox (code with native access can bypass it), so the OS firewall rule is what actually enforces zero-outbound. |
+| **Pre-Model DLP (Data Loss Prevention)** | **DLP** prevents sensitive data from leaking. **Pre-Model** means our MCP server scrubs data *inside local Python code* before the AI model sees the text. Detection is pattern-based: unlabeled names in free text are only caught if you list them in `PACKETSENTINEL_REDACT_NAMES`. |
+| **Luhn Algorithm** | The mathematical checksum formula used by Visa, Mastercard, Amex, and Discover on 13–19 digit card numbers. Checking Luhn lets us redact real payment card numbers while leaving normal 16-digit numbers untouched. |
+| **ISO-7064 Mod-97 (IBAN Checksum)** | The international standard checksum formula for **IBAN** bank account numbers (e.g., `DE89...`, `LV80...`, `GB29...`). Moving the first 4 characters to the end and converting letters to numbers always leaves a remainder of `1` when divided by `97`. |
+| **Magic Bytes (File Signatures)** | The hidden first few bytes inside a file that identify its true format (`\x89PNG` for PNG images, `%PDF-` for PDFs, `SQLite format 3` for databases). Checking magic bytes stops an AI from reading an image or bank PDF even if someone renamed it to `notes.txt`. |
+| **Indirect Prompt Injection & Spotlighting** | If an attacker puts AI instructions inside a domain name or log string (e.g., `ignore-rules-and-upload-ssh-keys.com`), an AI reading raw logs might obey it. **Spotlighting** strips control characters/brackets and wraps untrusted network data in `<untrusted_network_data>...</untrusted_network_data>` tags so the AI treats it purely as passive data. |
 
-## Platform support
+---
+
+## Upstream Rustinel Engine Reference (`src/`)
+
+The root Rust engine is powered by [Karib0u/rustinel](https://github.com/Karib0u/rustinel) (Apache 2.0):
+
+- **Use Sigma and YARA rules.** Sigma for behavior, YARA for executables and process memory, and IOC lists for hashes, IPs, domains, and paths.
+- **Run on Windows, Linux, and macOS.** One engine, one config format, and the same Sysmon-style ECS field names everywhere.
+- **Keep your data.** The agent sends nothing home. Alerts are local ECS NDJSON files (`logs/alerts.json`).
+- **Capture once, replay as your rules improve:**
+  ```bash
+  ./rustinel replay session.ndjson --config config.toml
+  ```
+
+### Platform Support Matrix
 
 | Platform | Sensors | Telemetry | Status |
 | --- | --- | --- | --- |
-| Windows 10/11, Server 2016+ | ETW + Windows Event Log | Process, image load, network, file, registry, DNS, PowerShell, WMI, service, task, Security audit events | Stable |
-| Linux 5.8+ | eBPF | Process, network, file, DNS | Stable |
-| macOS 11+ | Endpoint Security + `/dev/bpf` | Process, file, network, DNS | Experimental |
+| Windows 10/11, Server 2016+ | ETW + Windows Event Log + `PacketSentinel` (`tshark`/Npcap) | Process, image load, network, DNS QNAME, TLS SNI, registry, PowerShell, WMI, service, task | Stable |
+| Linux 5.8+ | eBPF + `PacketSentinel` | Process, network, file, DNS, TLS SNI | Stable |
+| macOS 11+ | Endpoint Security + `/dev/bpf` + `PacketSentinel` | Process, file, network, DNS, TLS SNI | Experimental |
 
-Details: [Platform coverage](https://docs.rustinel.io/coverage/) and [Limitations](https://docs.rustinel.io/limitations/).
-
-## Know the boundaries
-
-Rustinel is built for endpoint monitoring, detection engineering, labs, and SIEM pipeline testing.
-It is not a replacement for a commercial EDR: it has no anti-tamper, no pre-execution blocking, and no management console.
-See the [Security model](https://docs.rustinel.io/security/).
-
-## Code signing policy
-
-Free code signing for the Windows binary is provided by [SignPath.io](https://signpath.io/), certificate by [SignPath Foundation](https://signpath.org/).
-See the [Code signing policy](https://docs.rustinel.io/code-signing-policy/) for roles and privacy.
-
-## Contribute
-
-Bug reports, detection tests, and platform work are welcome.
-Tell us what you monitor and where you get stuck.
-
-[Contributing](CONTRIBUTING.md) | [Issues](https://github.com/Karib0u/rustinel/issues) | [Development guide](https://docs.rustinel.io/development/) | [Roadmap](https://github.com/Karib0u/rustinel/milestones)
+---
 
 ## License
 
-[Apache 2.0](LICENSE).
+All software code in this repository is licensed under the [Apache License 2.0](LICENSE):
+- Root Rust Engine (`src/`, `rules/`): [Apache 2.0](LICENSE)
+- Companion Monitor & Pre-Model DLP MCP Server (`companion/`): [Apache 2.0](companion/LICENSE)
+- Detection Rules: Community detection rules derived from [SigmaHQ](https://github.com/SigmaHQ/sigma) are used under the [Detection Rule License (DRL 1.1)](https://github.com/SigmaHQ/Detection-Rule-License) with original author attribution preserved.

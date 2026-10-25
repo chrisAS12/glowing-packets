@@ -7,7 +7,7 @@ name = "packetsentinel"
 version = "0.1.0"
 description = "Real-time Windows packet & DNS threat monitor using Wireshark/tshark and open-source threat feeds."
 readme = "README.md"
-license = { text = "MIT" }
+license = { text = "Apache-2.0" }
 requires-python = ">=3.10"
 dependencies = [
     "psutil>=7.2.2,<8.0.0",

@@ -155,6 +155,7 @@ class AppConfig:
 
     @property
     def custom_blocklist_file(self) -> Path:
+        self.app_dir.mkdir(parents=True, exist_ok=True)
         path = self.app_dir / "custom_sketchy_domains.txt"
         if not path.exists():
             header = (

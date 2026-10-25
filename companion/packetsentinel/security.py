@@ -49,7 +49,7 @@ def sanitize_display_text(value: Any, max_len: int = 253) -> str:
     while i < n and len(out_chars) < max_len:
         ch = raw[i]
         code = ord(ch)
-        # Detect ANSI CSI escape sequences: ESC [ ... <final byte 0x40-0x7E>
+        # Strip ANSI CSI (ESC [ ... <0x40-0x7E>) and OSC (ESC ] ... BEL / ESC \) sequences (CWE-150)
         if code == 0x1B:
             i += 1
             if i < n and raw[i] == "[":
@@ -57,6 +57,16 @@ def sanitize_display_text(value: Any, max_len: int = 253) -> str:
                 while i < n and not (0x40 <= ord(raw[i]) <= 0x7E):
                     i += 1
                 if i < n:
+                    i += 1
+            elif i < n and raw[i] == "]":
+                i += 1
+                while i < n:
+                    if ord(raw[i]) == 0x07:
+                        i += 1
+                        break
+                    if ord(raw[i]) == 0x1B and (i + 1) < n and raw[i + 1] == "\\":
+                        i += 2
+                        break
                     i += 1
             continue
         # Skip control characters (C0 and C1 control blocks + DEL)

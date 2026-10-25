@@ -300,7 +300,11 @@ class ThreatIntelEngine:
             )
         return sources
 
-    def load_or_update_feeds(self, force_network_update: bool = False) -> Dict[str, int]:
+    def load_or_update_feeds(
+        self,
+        force_network_update: bool = False,
+        offline_only: bool = False,
+    ) -> Dict[str, int]:
         """
         Load threat feeds from verified local cache or fetch fresh copies over HTTPS.
         Swaps the in-memory sets atomically so active packet sniffing is never blocked.
@@ -345,10 +349,12 @@ class ThreatIntelEngine:
                 break
 
             content: Optional[str] = None
-            if not force_network_update:
+            if offline_only:
+                content = self._load_cached_feed(source, allow_stale=True)
+            elif not force_network_update:
                 content = self._load_cached_feed(source, allow_stale=False)
 
-            if content is None:
+            if content is None and not offline_only:
                 try:
                     logger.info("Fetching threat feed: %s (%s)", source.name, source.url)
                     content = fetch_https_stream_safely(

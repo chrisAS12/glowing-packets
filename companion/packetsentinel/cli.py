@@ -10,11 +10,14 @@ import os
 import signal
 import sys
 import time
+from pathlib import Path
 from typing import List, Optional
 
 from . import __version__
 from .capture import PacketSentinelMonitor
 from .config import HELP_ISSUES_URL, AppConfig
+from .egress_guard import engage_runtime_network_lockdown
+from .mcp_server import run_mcp_stdio_server
 from .notifier import AlertNotifier
 from .process_mapper import ProcessInfo, ProcessMapper
 from .security import validate_https_feed_url
@@ -92,6 +95,17 @@ def build_arg_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Disable Windows desktop toast popups (log alerts to console and JSONL file only).",
     )
+    parser.add_argument(
+        "--mcp",
+        action="store_true",
+        help="Run the read-only, Pre-Model Privacy & DLP-scrubbed MCP server over stdio (JSON-RPC 2.0).",
+    )
+    parser.add_argument(
+        "--mcp-workspace",
+        metavar="DIR",
+        default=None,
+        help="Workspace root directory allowed for sanitized MCP file inspection (defaults to CWD).",
+    )
     return parser
 
 
@@ -131,6 +145,10 @@ def main(argv: Optional[List[str]] = None) -> int:
     config = AppConfig.load()
     if args.no_toast:
         config.enable_desktop_toast = False
+
+    if args.mcp:
+        ws_root = Path(args.mcp_workspace).resolve() if args.mcp_workspace else Path.cwd().resolve()
+        return run_mcp_stdio_server(config=config, workspace_root=ws_root)
 
     if args.setup:
         return run_interactive_setup(config, interactive=not args.non_interactive)
@@ -177,8 +195,11 @@ def main(argv: Optional[List[str]] = None) -> int:
             print(f"[!] Invalid indicator: {exc}", file=sys.stderr)
             return 1
 
-    print("[*] Loading threat intelligence feeds (local SHA-256 cache / HTTPS repos)...")
-    feed_stats = threat_engine.load_or_update_feeds(force_network_update=bool(args.update_feeds))
+    print("[*] Loading threat intelligence feeds from local cache...")
+    feed_stats = threat_engine.load_or_update_feeds(
+        force_network_update=bool(args.update_feeds),
+        offline_only=not bool(args.update_feeds),
+    )
 
     if args.update_feeds:
         print_status_report(config, monitor, feed_stats)
@@ -234,6 +255,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         return 0
 
     print_status_report(config, monitor, feed_stats)
+    engage_runtime_network_lockdown()
+    print("[*] Zero-Outbound Egress Airlock ACTIVE (PEP 578 socket/HTTP/ctypes lockdown engaged).")
     print("[*] Live monitoring ACTIVE. Watching DNS queries, TLS SNI, and outbound connections...")
     print("[*] Tip: Test anytime in another terminal with: nslookup sketchy-canary.example.com")
     print(f"[*] Need help? See SETUP_AND_TROUBLESHOOTING.md or {HELP_ISSUES_URL}")
@@ -261,7 +284,7 @@ def main(argv: Optional[List[str]] = None) -> int:
 
             if (time.monotonic() - last_feed_refresh) >= config.cache_ttl_seconds:
                 last_feed_refresh = time.monotonic()
-                threat_engine.load_or_update_feeds(force_network_update=True)
+                threat_engine.load_or_update_feeds(force_network_update=False, offline_only=True)
     except KeyboardInterrupt:
         pass
     finally:
