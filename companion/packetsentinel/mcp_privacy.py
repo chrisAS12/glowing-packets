@@ -252,6 +252,15 @@ _LABELED_FINANCIAL_RE = re.compile(
     r"""(?i)\b(iban|swift|bic|routing[ _-]?number|sort[ _-]?code|account[ _-]?number|bank[ _-]?account|card[ _-]?number|pan|cvv|cvc|tax[ _-]?id|national[ _-]?id)(['"]?\s*[:=#]\s*['"]?)([A-Z0-9 -]{3,34})"""
 )
 _US_SSN_RE = re.compile(r"\b(?!000|666|9\d\d)\d{3}-(?!00)\d{2}-(?!0000)\d{4}\b")
+_NATIONAL_ID_CODE_RE = re.compile(
+    r"\b(?:\d{6}[-+A]\d{3,5}[0-9A-Z]?|\d{6}-\d{5})\b"
+)
+_LABELED_PERSONAL_CODE_RE = re.compile(
+    r"""(?i)\b(personal[ _-]?code|id[ _-]?code|identity[ _-]?code|citizen[ _-]?code|national[ _-]?id|tax[ _-]?code|tin|pesel|henkilötunnus|isikukood|asmens[ _-]?kodas|pin[ _-]?code|security[ _-]?code|verification[ _-]?code|backup[ _-]?code)(['"]?\s*[:=#]\s*['"]?)([A-Za-z0-9_-]{4,24})"""
+)
+_STANDALONE_PIN_OTP_RE = re.compile(
+    r"""(?i)\b(pin|otp|passcode)\s*[:=]\s*(\d{4,8})\b"""
+)
 _CRYPTO_HEX_KEY_RE = re.compile(
     r"(?i)\b(?:0x[a-f0-9]{64}|(?:btc|eth|sol|wallet|private_key)\s*[:=]\s*['\"]?[A-Za-z0-9]{26,66}['\"]?)\b"
 )
@@ -533,6 +542,9 @@ class PrivacySanitizer:
 
         out = _CARD_CANDIDATE_RE.sub(_replace_card, out)
         out = _US_SSN_RE.sub("[REDACTED_SSN]", out)
+        out = _NATIONAL_ID_CODE_RE.sub("[REDACTED_NATIONAL_ID]", out)
+        out = _LABELED_PERSONAL_CODE_RE.sub(r"\1\2[REDACTED_PERSONAL_CODE]", out)
+        out = _STANDALONE_PIN_OTP_RE.sub(r"\1: [REDACTED_PIN]", out)
         out = _CRYPTO_HEX_KEY_RE.sub("[REDACTED_CRYPTO_MATERIAL]", out)
         out = _LABELED_FINANCIAL_RE.sub(r"\1\2[REDACTED_FINANCIAL_ID]", out)
 
