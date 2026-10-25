@@ -60,23 +60,32 @@ Most people avoid third-party commercial antiviruses because they duplicate your
 
 ---
 
-## Quick Start: Companion Monitor & Pre-Model Privacy MCP Server (`companion/`)
+## Quick Start: 1-Click Launchers & Pre-Model Privacy MCP Server
 
+### 1. Zero-Friction Desktop Launchers (Windows)
+Double-click `run.bat` (or `Launch-PacketSentinel.vbs` for a silent window) from File Explorer:
+- **`run.bat`**: Displays an interactive menu with auto-detection for Python/Anaconda:
+  - `[1] Launch Native Desktop App (--ui)`: Dark-mode desktop window with 5-Gate DLP scrubber, live wire monitor, process watchdog, and emergency kill switch.
+  - `[2] Start Live Packet Monitor (CLI)`: Real-time DNS & TLS SNI packet inspection.
+  - `[3] Target Process Watchdog (--watch-process)`: Track child script interpreters spawned by an application.
+  - `[4] Run Security Audit & Verification`: Executes the full 54-test security and supply-chain suite.
+  - `[5] EMERGENCY KILL SWITCH`: Instantly stops all background processes and listeners.
+- **`Launch-PacketSentinel.vbs`**: 1-click silent desktop launcher that pops open the native GUI without leaving a terminal window open.
+- **`kill.bat`**: 1-click emergency stop script.
+
+### 2. Command Line Usage
 ```powershell
-# 1. Install the single audited Python dependency (psutil)
-pip install -r companion/requirements.txt
+# Launch the native dark-mode desktop window (0 open ports, 0 web browser)
+.\run.bat --ui
 
-# 2. Run the interactive setup, OS defense check, & self-test wizard
-python companion/run_packetsentinel.py --setup
+# Target a specific process to watch its spawned child scripts
+.\run.bat --watch-process python
 
-# 3. Start live packet & sketchy DNS monitoring (Zero-Outbound Airlock active)
-python companion/run_packetsentinel.py
-
-# 4. Run the Pre-Model Privacy & DLP MCP Server over stdio
-python companion/run_packetsentinel.py --mcp --mcp-workspace .
+# Run the 100% offline Pre-Model Privacy MCP Server over stdio
+python packetsentinel.py --mcp --mcp-workspace .
 ```
 
-### Connecting Your AI Agent to the Privacy MCP Server
+### 3. Connecting Your AI Agent to the Privacy MCP Server
 
 Add the following to your AI client's MCP configuration (e.g., Claude Desktop, Cursor, or Antigravity):
 
@@ -86,7 +95,7 @@ Add the following to your AI client's MCP configuration (e.g., Claude Desktop, C
     "packetsentinel-privacy": {
       "command": "python",
       "args": [
-        "companion/run_packetsentinel.py",
+        "packetsentinel.py",
         "--mcp",
         "--mcp-workspace",
         "."
@@ -106,6 +115,7 @@ Add the following to your AI client's MCP configuration (e.g., Claude Desktop, C
 | `check_indicator_reputation` | Checks a domain or public IP against 95,000+ offline cached threat indicators. | Runs 100% offline in O(1) memory with PEP 578 network lockdown engaged. |
 | `get_sanitized_system_diagnostics` | Reports loaded feed counts, platform, and active DLP gates. | Exposes zero hostnames, usernames, or filesystem paths. |
 | `read_sanitized_project_text` | Reads lines from a workspace file so your AI can help you code safely. | Blocks images, PDFs, Office docs, databases, and `.env`/`.secrets` (by filename and magic-byte header), and scrubs names, credit cards, IBANs, emails, and tokens **before** returning text to the AI. |
+| `scan_downloaded_payload_malware` | Inspects downloaded payloads or scripts for deceptive extensions (e.g. `.txt` hiding PE/ELF executable), polyglot binaries, and encoded execution patterns (`Invoke-Expression`, `DownloadString`). | 100% offline in-memory static analysis before execution. |
 
 ---
 

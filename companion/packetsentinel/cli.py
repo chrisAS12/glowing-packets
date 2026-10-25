@@ -106,6 +106,19 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=None,
         help="Workspace root directory allowed for sanitized MCP file inspection (defaults to CWD).",
     )
+    parser.add_argument(
+        "--watch-process",
+        metavar="APP_OR_PID",
+        default=None,
+        help="Target a specific application name or PID to monitor all its sockets, DNS queries, and spawned child scripts.",
+    )
+    parser.add_argument(
+        "--ui",
+        "--desktop-ui",
+        action="store_true",
+        dest="voice_ui",
+        help="Launch the native, 100% offline desktop window with Pre-Model Privacy Scrubber, Wire Monitor, and Process Watchdog.",
+    )
     return parser
 
 
@@ -223,6 +236,49 @@ def main(argv: Optional[List[str]] = None) -> int:
             f"[+] CLEAN: '{target}' was not found in {threat_engine.domain_count:,} domains "
             f"or {threat_engine.ip_count:,} IPs."
         )
+        return 0
+
+    if args.watch_process:
+        from .process_watchdog import (
+            WatchdogTargetStatus,
+            find_processes_by_name,
+            format_watchdog_banner,
+            inspect_child_lineage,
+        )
+
+        target = args.watch_process.strip()
+        print(f"[*] Activating Target Process Watchdog on: '{target}'")
+        target_pid = int(target) if target.isdigit() else None
+        target_name = target
+        if target_pid is None:
+            matches = find_processes_by_name(target)
+            if not matches:
+                print(f"[!] No running process matching '{target}' found.")
+                return 1
+            target_pid, target_name, _ = matches[0]
+            print(f"[+] Found {len(matches)} matching instance(s). Attached to PID {target_pid} ({target_name}).")
+
+        children = inspect_child_lineage(target_pid)
+        status = WatchdogTargetStatus(
+            target_pid=target_pid,
+            target_name=target_name,
+            is_alive=True,
+            active_children_count=len(children),
+        )
+        print(format_watchdog_banner(status))
+        if children:
+            print("[*] Active child processes / scripts spawned:")
+            for c in children:
+                tag = "[SCRIPT INTERPRETER]" if c.is_script_interpreter else ""
+                print(f"    - PID {c.child_pid}: {c.child_name} {tag} (cmd: {c.cmdline[:80]})")
+        return 0
+
+    if args.voice_ui:
+        print_status_report(config, monitor, feed_stats)
+        from .desktop_ui import launch_desktop_app
+
+        print("[*] Launching Native Desktop Security & Privacy Airlock UI...")
+        launch_desktop_app(config=config)
         return 0
 
     if args.test_alert:

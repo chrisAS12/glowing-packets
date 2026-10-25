@@ -116,6 +116,30 @@ MCP_TOOLS_SCHEMA: List[Dict[str, Any]] = [
             "additionalProperties": False,
         },
     },
+    {
+        "name": "scan_downloaded_payload_malware",
+        "description": (
+            "Scan a downloaded payload, file content, or text for malware, deceptive extensions "
+            "(e.g. .txt hiding PE/MZ executable), polyglot binaries, and encoded script execution "
+            "patterns (IEX/DownloadString) before execution. Pure offline scan."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "content_text": {
+                    "type": "string",
+                    "description": "Text or script content to scan.",
+                },
+                "filename": {
+                    "type": "string",
+                    "description": "Intended filename or extension (e.g. 'install.ps1' or 'data.txt').",
+                    "default": "unnamed_payload",
+                },
+            },
+            "required": ["content_text"],
+            "additionalProperties": False,
+        },
+    },
 ]
 
 
@@ -265,6 +289,23 @@ class PacketSentinelMCPServer:
             end_line=end_line,
         )
 
+    def tool_scan_downloaded_payload_malware(
+        self,
+        content_text: str,
+        filename: str = "unnamed_payload",
+    ) -> Dict[str, Any]:
+        from .download_guard import scan_downloaded_payload
+
+        data = str(content_text or "").encode("utf-8", errors="replace")
+        res = scan_downloaded_payload(data, filename=filename)
+        return {
+            "is_safe": res.is_safe,
+            "risk_level": res.risk_level,
+            "reason": res.reason,
+            "sha256": res.sha256,
+            "file_size_bytes": res.file_size_bytes,
+        }
+
     def handle_jsonrpc_message(self, request: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         if not isinstance(request, dict):
             return {
@@ -331,6 +372,11 @@ class PacketSentinelMCPServer:
                         relative_path=str(tool_args.get("relative_path", "")),
                         start_line=int(tool_args.get("start_line", 1)),
                         end_line=int(tool_args.get("end_line", 200)),
+                    )
+                elif tool_name == "scan_downloaded_payload_malware":
+                    payload = self.tool_scan_downloaded_payload_malware(
+                        content_text=str(tool_args.get("content_text", "")),
+                        filename=str(tool_args.get("filename", "unnamed_payload")),
                     )
                 else:
                     return {
