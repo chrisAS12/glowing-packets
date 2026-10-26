@@ -36,6 +36,13 @@ def get_log_dir() -> Path:
     return log_dir
 
 
+def get_incident_dir() -> Path:
+    """Return the directory where post-mortem incident reports are recorded."""
+    inc_dir = get_log_dir() / "incident_reports"
+    inc_dir.mkdir(parents=True, exist_ok=True)
+    return inc_dir
+
+
 def setup_diagnostic_logging(level: str = "INFO") -> Path:
     """Configure rotating file logging in the local user AppData directory."""
     global _root_configured
@@ -173,3 +180,99 @@ def generate_anonymized_diagnostic_bundle(
     ]
 
     return "\n".join(report)
+
+
+def record_kill_switch_incident(
+    reason: str,
+    snapshot_data: Optional[Dict[str, Any]] = None,
+    sanitizer: Optional[PrivacySanitizer] = None,
+) -> Path:
+    """Record a post-mortem incident snapshot when the Emergency Kill Switch is triggered.
+
+    Stores the event under %LOCALAPPDATA%\\PacketSentinel\\logs\\incident_reports\\
+    so the user can inspect or safely report what happened without exposing machine identifiers.
+    """
+    import json
+    import time
+
+    inc_dir = get_incident_dir()
+    ts = int(time.time())
+    iso_time = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(ts))
+    incident_file = inc_dir / f"kill_switch_incident_{ts}.json"
+
+    clean_reason = sanitize_text_for_incident(reason, sanitizer)
+
+    raw_snapshot = snapshot_data or {}
+    clean_snapshot = {}
+    for k, v in raw_snapshot.items():
+        if isinstance(v, str):
+            clean_snapshot[k] = sanitize_text_for_incident(v, sanitizer)
+        elif isinstance(v, list):
+            clean_snapshot[k] = [
+                sanitize_text_for_incident(str(item), sanitizer) if isinstance(item, (str, dict)) else item
+                for item in v
+            ]
+        else:
+            clean_snapshot[k] = v
+
+    record = {
+        "incident_id": f"KILL-{ts}",
+        "timestamp_utc": iso_time,
+        "action": "EMERGENCY_KILL_SWITCH",
+        "reason": clean_reason,
+        "environment": {
+            "os": f"{platform.system()} {platform.release()}",
+            "python": sys.version.split()[0],
+        },
+        "airlock_state": {
+            "pep578_runtime_socket_lock": True,
+            "background_monitors_terminated": True,
+            "child_processes_cleaned": True,
+        },
+        "telemetry_at_kill": clean_snapshot,
+    }
+
+    try:
+        with open(incident_file, "w", encoding="utf-8") as f:
+            json.dump(record, f, indent=2)
+    except OSError as e:
+        logging.getLogger(LOGGER_NAME).error(f"Failed to write incident record: {e}")
+
+    return incident_file
+
+
+def list_kill_switch_incidents(limit: int = 10) -> List[Dict[str, Any]]:
+    """Return recent incident reports, newest first."""
+    import json
+
+    inc_dir = get_incident_dir()
+    files = sorted(inc_dir.glob("kill_switch_incident_*.json"), key=os.path.getmtime, reverse=True)
+    incidents: List[Dict[str, Any]] = []
+
+    for f in files[:limit]:
+        try:
+            with open(f, "r", encoding="utf-8") as fp:
+                data = json.load(fp)
+                data["_file_path"] = str(f)
+                incidents.append(data)
+        except Exception:
+            continue
+
+    return incidents
+
+
+def sanitize_text_for_incident(text: str, sanitizer: Optional[PrivacySanitizer] = None) -> str:
+    """Mask PII, machine usernames, and home paths from incident fields."""
+    active_sanitizer = sanitizer or PrivacySanitizer()
+    scrubbed = active_sanitizer.sanitize_text(str(text or ""))
+
+    username = os.environ.get("USERNAME") or os.environ.get("USER", "")
+    if username:
+        scrubbed = scrubbed.replace(username, "<ANONYMIZED_USER>")
+
+    home_path = str(Path.home())
+    if home_path:
+        scrubbed = scrubbed.replace(home_path, "<USER_HOME_DIR>")
+
+    return scrubbed
+

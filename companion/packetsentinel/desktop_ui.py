@@ -29,8 +29,11 @@ from typing import Any, Dict, List, Optional
 from .config import AppConfig, get_app_data_dir
 from .diagnostic_logger import (
     generate_anonymized_diagnostic_bundle,
+    get_incident_dir,
     get_log_dir,
+    list_kill_switch_incidents,
     purge_all_local_data,
+    record_kill_switch_incident,
     setup_diagnostic_logging,
 )
 from .egress_guard import engage_runtime_network_lockdown
@@ -1430,6 +1433,20 @@ class PacketSentinelDesktopApp:
         )
         refresh_logs_btn.pack(side=tk.LEFT, padx=(0, 8))
 
+        incidents_btn = tk.Button(
+            act_row,
+            text="🚨 Kill Incidents",
+            font=("Segoe UI", 9),
+            bg="#334155",
+            fg="#fca5a5",
+            padx=10,
+            pady=6,
+            relief=tk.FLAT,
+            cursor="hand2",
+            command=self._view_kill_incidents,
+        )
+        incidents_btn.pack(side=tk.LEFT, padx=(0, 8))
+
         nuke_btn = tk.Button(
             act_row,
             text="🗑️ Nuke All Local Data & Logs",
@@ -1540,6 +1557,87 @@ class PacketSentinelDesktopApp:
         )
         close_b.pack(side=tk.RIGHT)
 
+    def _view_kill_incidents(self) -> None:
+        incidents = list_kill_switch_incidents(limit=10)
+        inc_win = tk.Toplevel(self.root)
+        inc_win.title("Kill Switch Post-Mortem Incident Reports")
+        inc_win.geometry("720x540")
+        inc_win.configure(bg="#0f172a")
+
+        tk.Label(
+            inc_win,
+            text="🚨 Emergency Kill Switch Incident History",
+            font=("Segoe UI", 11, "bold"),
+            fg="#f87171",
+            bg="#0f172a",
+            padx=14,
+            pady=8,
+        ).pack(anchor=tk.W)
+
+        tk.Label(
+            inc_win,
+            text="Every kill switch event is recorded with 5-Gate DLP scrubbing so you can safely export and report issues to GitHub or forums without leaking system data.",
+            font=("Segoe UI", 9),
+            fg="#94a3b8",
+            bg="#0f172a",
+            padx=14,
+            wraplength=680,
+            justify=tk.LEFT,
+        ).pack(anchor=tk.W, pady=(0, 8))
+
+        inc_text = tk.Text(inc_win, bg="#020617", fg="#38bdf8", font=("Consolas", 9), relief=tk.FLAT, padx=10, pady=10)
+        inc_text.pack(fill=tk.BOTH, expand=True, padx=14, pady=(0, 10))
+
+        if not incidents:
+            inc_text.insert(tk.END, "[*] No Kill Switch incidents recorded. Clean operating history.\n")
+        else:
+            for inc in incidents:
+                inc_text.insert(
+                    tk.END,
+                    f"======================================================================\n"
+                    f"Incident ID   : {inc.get('incident_id', 'UNKNOWN')}\n"
+                    f"Timestamp UTC : {inc.get('timestamp_utc', 'UNKNOWN')}\n"
+                    f"Action Taken  : {inc.get('action', 'UNKNOWN')}\n"
+                    f"Reported Cause: {inc.get('reason', 'UNKNOWN')}\n"
+                    f"Environment   : {json.dumps(inc.get('environment', {}))}\n"
+                    f"Telemetry     : {json.dumps(inc.get('telemetry_at_kill', {}), indent=2)}\n\n"
+                )
+
+        b_bar = tk.Frame(inc_win, bg="#0f172a", padx=14, pady=10)
+        b_bar.pack(fill=tk.X)
+
+        def _copy_incidents() -> None:
+            content = inc_text.get("1.0", tk.END).strip()
+            self.root.clipboard_clear()
+            self.root.clipboard_append(content)
+            messagebox.showinfo("Copied", "Incident report copied to clipboard! Safe to post publicly.")
+
+        copy_b = tk.Button(
+            b_bar,
+            text="📋 Copy Incident Report for GitHub / Forums",
+            font=("Segoe UI", 9, "bold"),
+            bg="#0284c7",
+            fg="#ffffff",
+            padx=14,
+            pady=6,
+            relief=tk.FLAT,
+            command=_copy_incidents,
+        )
+        copy_b.pack(side=tk.LEFT)
+
+        close_b = tk.Button(
+            b_bar,
+            text="Close",
+            font=("Segoe UI", 9),
+            bg="#1e293b",
+            fg="#94a3b8",
+            padx=12,
+            pady=6,
+            relief=tk.FLAT,
+            command=inc_win.destroy,
+        )
+        close_b.pack(side=tk.RIGHT)
+
     def _nuke_local_data(self) -> None:
         confirm = messagebox.askyesno(
             "Purge All Local Data?",
@@ -1601,18 +1699,142 @@ class PacketSentinelDesktopApp:
         self.root.iconify()
 
     def _emergency_kill(self) -> None:
-        try:
-            self._monitor_service.shutdown()
-        except Exception as e:
-            logger.warning(f"Error shutting down monitor service during kill switch: {e}")
-        engage_runtime_network_lockdown()
-        messagebox.showwarning(
-            "EMERGENCY KILL SWITCH ENGAGED",
-            "Runtime socket creation has been severed (PEP 578 airlock active).\n"
-            "All background wire capture processes have been signaled to terminate immediately.",
+        dialog = tk.Toplevel(self.root)
+        dialog.title("Confirm Emergency Kill Switch")
+        dialog.geometry("540x390")
+        dialog.configure(bg="#0f172a")
+        dialog.transient(self.root)
+        dialog.grab_set()
+
+        tk.Label(
+            dialog,
+            text="🚨 INITIATE EMERGENCY KILL SWITCH",
+            font=("Segoe UI", 12, "bold"),
+            fg="#f87171",
+            bg="#0f172a",
+            padx=16,
+            pady=10,
+        ).pack(anchor=tk.W)
+
+        desc = (
+            "Engaging the Kill Switch immediately executes:\n"
+            "• PEP 578 runtime socket lockdown (severing all in-process networking)\n"
+            "• Immediate termination of background wire capture & sniffer threads\n"
+            "• Termination of orphan capture tools (tshark/dumpcap)\n"
+            "• Generates an anonymized post-mortem incident report\n\n"
+            "Note: This is an emergency stop. You can launch and use SentinelWire again anytime via run.bat."
         )
-        self.root.destroy()
-        os._exit(0)
+        tk.Label(
+            dialog,
+            text=desc,
+            font=("Segoe UI", 9),
+            fg="#cbd5e1",
+            bg="#0f172a",
+            justify=tk.LEFT,
+            padx=16,
+        ).pack(anchor=tk.W, pady=(0, 10))
+
+        tk.Label(
+            dialog,
+            text="Reason for Kill Switch (saved to anonymized incident report):",
+            font=("Segoe UI", 9, "bold"),
+            fg="#94a3b8",
+            bg="#0f172a",
+            padx=16,
+        ).pack(anchor=tk.W)
+
+        reason_var = tk.StringVar(value="Suspicious / unexpected network traffic")
+        reasons = [
+            "Suspicious / unexpected network traffic",
+            "High CPU load or application frozen",
+            "Testing emergency kill switch",
+            "Manual user abort / security precaution",
+        ]
+        for r in reasons:
+            tk.Radiobutton(
+                dialog,
+                text=r,
+                variable=reason_var,
+                value=r,
+                font=("Segoe UI", 9),
+                fg="#e2e8f0",
+                bg="#0f172a",
+                selectcolor="#1e293b",
+                activebackground="#0f172a",
+                activeforeground="#ffffff",
+                padx=16,
+            ).pack(anchor=tk.W)
+
+        btn_bar = tk.Frame(dialog, bg="#0f172a", padx=16, pady=16)
+        btn_bar.pack(fill=tk.X, side=tk.BOTTOM)
+
+        def _execute_kill() -> None:
+            reason = reason_var.get()
+            snap = self._monitor_service.snapshot()
+            recent_alerts = [
+                {
+                    "time": a.timestamp_utc,
+                    "indicator": a.indicator,
+                    "feed": a.source_feed,
+                    "process": a.process_name,
+                }
+                for a in self._monitor_service.recent_alerts(limit=10)
+            ]
+            snapshot_dict = {
+                "events_inspected": snap.events_inspected,
+                "alerts_emitted": snap.alerts_emitted,
+                "recent_alerts": recent_alerts,
+            }
+            inc_file = record_kill_switch_incident(
+                reason=reason,
+                snapshot_data=snapshot_dict,
+                sanitizer=self.sanitizer,
+            )
+            try:
+                self._monitor_service.shutdown()
+            except Exception as e:
+                logger.warning(f"Error shutting down monitor service during kill switch: {e}")
+            engage_runtime_network_lockdown()
+
+            dialog.destroy()
+            messagebox.showwarning(
+                "EMERGENCY KILL SWITCH ENGAGED",
+                f"Runtime sockets severed and capture engines terminated.\n\n"
+                f"Post-mortem incident recorded to:\n{inc_file.name}\n\n"
+                f"SentinelWire will now exit. You can restart cleanly anytime with run.bat.",
+            )
+            self.root.destroy()
+            os._exit(0)
+
+        kill_btn = tk.Button(
+            btn_bar,
+            text="🚨 ENGAGE KILL SWITCH NOW",
+            font=("Segoe UI", 10, "bold"),
+            bg="#dc2626",
+            fg="#ffffff",
+            activebackground="#b91c1c",
+            activeforeground="#ffffff",
+            padx=14,
+            pady=6,
+            relief=tk.FLAT,
+            cursor="hand2",
+            command=_execute_kill,
+        )
+        kill_btn.pack(side=tk.LEFT)
+
+        cancel_btn = tk.Button(
+            btn_bar,
+            text="Cancel / Return to App",
+            font=("Segoe UI", 9),
+            bg="#1e293b",
+            fg="#94a3b8",
+            padx=12,
+            pady=6,
+            relief=tk.FLAT,
+            cursor="hand2",
+            command=dialog.destroy,
+        )
+        cancel_btn.pack(side=tk.RIGHT)
 
     def run(self) -> None:
         """Run the main event loop and clean up background services on exit."""
