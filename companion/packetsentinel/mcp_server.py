@@ -19,7 +19,8 @@ from typing import Any, BinaryIO, Dict, List, Optional, Sequence
 from . import __version__
 from .config import AppConfig
 from .egress_guard import engage_runtime_network_lockdown, is_runtime_network_lockdown_active
-from .mcp_privacy import PrivacySanitizer
+from .lots_guard import check_ai_package_safety
+from .mcp_privacy import PrivacySanitizer, sanitize_prompt_injection
 from .threat_intel import ThreatIntelEngine
 
 
@@ -188,6 +189,47 @@ MCP_TOOLS_SCHEMA: List[Dict[str, Any]] = [
                 },
             },
             "required": ["process_name_or_pid"],
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "scan_prompt_injection",
+        "description": (
+            "Scan text, web search results, or user prompts for indirect prompt injection, "
+            "zero-width character steganography, and deceptive chat framing overrides before context ingestion."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "text": {
+                    "type": "string",
+                    "description": "Text content, web search snippet, or untrusted prompt to scan.",
+                },
+            },
+            "required": ["text"],
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "verify_package_safety",
+        "description": (
+            "Verify a Python (PyPI) or Node (npm) package name against AI hallucination patterns "
+            "(slopsquatting), popular package prefix/suffix mimicry, and 1-character typosquats."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "package_name": {
+                    "type": "string",
+                    "description": "Package name to verify (e.g. 'requests', 'python-requests', 'express').",
+                },
+                "ecosystem": {
+                    "type": "string",
+                    "description": "Package ecosystem ('pypi' or 'npm').",
+                    "default": "pypi",
+                },
+            },
+            "required": ["package_name"],
             "additionalProperties": False,
         },
     },
@@ -475,6 +517,21 @@ class PacketSentinelMCPServer:
             "processes": results,
         }
 
+    def tool_scan_prompt_injection(self, text: str) -> Dict[str, Any]:
+        """Scan text for indirect prompt injection and zero-width steganography."""
+        result = sanitize_prompt_injection(text)
+        return {
+            "is_injection_detected": result.is_injection_detected,
+            "has_zero_width_steganography": result.has_zero_width_steganography,
+            "reasons": result.reasons,
+            "sanitized_text": result.sanitized_text,
+        }
+
+    def tool_verify_package_safety(self, package_name: str, ecosystem: str = "pypi") -> Dict[str, Any]:
+        """Check package name for slopsquatting or typo-squat risks."""
+        result = check_ai_package_safety(package_name, ecosystem=ecosystem)
+        return result.to_dict()
+
     def handle_jsonrpc_message(self, request: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         if not isinstance(request, dict):
             return {
@@ -556,6 +613,15 @@ class PacketSentinelMCPServer:
                 elif tool_name == "inspect_process_safety":
                     payload = self.tool_inspect_process_safety(
                         process_name_or_pid=str(tool_args.get("process_name_or_pid", ""))
+                    )
+                elif tool_name == "scan_prompt_injection":
+                    payload = self.tool_scan_prompt_injection(
+                        text=str(tool_args.get("text", ""))
+                    )
+                elif tool_name == "verify_package_safety":
+                    payload = self.tool_verify_package_safety(
+                        package_name=str(tool_args.get("package_name", "")),
+                        ecosystem=str(tool_args.get("ecosystem", "pypi")),
                     )
                 else:
                     return {

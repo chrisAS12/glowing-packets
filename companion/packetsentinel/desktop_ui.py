@@ -1680,8 +1680,8 @@ class PacketSentinelDesktopApp:
         self.alert_feed_combo = ttk.Combobox(
             filter_bar,
             textvariable=self.alert_feed_filter_var,
-            values=["All Feeds", "LOTS", "Botnet / C2", "URLhaus", "OISD", "Canary"],
-            width=12,
+            values=["All Feeds", "LOTS", "Shadow AI", "Supply Chain", "Botnet / C2", "URLhaus", "OISD", "Canary"],
+            width=13,
             state="readonly",
         )
         self.alert_feed_combo.pack(side=tk.LEFT, padx=(0, 10))
@@ -2399,6 +2399,10 @@ class PacketSentinelDesktopApp:
                 elif sel_lower in ("botnet / c2", "c2") and not any(k in feed_lower for k in ("feodo", "threatfox", "botnet", "c2")):
                     continue
                 elif sel_lower == "urlhaus" and "urlhaus" not in feed_lower:
+                    continue
+                elif sel_lower == "shadow ai" and "shadow" not in feed_lower and "model" not in feed_lower:
+                    continue
+                elif sel_lower == "supply chain" and "supply" not in feed_lower:
                     continue
                 elif sel_lower == "oisd" and "oisd" not in feed_lower:
                     continue

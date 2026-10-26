@@ -144,8 +144,14 @@ BLOCKED_PATH_SEGMENTS: frozenset[str] = frozenset(
         ".azure",
         ".gcloud",
         ".config/gcloud",
+        ".config/gh",
+        ".git",
         ".mozilla",
         ".thunderbird",
+        "google/chrome/user data",
+        "bravesoftware/brave-browser/user data",
+        "microsoft/edge/user data",
+        "psreadline",
     }
 )
 
@@ -156,6 +162,14 @@ BLOCKED_EXACT_FILENAMES: frozenset[str] = frozenset(
         ".pypirc",
         ".netrc",
         ".git-credentials",
+        ".bash_history",
+        ".zsh_history",
+        "consolehost_history.txt",
+        "hosts.yml",
+        "gh-hosts.yml",
+        "cookies.sqlite",
+        "login data",
+        "web data",
         "id_rsa",
         "id_ed25519",
         "id_ecdsa",
@@ -454,6 +468,81 @@ class SanitizedAlertSummary:
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
+
+
+# Gate 6: Indirect Prompt-Injection & Steganography Detection
+_ZERO_WIDTH_STEGANOGRAPHY_RE = re.compile(
+    r"[\u200B-\u200D\u200E\u200F\u202A-\u202E\u2060-\u2064\uFEFF]"
+)
+
+_PROMPT_INJECTION_OVERRIDE_RE = re.compile(
+    r"(?i)\b(?:ignore\s+(?:all\s+)?(?:previous|prior)\s+instructions"
+    r"|disregard\s+(?:all\s+)?(?:previous|prior)\s+(?:rules|guidelines|directives)"
+    r"|system\s+prompt\s+override"
+    r"|new\s+system\s+directive\s*:"
+    r"|you\s+are\s+now\s+(?:in\s+developer\s+mode|unrestricted|DAN)"
+    r"|bypass\s+(?:content|safety)\s+filters"
+    r")\b"
+)
+
+_CHAT_FRAME_OVERRIDE_RE = re.compile(
+    r"(?:\[/?(?:INST|SYS)\]|<\|im_start\|>|<\|im_end\|>|<!--\s*(?:system|instruction|prompt)\s*:.*?-->)"
+)
+
+
+@dataclass(frozen=True)
+class PromptInjectionScanResult:
+    """Represents Gate 6 prompt injection analysis result."""
+
+    is_injection_detected: bool
+    sanitized_text: str
+    reasons: List[str]
+    has_zero_width_steganography: bool
+
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
+
+
+def sanitize_prompt_injection(text: str) -> PromptInjectionScanResult:
+    """
+    Gate 6: Scan and sanitize indirect prompt injection, zero-width steganography,
+    and chat template framing overrides from text.
+    """
+    if not text or not isinstance(text, str):
+        return PromptInjectionScanResult(
+            is_injection_detected=False,
+            sanitized_text="",
+            reasons=[],
+            has_zero_width_steganography=False,
+        )
+
+    reasons: List[str] = []
+    has_bidi = bool(_ZERO_WIDTH_STEGANOGRAPHY_RE.search(text))
+    if has_bidi:
+        reasons.append("Hidden zero-width steganography / Unicode override characters detected and stripped.")
+
+    # 1. Strip zero-width and bidi override characters (invisible payload carriers)
+    cleaned = _ZERO_WIDTH_STEGANOGRAPHY_RE.sub("", text)
+
+    # 2. Check for direct prompt override directives
+    matches = _PROMPT_INJECTION_OVERRIDE_RE.findall(cleaned)
+    if matches:
+        reasons.append(f"Prompt injection directive detected: {', '.join(matches[:3])}")
+        cleaned = _PROMPT_INJECTION_OVERRIDE_RE.sub("[NEUTRALIZED_PROMPT_INJECTION_ATTEMPT]", cleaned)
+
+    # 3. Check for chat template frame hijacking
+    frame_matches = _CHAT_FRAME_OVERRIDE_RE.findall(cleaned)
+    if frame_matches:
+        reasons.append("Deceptive chat template framing / system tag smuggling detected.")
+        cleaned = _CHAT_FRAME_OVERRIDE_RE.sub("[NEUTRALIZED_CHAT_FRAME_OVERRIDE]", cleaned)
+
+    is_threat = len(reasons) > 0
+    return PromptInjectionScanResult(
+        is_injection_detected=is_threat,
+        sanitized_text=cleaned,
+        reasons=reasons,
+        has_zero_width_steganography=has_bidi,
+    )
 
 
 def _strip_embedded_media(out: str) -> str:
@@ -821,6 +910,15 @@ class PrivacySanitizer:
         selected_raw = "\n".join(lines[s_line - 1 : e_line])
         sanitized_content = self.sanitize_text(selected_raw, redact_private_ips=True)
 
+        # Gate 6: Indirect prompt-injection and steganography neutralization
+        injection_res = sanitize_prompt_injection(sanitized_content)
+        sanitized_content = injection_res.sanitized_text
+
+        framed_content = (
+            f'<untrusted_project_file path="{str(rel_path).replace(chr(92), "/")}">'
+            f"\n{sanitized_content}\n</untrusted_project_file>"
+        )
+
         return {
             "relative_path": str(rel_path).replace("\\", "/"),
             "start_line": s_line,
@@ -828,7 +926,9 @@ class PrivacySanitizer:
             "total_lines": total_lines,
             "truncated_by_byte_cap": truncated_by_bytes,
             "dlp_sanitized": True,
-            "content": sanitized_content,
+            "injection_detected": injection_res.is_injection_detected,
+            "injection_reasons": injection_res.reasons,
+            "content": framed_content,
         }
 
     def sanitize_for_ai(self, target: Any) -> Any:

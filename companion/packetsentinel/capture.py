@@ -18,7 +18,12 @@ from pathlib import Path
 from typing import List, Optional, Set, Tuple
 
 from .config import VERIFIED_TSHARK_PATHS, AppConfig
-from .lots_guard import PACKAGE_MANAGERS, check_lots_risk, check_supply_chain_risk
+from .lots_guard import (
+    PACKAGE_MANAGERS,
+    check_ai_egress_risk,
+    check_lots_risk,
+    check_supply_chain_risk,
+)
 from .notifier import AlertNotifier
 from .process_mapper import UNKNOWN_PROCESS, ProcessInfo, ProcessMapper
 from .security import (
@@ -440,6 +445,24 @@ class PacketSentinelMonitor:
                         dst_ip=dst_ip or "",
                         dst_port=dst_port,
                         detection_layer="supply-chain-wire",
+                    )
+                    return
+
+                ai_egress_risk = check_ai_egress_risk(proc.name, clean_dom, port=dst_port or 443)
+                if ai_egress_risk and ai_egress_risk.is_threat:
+                    ai_match = ThreatMatch(
+                        indicator=clean_dom,
+                        matched_rule=ai_egress_risk.matched_domain or clean_dom,
+                        source_feed="Shadow-AI-Guard (UNVETTED_MODEL_GATEWAY)",
+                        match_type=f"shadow_ai_{ai_egress_risk.severity.lower()}",
+                    )
+                    self._notifier.notify_match(
+                        match=ai_match,
+                        process=proc,
+                        protocol=protocol,
+                        dst_ip=dst_ip or "",
+                        dst_port=dst_port,
+                        detection_layer="shadow-ai-wire",
                     )
                     return
 
