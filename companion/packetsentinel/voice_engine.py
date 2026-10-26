@@ -67,15 +67,23 @@ def check_voice_status(model_dir: Path, model_name: str = DEFAULT_MODEL_NAME) ->
 
 
 class MicrophoneRecorder:
-    """Records mono 16 kHz audio until stop() is called or the safety cap is reached."""
+    """Records mono 16 kHz audio until stop() is called, silence is detected, or the safety cap is reached."""
 
-    def __init__(self, max_seconds: int = MAX_RECORDING_SECONDS) -> None:
+    def __init__(
+        self,
+        max_seconds: int = MAX_RECORDING_SECONDS,
+        silence_timeout_seconds: float = 1.8,
+    ) -> None:
         self._max_frames = max_seconds * SAMPLE_RATE_HZ
+        self.silence_timeout_seconds = silence_timeout_seconds
         self._chunks: List[Any] = []
         self._frames = 0
         self._lock = threading.Lock()
         self._stream: Optional[Any] = None
         self.hit_time_limit = False
+        self.hit_silence_limit = False
+        self._speech_detected = False
+        self._last_speech_time = 0.0
 
     @property
     def is_recording(self) -> bool:
@@ -90,6 +98,9 @@ class MicrophoneRecorder:
         self._chunks = []
         self._frames = 0
         self.hit_time_limit = False
+        self.hit_silence_limit = False
+        self._speech_detected = False
+        self._last_speech_time = 0.0
         try:
             self._stream = sd.InputStream(
                 samplerate=SAMPLE_RATE_HZ, channels=1, dtype="float32", callback=self._on_audio
@@ -100,12 +111,24 @@ class MicrophoneRecorder:
             raise VoiceEngineError(f"Could not open the microphone: {exc}") from exc
 
     def _on_audio(self, indata: Any, frames: int, _time_info: Any, _status: Any) -> None:
+        import time
+        import numpy as np
+
         with self._lock:
             if self._frames >= self._max_frames:
                 self.hit_time_limit = True
                 return
             self._chunks.append(indata.copy())
             self._frames += frames
+
+            if indata is not None and len(indata) > 0:
+                rms = float(np.sqrt(np.mean(indata**2)))
+                now = time.time()
+                if rms > 0.015:
+                    self._speech_detected = True
+                    self._last_speech_time = now
+                elif self._speech_detected and (now - self._last_speech_time) > self.silence_timeout_seconds:
+                    self.hit_silence_limit = True
 
     def stop(self) -> Any:
         """Stop capture and return a 1-D float32 numpy array (may be empty)."""

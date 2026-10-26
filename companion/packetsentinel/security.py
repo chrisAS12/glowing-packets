@@ -28,7 +28,7 @@ from typing import Any, Optional, Set
 
 MAX_DOMAIN_LENGTH = 253
 MAX_LABEL_LENGTH = 63
-MAX_FEED_BYTES_DEFAULT = 15 * 1024 * 1024  # 15 MB hard ceiling per feed
+MAX_FEED_BYTES_DEFAULT = 25 * 1024 * 1024  # 25 MB hard ceiling per feed
 MAX_DNS_POINTER_JUMPS = 10
 
 ALLOWED_LABEL_CHARS = frozenset("abcdefghijklmnopqrstuvwxyz0123456789-_")

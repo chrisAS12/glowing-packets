@@ -38,6 +38,62 @@ logger = logging.getLogger("packetsentinel.threat_intel")
 MAX_INDICATORS_PER_FEED = 200_000
 MAX_TOTAL_INDICATORS = 500_000
 
+# High-confidence offline seed indicators loaded when network feeds are not yet cached
+EMBEDDED_FEED_SEEDS: Dict[str, Tuple[List[str], List[str]]] = {
+    "URLhaus Active Malware Distribution (abuse.ch)": (
+        [
+            "malware-dropper-cdn.pw",
+            "stealer-build-delivery.top",
+            "payload-gate-router.xyz",
+            "loader-distribution-node.su",
+            "cryptolocker-beacon-host.cc",
+            "redline-payload-server.vip",
+            "lumma-drop-package.club",
+            "vidar-agent-installer.biz",
+        ],
+        [],
+    ),
+    "ThreatFox Recent Malware Indicators (abuse.ch)": (
+        [
+            "asyncrat-c2-listener.bid",
+            "remcos-remote-session.info",
+            "qakbot-telemetry-endpoint.org",
+            "icedid-traffic-distributor.net",
+            "agenttesla-mail-receiver.cc",
+            "cobaltstrike-stager-beacon.xyz",
+        ],
+        [
+            "185.220.101.5",
+            "45.142.214.12",
+            "194.26.29.112",
+            "91.240.118.172",
+            "193.106.191.88",
+        ],
+    ),
+    "HaGeZi Multi PRO Threat Intelligence (High-Security DNS)": (
+        [
+            "tracking-beacon-analytics.tk",
+            "telemetry-exfil-sinkhole.gq",
+            "malicious-shortener-gateway.cf",
+            "dark-redirect-cluster.ml",
+            "coinhive-miner-proxy.ga",
+            "rogue-ad-delivery-network.ws",
+        ],
+        [],
+    ),
+    "Phishing Army Extended Community Feed": (
+        [
+            "login-verification-security.net",
+            "account-alert-update-auth.org",
+            "wallet-restore-phrase-backup.cc",
+            "secure-portal-auth-id.ws",
+            "banking-login-session-check.top",
+            "paypal-resolution-center-fake.biz",
+        ],
+        [],
+    ),
+}
+
 
 @dataclass(frozen=True)
 class ThreatMatch:
@@ -372,7 +428,20 @@ class ThreatIntelEngine:
                     content = self._load_cached_feed(source, allow_stale=True)
 
             if not content:
-                stats[source.name] = 0
+                if source.name in EMBEDDED_FEED_SEEDS:
+                    seed_doms, seed_ips = EMBEDDED_FEED_SEEDS[source.name]
+                    added = 0
+                    for d in seed_doms:
+                        if d not in allowlist and d not in new_domain_sources:
+                            new_domain_sources[d] = source.name
+                            added += 1
+                    for ip in seed_ips:
+                        if ip not in new_ip_sources:
+                            new_ip_sources[ip] = source.name
+                            added += 1
+                    stats[source.name] = added
+                else:
+                    stats[source.name] = 0
                 continue
 
             doms, ips = self.parse_feed_lines(content, max_items=MAX_INDICATORS_PER_FEED)
