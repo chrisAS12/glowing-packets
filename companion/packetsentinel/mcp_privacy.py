@@ -456,16 +456,93 @@ class SanitizedAlertSummary:
         return asdict(self)
 
 
+def _strip_embedded_media(out: str) -> str:
+    out = _INLINE_IMAGE_DATA_URI_RE.sub("[REDACTED_INLINE_IMAGE_DATA_URI]", out)
+    return strip_inline_svg_blocks(out)
+
+
+def _scrub_secrets(out: str) -> str:
+    out = _PEM_PRIVATE_KEY_RE.sub("[REDACTED_PRIVATE_KEY]", out)
+    out = _GITHUB_TOKEN_RE.sub("[REDACTED_GITHUB_TOKEN]", out)
+    out = _API_KEY_RE.sub("[REDACTED_API_KEY]", out)
+    out = _JWT_RE.sub("[REDACTED_JWT]", out)
+    out = _BEARER_HEADER_RE.sub(r"\1[REDACTED_CREDENTIAL]", out)
+    out = _URL_EMBEDDED_CRED_RE.sub(r"\1[REDACTED_PASSWORD]\3", out)
+    return _SECRET_ASSIGNMENT_RE.sub(r"\1\2\3[REDACTED_SECRET]\3", out)
+
+
+def _scrub_cards_and_ibans(out: str) -> str:
+    def _replace_iban(match: re.Match[str]) -> str:
+        return "[REDACTED_IBAN]" if is_valid_iban(match.group(0)) else match.group(0)
+
+    def _replace_card(match: re.Match[str]) -> str:
+        digits = "".join(ch for ch in match.group(0) if ch.isdigit())
+        return "[REDACTED_PAYMENT_CARD]" if is_valid_luhn(digits) else match.group(0)
+
+    out = _IBAN_CANDIDATE_RE.sub(_replace_iban, out)
+    return _CARD_CANDIDATE_RE.sub(_replace_card, out)
+
+
+def _scrub_national_ids(out: str) -> str:
+    out = _US_SSN_RE.sub("[REDACTED_SSN]", out)
+    out = _NATIONAL_ID_CODE_RE.sub("[REDACTED_NATIONAL_ID]", out)
+    return _LABELED_PERSONAL_CODE_RE.sub(r"\1\2[REDACTED_PERSONAL_CODE]", out)
+
+
+def _scrub_financial_labels(out: str) -> str:
+    out = _STANDALONE_PIN_OTP_RE.sub(r"\1: [REDACTED_PIN]", out)
+    out = _CRYPTO_HEX_KEY_RE.sub("[REDACTED_CRYPTO_MATERIAL]", out)
+    return _LABELED_FINANCIAL_RE.sub(r"\1\2[REDACTED_FINANCIAL_ID]", out)
+
+
+def _scrub_private_ips(out: str) -> str:
+    def _replace_private_ip(match: re.Match[str]) -> str:
+        ip_str = match.group(0)
+        try:
+            ip_obj = ipaddress.ip_address(ip_str)
+        except ValueError:
+            return ip_str
+        is_internal = (
+            ip_obj.is_private
+            or ip_obj.is_loopback
+            or ip_obj.is_link_local
+            or ip_obj.is_reserved
+            or ip_obj.is_multicast
+        )
+        return "[REDACTED_LAN_IP]" if is_internal else ip_str
+
+    return _IPV4_CANDIDATE_RE.sub(_replace_private_ip, out)
+
+
+@dataclass(frozen=True)
+class RedactionCategories:
+    """User-selectable redaction categories shown in the desktop Settings view.
+
+    Embedded images and inline SVG are always stripped and cannot be disabled.
+    """
+
+    secrets: bool = True
+    financial: bool = True
+    national_ids: bool = True
+    identity: bool = True
+    private_ips: bool = True
+
+
 class PrivacySanitizer:
     """
     Stateful local privacy & DLP scrubber that discovers OS usernames/hostnames in local
     memory and strips PII, financial identifiers, secrets, and images before MCP responses.
     """
 
-    def __init__(self, extra_redacted_names: Optional[Sequence[str]] = None) -> None:
+    def __init__(
+        self,
+        extra_redacted_names: Optional[Sequence[str]] = None,
+        categories: Optional[RedactionCategories] = None,
+    ) -> None:
         self._user_tokens: Set[str] = set()
         self._host_tokens: Set[str] = set()
         self._custom_name_tokens: Set[str] = set()
+        self.categories = categories or RedactionCategories()
         self._discover_local_identity(extra_redacted_names)
 
     def _discover_local_identity(self, extra_redacted_names: Optional[Sequence[str]]) -> None:
@@ -517,46 +594,25 @@ class PrivacySanitizer:
         if not text:
             return ""
 
-        out = text
+        cats = self.categories
+        # The ordering matters: secrets are removed before card/IBAN candidates so that
+        # long digit runs inside API keys are not mislabelled as payment cards.
+        out = _strip_embedded_media(text)
+        if cats.secrets:
+            out = _scrub_secrets(out)
+        if cats.financial:
+            out = _scrub_cards_and_ibans(out)
+        if cats.national_ids:
+            out = _scrub_national_ids(out)
+        if cats.financial:
+            out = _scrub_financial_labels(out)
+        if cats.identity:
+            out = self._scrub_identity(out)
+        if redact_private_ips and cats.private_ips:
+            out = _scrub_private_ips(out)
+        return out
 
-        # Gate 1B: Strip embedded base64 images/PDFs and inline SVG blocks inside text files
-        out = _INLINE_IMAGE_DATA_URI_RE.sub("[REDACTED_INLINE_IMAGE_DATA_URI]", out)
-        out = strip_inline_svg_blocks(out)
-
-        # Gate 4: Secrets, private keys, API keys, JWTs, & credentials
-        out = _PEM_PRIVATE_KEY_RE.sub("[REDACTED_PRIVATE_KEY]", out)
-        out = _GITHUB_TOKEN_RE.sub("[REDACTED_GITHUB_TOKEN]", out)
-        out = _API_KEY_RE.sub("[REDACTED_API_KEY]", out)
-        out = _JWT_RE.sub("[REDACTED_JWT]", out)
-        out = _BEARER_HEADER_RE.sub(r"\1[REDACTED_CREDENTIAL]", out)
-        out = _URL_EMBEDDED_CRED_RE.sub(r"\1[REDACTED_PASSWORD]\3", out)
-        out = _SECRET_ASSIGNMENT_RE.sub(r"\1\2\3[REDACTED_SECRET]\3", out)
-
-        # Gate 2: Banking, payment cards (Luhn), IBANs (ISO 7064 Mod-97), SSNs, & crypto keys
-        def _replace_iban(match: re.Match[str]) -> str:
-            candidate = match.group(0)
-            if is_valid_iban(candidate):
-                return "[REDACTED_IBAN]"
-            return candidate
-
-        out = _IBAN_CANDIDATE_RE.sub(_replace_iban, out)
-
-        def _replace_card(match: re.Match[str]) -> str:
-            candidate = match.group(0)
-            digits = "".join(ch for ch in candidate if ch.isdigit())
-            if is_valid_luhn(digits):
-                return "[REDACTED_PAYMENT_CARD]"
-            return candidate
-
-        out = _CARD_CANDIDATE_RE.sub(_replace_card, out)
-        out = _US_SSN_RE.sub("[REDACTED_SSN]", out)
-        out = _NATIONAL_ID_CODE_RE.sub("[REDACTED_NATIONAL_ID]", out)
-        out = _LABELED_PERSONAL_CODE_RE.sub(r"\1\2[REDACTED_PERSONAL_CODE]", out)
-        out = _STANDALONE_PIN_OTP_RE.sub(r"\1: [REDACTED_PIN]", out)
-        out = _CRYPTO_HEX_KEY_RE.sub("[REDACTED_CRYPTO_MATERIAL]", out)
-        out = _LABELED_FINANCIAL_RE.sub(r"\1\2[REDACTED_FINANCIAL_ID]", out)
-
-        # Gate 3: OS user paths, personal names, usernames, hostnames, emails, phones, MACs, LAN IPs
+    def _scrub_identity(self, out: str) -> str:
         out = _WIN_USER_PATH_RE.sub(r"%USERPROFILE%", out)
         out = _MAC_USER_PATH_RE.sub(r"$HOME", out)
         out = _LINUX_USER_PATH_RE.sub(r"$HOME", out)
@@ -565,41 +621,18 @@ class PrivacySanitizer:
         out = _HONORIFIC_NAME_RE.sub("[REDACTED_PERSONAL_NAME]", out)
         out = _GIT_AUTHOR_HEADER_RE.sub(r"\1[REDACTED_PERSONAL_NAME] <[REDACTED_EMAIL]>", out)
 
-        for custom_name in sorted(self._custom_name_tokens, key=len, reverse=True):
-            pattern = re.compile(rf"(?i)\b{re.escape(custom_name)}\b")
-            out = pattern.sub("[REDACTED_PERSONAL_NAME]", out)
-
-        for user_tok in sorted(self._user_tokens, key=len, reverse=True):
-            pattern = re.compile(rf"(?i)\b{re.escape(user_tok)}\b")
-            out = pattern.sub("<REDACTED_USER>", out)
-
-        for host_tok in sorted(self._host_tokens, key=len, reverse=True):
-            pattern = re.compile(rf"(?i)\b{re.escape(host_tok)}\b")
-            out = pattern.sub("<REDACTED_HOST>", out)
+        token_groups = (
+            (self._custom_name_tokens, "[REDACTED_PERSONAL_NAME]"),
+            (self._user_tokens, "<REDACTED_USER>"),
+            (self._host_tokens, "<REDACTED_HOST>"),
+        )
+        for tokens, placeholder in token_groups:
+            for tok in sorted(tokens, key=len, reverse=True):
+                out = re.sub(rf"(?i)\b{re.escape(tok)}\b", placeholder, out)
 
         out = _EMAIL_RE.sub("[REDACTED_EMAIL]", out)
         out = _PHONE_RE.sub("[REDACTED_PHONE]", out)
         out = _MAC_ADDR_RE.sub("[REDACTED_MAC]", out)
-
-        if redact_private_ips:
-            def _replace_private_ip(match: re.Match[str]) -> str:
-                ip_str = match.group(0)
-                try:
-                    ip_obj = ipaddress.ip_address(ip_str)
-                    if (
-                        ip_obj.is_private
-                        or ip_obj.is_loopback
-                        or ip_obj.is_link_local
-                        or ip_obj.is_reserved
-                        or ip_obj.is_multicast
-                    ):
-                        return "[REDACTED_LAN_IP]"
-                except ValueError:
-                    pass
-                return ip_str
-
-            out = _IPV4_CANDIDATE_RE.sub(_replace_private_ip, out)
-
         return out
 
     def spotlight_untrusted_indicator(self, raw_indicator: str) -> str:

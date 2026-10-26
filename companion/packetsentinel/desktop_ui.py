@@ -34,9 +34,17 @@ from .diagnostic_logger import (
     setup_diagnostic_logging,
 )
 from .egress_guard import engage_runtime_network_lockdown
+from .live_monitor_service import AlertRow, LiveMonitorService, MonitorSnapshot
 from .mcp_privacy import PrivacySanitizer
 from .process_watchdog import inspect_child_lineage
 from .vault import EncryptedVaultManager, VaultSettings
+from .voice_engine import (
+    MicrophoneRecorder,
+    OfflineTranscriber,
+    VoiceEngineError,
+    check_voice_status,
+    get_model_dir,
+)
 
 logger = logging.getLogger("sentinelwire.ui")
 
@@ -50,12 +58,24 @@ class PacketSentinelDesktopApp:
 
         self.vault_mgr = EncryptedVaultManager()
         self.vault_settings = self.vault_mgr.load_settings()
-        self.sanitizer = PrivacySanitizer(extra_redacted_names=self.vault_settings.custom_names)
+        self.sanitizer = PrivacySanitizer(
+            extra_redacted_names=self.vault_settings.custom_names,
+            categories=self.vault_settings.redaction_categories(),
+        )
 
+        self._voice_recorder: Optional[MicrophoneRecorder] = None
+        self._voice_transcriber = OfflineTranscriber(
+            model_dir=get_model_dir(self.config.app_dir),
+            model_name="base",
+        )
         self._is_recording = False
         self._record_start_time = 0.0
         self._record_timer_id: Optional[str] = None
         self._audio_stream = None
+
+        self._monitor_service = LiveMonitorService(self.config, lock_network_on_start=False)
+        self._telemetry_timer_id: Optional[str] = None
+        self._threat_rows_seen: Set[str] = set()
 
         self._packet_count = 0
         self._threat_count = 0
@@ -72,6 +92,9 @@ class PacketSentinelDesktopApp:
         self._build_metrics_strip()
         self._build_main_container()
         self._build_footer()
+
+        # Start periodic telemetry refresh
+        self._schedule_telemetry_poll()
 
         # Handle close: minimize to background/tray rather than accidental kill
         self.root.protocol("WM_DELETE_WINDOW", self._on_window_close)
@@ -555,55 +578,27 @@ class PacketSentinelDesktopApp:
         )
         self.voice_status_pill.config(text="🔴 RECORDING LIVE AUDIO (00:00)", bg="#7f1d1d", fg="#fca5a5")
         self.voice_feedback_lbl.config(
-            text="Listening to microphone... Speak freely. Click Stop when finished.",
+            text="Listening to microphone (100% offline)... Speak freely. Click Stop when finished.",
             fg="#38bdf8",
         )
         self._update_recording_timer()
 
-        def _bg_audio_capture() -> None:
-            try:
-                import sounddevice as sd
-                import speech_recognition as sr
-                import numpy as np
-
-                fs = 16000
-                recorded_frames = []
-
-                def callback(indata, frames, time_info, status):
-                    if self._is_recording:
-                        recorded_frames.append(indata.copy())
-
-                with sd.InputStream(samplerate=fs, channels=1, callback=callback):
-                    while self._is_recording:
-                        time.sleep(0.1)
-
-                if recorded_frames:
-                    audio_data = np.concatenate(recorded_frames, axis=0)
-                    r = sr.Recognizer()
-                    import io
-                    import wave
-
-                    wav_io = io.BytesIO()
-                    with wave.open(wav_io, "wb") as wf:
-                        wf.setnchannels(1)
-                        wf.setsampwidth(2)
-                        wf.setframerate(fs)
-                        wf.writeframes((audio_data * 32767).astype(np.int16).tobytes())
-                    wav_io.seek(0)
-                    with sr.AudioFile(wav_io) as source:
-                        audio = r.record(source)
-                    text = r.recognize_google(audio)
-                    self.root.after(0, lambda: self._on_voice_audio_received(text))
-            except Exception as e:
-                logger.warning(f"Audio capture fallback: {e}")
-                self.root.after(
-                    0,
-                    lambda: self._on_voice_audio_received(
-                        "Voice dictation captured locally: user Johnathan Doe reviewed account 4532 0151 1283 0366."
-                    ),
-                )
-
-        threading.Thread(target=_bg_audio_capture, daemon=True).start()
+        try:
+            self._voice_recorder = MicrophoneRecorder()
+            self._voice_recorder.start()
+        except VoiceEngineError as err:
+            self._is_recording = False
+            if self._record_timer_id:
+                self.root.after_cancel(self._record_timer_id)
+                self._record_timer_id = None
+            self.voice_btn.config(
+                text="🎙️  CLICK TO START DICTATING",
+                bg="#0284c7",
+                activebackground="#0369a1",
+            )
+            self.voice_status_pill.config(text="⚠️ VOICE ENGINE NOT READY", bg="#78350f", fg="#fde047")
+            self.voice_feedback_lbl.config(text=f"❌ Microphone error: {err}", fg="#ef4444")
+            messagebox.showwarning("Voice Airlock Notice", str(err))
 
     def _stop_persistent_recording(self) -> None:
         self._is_recording = False
@@ -615,6 +610,37 @@ class PacketSentinelDesktopApp:
             bg="#0284c7",
             activebackground="#0369a1",
         )
+        self.voice_status_pill.config(text="🟡 TRANSCRIBING & DLP SCRUBBING", bg="#78350f", fg="#fde047")
+        self.voice_feedback_lbl.config(text="Transcribing audio locally with offline Whisper model...", fg="#38bdf8")
+
+        recorder = self._voice_recorder
+        self._voice_recorder = None
+
+        def _bg_transcribe() -> None:
+            if recorder is None:
+                return
+            try:
+                audio_data = recorder.stop()
+                text = self._voice_transcriber.transcribe(audio_data)
+                self.root.after(0, lambda: self._on_voice_audio_received(text))
+            except VoiceEngineError as err:
+                logger.warning(f"Voice engine notice: {err}")
+                self.root.after(0, lambda: self._on_voice_engine_error(str(err)))
+            except Exception as exc:
+                logger.error(f"Unexpected error in offline voice transcriber: {exc}")
+                self.root.after(0, lambda: self._on_voice_engine_error(f"Transcription error: {exc}"))
+
+        threading.Thread(target=_bg_transcribe, daemon=True).start()
+
+    def _on_voice_engine_error(self, message: str) -> None:
+        self._is_recording = False
+        self.voice_btn.config(
+            text="🎙️  CLICK TO START DICTATING",
+            bg="#0284c7",
+            activebackground="#0369a1",
+        )
+        self.voice_status_pill.config(text="⚠️ VOICE AIRLOCK NOTICE", bg="#78350f", fg="#fde047")
+        self.voice_feedback_lbl.config(text=f"❌ {message}", fg="#ef4444")
         self.voice_status_pill.config(text="🟡 TRANSCRIBING & DLP SCRUBBING", bg="#78350f", fg="#fde047")
 
     def _update_recording_timer(self) -> None:
@@ -842,37 +868,183 @@ class PacketSentinelDesktopApp:
         card = tk.Frame(self.tab_monitor, bg="#1e293b", padx=16, pady=16)
         card.pack(fill=tk.BOTH, expand=True)
 
+        header_row = tk.Frame(card, bg="#1e293b")
+        header_row.pack(fill=tk.X, pady=(0, 8))
+
         tk.Label(
-            card,
-            text="Live Packet Capture & Threat Intel Status",
+            header_row,
+            text="Live Packet Capture & Real-Time Threat Alerts",
             font=("Segoe UI", 12, "bold"),
             fg="#f8fafc",
             bg="#1e293b",
-        ).pack(anchor=tk.W, pady=(0, 8))
+        ).pack(side=tk.LEFT)
 
-        status_box = tk.Text(
-            card,
-            bg="#0f172a",
-            fg="#94a3b8",
-            font=("Consolas", 10),
+        self.monitor_status_badge = tk.Label(
+            header_row,
+            text="🔴 SNIFFER STOPPED",
+            font=("Segoe UI", 9, "bold"),
+            fg="#fca5a5",
+            bg="#7f1d1d",
+            padx=10,
+            pady=3,
+        )
+        self.monitor_status_badge.pack(side=tk.RIGHT)
+
+        # Control Bar
+        ctrl_bar = tk.Frame(card, bg="#1e293b")
+        ctrl_bar.pack(fill=tk.X, pady=(0, 10))
+
+        self.btn_toggle_monitor = tk.Button(
+            ctrl_bar,
+            text="▶️ Start Live Sniffer",
+            font=("Segoe UI", 9, "bold"),
+            bg="#0284c7",
+            fg="#ffffff",
+            activebackground="#0369a1",
+            activeforeground="#ffffff",
+            padx=12,
+            pady=5,
             relief=tk.FLAT,
-            wrap=tk.WORD,
+            cursor="hand2",
+            command=self._toggle_sniffer,
+        )
+        self.btn_toggle_monitor.pack(side=tk.LEFT, padx=(0, 8))
+
+        canary_btn = tk.Button(
+            ctrl_bar,
+            text="🧪 Trigger Safe Canary Alert",
+            font=("Segoe UI", 9),
+            bg="#334155",
+            fg="#f8fafc",
+            activebackground="#475569",
+            activeforeground="#ffffff",
+            padx=12,
+            pady=5,
+            relief=tk.FLAT,
+            cursor="hand2",
+            command=self._trigger_canary_alert,
+        )
+        canary_btn.pack(side=tk.LEFT, padx=(0, 8))
+
+        self.monitor_detail_lbl = tk.Label(
+            ctrl_bar,
+            text="Ready. Start sniffer to inspect wire DNS/TLS packets in real-time.",
+            font=("Segoe UI", 9),
+            fg="#94a3b8",
+            bg="#1e293b",
+        )
+        self.monitor_detail_lbl.pack(side=tk.LEFT, padx=(8, 0))
+
+        # Real-time Threat Alerts Treeview
+        tree_frame = tk.Frame(card, bg="#0f172a", highlightthickness=1, highlightbackground="#334155")
+        tree_frame.pack(fill=tk.BOTH, expand=True)
+
+        cols = ("time", "indicator", "feed", "process", "layer")
+        self.alert_tree = ttk.Treeview(
+            tree_frame,
+            columns=cols,
+            show="headings",
+            selectmode="browse",
             height=12,
         )
-        status_box.pack(fill=tk.BOTH, expand=True, pady=(0, 10))
+        self.alert_tree.heading("time", text="Timestamp (UTC)")
+        self.alert_tree.heading("indicator", text="Flagged Domain / IP")
+        self.alert_tree.heading("feed", text="Matched Threat Feed")
+        self.alert_tree.heading("process", text="Attributed Process")
+        self.alert_tree.heading("layer", text="Detection Layer")
 
-        status_info = (
-            "[*] Zero-Outbound PEP 578 Airlock: ACTIVE\n"
-            "[*] Upstream Wire Capture Engine: READY\n"
-            "[*] Living-Off-Trusted-Sites (LOTS) Guard: ACTIVE\n"
-            "    - Monitored interpreters: powershell, node, python, curl, cmd\n"
-            "    - Guarded endpoints: api.telegram.org, discord.com/api/webhooks,\n"
-            "      *.trycloudflare.com, *.ngrok-free.app, webhook.site\n"
-            "[*] Threat Feeds: Local offline cache loaded.\n"
-            "[*] Built-in Defense Deduplication: Scans delegated to OS AV (Windows Defender).\n"
-        )
-        status_box.insert(tk.END, status_info)
-        status_box.configure(state=tk.DISABLED)
+        self.alert_tree.column("time", width=140, anchor="w")
+        self.alert_tree.column("indicator", width=260, anchor="w")
+        self.alert_tree.column("feed", width=220, anchor="w")
+        self.alert_tree.column("process", width=140, anchor="w")
+        self.alert_tree.column("layer", width=110, anchor="center")
+
+        sb = ttk.Scrollbar(tree_frame, orient="vertical", command=self.alert_tree.yview)
+        self.alert_tree.configure(yscrollcommand=sb.set)
+        self.alert_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        sb.pack(side=tk.RIGHT, fill=tk.Y)
+
+    def _toggle_sniffer(self) -> None:
+        snap = self._monitor_service.snapshot()
+        if not snap.running:
+            self._monitor_service.start()
+            self.btn_toggle_monitor.config(
+                text="⏹️ Stop Sniffer",
+                bg="#dc2626",
+                activebackground="#b91c1c",
+            )
+            self.monitor_status_badge.config(
+                text="🟢 SNIFFER LIVE",
+                bg="#064e3b",
+                fg="#22c55e",
+            )
+            self.monitor_detail_lbl.config(
+                text=f"Capturing: {snap.capture_mode} (PEP 578 airlock active)",
+                fg="#38bdf8",
+            )
+        else:
+            self._monitor_service.stop()
+            self.btn_toggle_monitor.config(
+                text="▶️ Start Live Sniffer",
+                bg="#0284c7",
+                activebackground="#0369a1",
+            )
+            self.monitor_status_badge.config(
+                text="🔴 SNIFFER STOPPED",
+                bg="#7f1d1d",
+                fg="#fca5a5",
+            )
+            self.monitor_detail_lbl.config(text="Sniffer stopped cleanly.", fg="#94a3b8")
+        self._refresh_telemetry_ui()
+
+    def _trigger_canary_alert(self) -> None:
+        self._monitor_service.run_canary_self_test()
+        self.monitor_detail_lbl.config(text="✅ Dispatched canary indicator (sketchy-canary.example.com)", fg="#22c55e")
+        self._refresh_telemetry_ui()
+
+    def _schedule_telemetry_poll(self) -> None:
+        self._refresh_telemetry_ui()
+        self._telemetry_timer_id = self.root.after(1500, self._schedule_telemetry_poll)
+
+    def _refresh_telemetry_ui(self) -> None:
+        snap = self._monitor_service.snapshot()
+        self._packet_count = snap.events_inspected
+        self._threat_count = snap.alerts_emitted
+
+        if hasattr(self, "metric_value_labels") and len(self.metric_value_labels) >= 4:
+            self.metric_value_labels[0].config(text=f"{snap.events_inspected:,}")
+            threat_color = "#ef4444" if snap.alerts_emitted > 0 else "#22c55e"
+            self.metric_value_labels[1].config(text=f"{snap.alerts_emitted:,}", fg=threat_color)
+            active_gates = sum(
+                1
+                for g in (
+                    self.vault_settings.dlp_gate_cards,
+                    self.vault_settings.dlp_gate_keys,
+                    self.vault_settings.dlp_gate_usernames,
+                    self.vault_settings.dlp_gate_national_ids,
+                    self.vault_settings.dlp_gate_ips,
+                )
+                if g
+            )
+            self.metric_value_labels[2].config(text=f"{active_gates}/5 Gates Active")
+            self.metric_value_labels[3].config(text="DPAPI Protected" if platform.system().lower() == "windows" else "Local (chmod 600)")
+
+        if hasattr(self, "alert_tree"):
+            for alert in self._monitor_service.recent_alerts(limit=50):
+                row_key = f"{alert.timestamp_utc}|{alert.indicator}|{alert.process_name}"
+                if row_key not in self._threat_rows_seen:
+                    self._threat_rows_seen.add(row_key)
+                    self.alert_tree.insert(
+                        "",
+                        0,
+                        values=(
+                            alert.timestamp_utc,
+                            alert.indicator,
+                            alert.source_feed,
+                            alert.process_name,
+                            alert.detection_layer,
+                        ),
+                    )
 
     def _build_watchdog_tab(self) -> None:
         card = tk.Frame(self.tab_watchdog, bg="#1e293b", padx=16, pady=16)
@@ -1133,15 +1305,19 @@ class PacketSentinelDesktopApp:
 
         ok = self.vault_mgr.save_settings(self.vault_settings)
         if ok:
-            self.sanitizer = PrivacySanitizer(extra_redacted_names=self.vault_settings.custom_names)
+            self.sanitizer = PrivacySanitizer(
+                extra_redacted_names=self.vault_settings.custom_names,
+                categories=self.vault_settings.redaction_categories(),
+            )
             now_str = time.strftime("%H:%M:%S")
             self.vault_status_lbl.config(
-                text=f"✅ Encrypted & saved at {now_str} ({len(names)} custom terms, {len(domains)} domains)",
+                text=f"✅ Saved at {now_str} ({len(names)} custom terms, {len(domains)} domains) • {self.vault_mgr.protection_description}",
                 fg="#22c55e",
             )
+            self._refresh_telemetry_ui()
             messagebox.showinfo(
-                "Encrypted Vault Updated",
-                "Your settings have been encrypted with Windows DPAPI and safely saved to disk.\n\n"
+                "Settings Vault Updated",
+                f"{self.vault_mgr.protection_description}\n\n"
                 f"Custom Redacted Terms: {len(names)}\n"
                 f"Custom Blocked Domains: {len(domains)}\n"
                 f"Vault Path: {self.vault_mgr.vault_path}",
@@ -1422,14 +1598,13 @@ class PacketSentinelDesktopApp:
             os._exit(0)
 
     def _minimize_to_tray(self) -> None:
-        self.root.withdraw()
-
-        def _restore_dialog() -> None:
-            time.sleep(1)
-
-        threading.Thread(target=_restore_dialog, daemon=True).start()
+        self.root.iconify()
 
     def _emergency_kill(self) -> None:
+        try:
+            self._monitor_service.shutdown()
+        except Exception as e:
+            logger.warning(f"Error shutting down monitor service during kill switch: {e}")
         engage_runtime_network_lockdown()
         messagebox.showwarning(
             "EMERGENCY KILL SWITCH ENGAGED",
@@ -1438,3 +1613,19 @@ class PacketSentinelDesktopApp:
         )
         self.root.destroy()
         os._exit(0)
+
+    def run(self) -> None:
+        """Run the main event loop and clean up background services on exit."""
+        try:
+            self.root.mainloop()
+        finally:
+            try:
+                self._monitor_service.shutdown()
+            except Exception:
+                pass
+
+
+def launch_desktop_app(config: Optional[AppConfig] = None) -> None:
+    """Entry point for CLI `--ui` command to launch the SentinelWire desktop app."""
+    app = PacketSentinelDesktopApp(config=config)
+    app.run()

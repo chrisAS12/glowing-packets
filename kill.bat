@@ -16,8 +16,8 @@ for /f "tokens=5" %%a in ('netstat -ano ^| findstr ":8765" ^| findstr "LISTENING
     taskkill /F /PID %%a >nul 2>&1
 )
 
-:: 3. Terminate any running PacketSentinel python processes
-powershell -Command "Get-CimInstance Win32_Process | Where-Object { $_.CommandLine -like '*packetsentinel*' } | ForEach-Object { Write-Host ('[*] Stopping PID ' + $_.ProcessId); Stop-Process -Id $_.ProcessId -Force }" >nul 2>&1
+:: 3. Terminate any running PacketSentinel python processes and tshark/dumpcap capture tools
+powershell -Command "Get-CimInstance Win32_Process | Where-Object { $_.CommandLine -like '*packetsentinel*' -or $_.Name -in @('tshark.exe','dumpcap.exe') } | ForEach-Object { Write-Host ('[*] Stopping PID ' + $_.ProcessId + ' (' + $_.Name + ')'); Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }" >nul 2>&1
 
 :: 4. Clean up tripwire files
 timeout /t 1 /nobreak >nul

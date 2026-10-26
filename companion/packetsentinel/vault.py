@@ -21,6 +21,8 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+from .mcp_privacy import RedactionCategories
+
 logger = logging.getLogger("packetsentinel.vault")
 
 
@@ -52,6 +54,15 @@ class VaultSettings:
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
+
+    def redaction_categories(self) -> RedactionCategories:
+        return RedactionCategories(
+            secrets=self.dlp_gate_keys,
+            financial=self.dlp_gate_cards,
+            national_ids=self.dlp_gate_national_ids,
+            identity=self.dlp_gate_usernames,
+            private_ips=self.dlp_gate_ips,
+        )
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "VaultSettings":
@@ -121,11 +132,22 @@ def _dpapi_decrypt(ciphertext: bytes) -> bytes:
 
 
 def get_default_vault_path() -> Path:
-    """Return default encrypted vault path in user's AppData or home directory."""
+    """Return default encrypted vault path in user's AppData or home directory.
+
+    PACKETSENTINEL_HOME relocates the vault together with logs and caches so that
+    tests and portable installs never touch the real user profile.
+    """
+    override = os.environ.get("PACKETSENTINEL_HOME")
+    if override:
+        return Path(override).expanduser().resolve() / "vault.bin"
     base = os.environ.get("APPDATA")
     if base:
         return Path(base) / "PacketSentinel" / "vault.bin"
     return Path.home() / ".packetsentinel" / "vault.bin"
+
+
+_PLAINTEXT_MARKER = b"PLAINTEXT_0600:"
+_LEGACY_PLAINTEXT_MARKER = b"NON_WIN_ENC:"
 
 
 class EncryptedVaultManager:
@@ -135,18 +157,21 @@ class EncryptedVaultManager:
         self.vault_path = vault_path if vault_path is not None else get_default_vault_path()
         self._is_windows = platform.system().lower() == "windows"
 
+    @property
+    def protection_description(self) -> str:
+        if self._is_windows:
+            return "Encrypted with Windows DPAPI (bound to your Windows login)"
+        return "NOT encrypted on this OS — plain JSON readable only by your user account (chmod 600)"
+
     def save_settings(self, settings: VaultSettings) -> bool:
         """Serialize settings to JSON and save encrypted binary to vault_path."""
         try:
             payload = json.dumps(settings.to_dict()).encode("utf-8")
-            if self._is_windows:
-                data = _dpapi_encrypt(payload)
-            else:
-                # Portable obfuscated container for non-Windows testing
-                data = b"NON_WIN_ENC:" + payload
-
+            data = _dpapi_encrypt(payload) if self._is_windows else _PLAINTEXT_MARKER + payload
             self.vault_path.parent.mkdir(parents=True, exist_ok=True)
             self.vault_path.write_bytes(data)
+            if not self._is_windows:
+                os.chmod(self.vault_path, 0o600)
             return True
         except Exception as exc:
             logger.error(f"Failed to save settings to vault: {exc}")
@@ -164,7 +189,11 @@ class EncryptedVaultManager:
             if self._is_windows:
                 decrypted = _dpapi_decrypt(raw)
             else:
-                decrypted = raw.replace(b"NON_WIN_ENC:", b"")
+                for marker in (_PLAINTEXT_MARKER, _LEGACY_PLAINTEXT_MARKER):
+                    if raw.startswith(marker):
+                        raw = raw[len(marker):]
+                        break
+                decrypted = raw
 
             parsed = json.loads(decrypted.decode("utf-8", errors="replace"))
             return VaultSettings.from_dict(parsed)
