@@ -62,6 +62,22 @@ Meanwhile, packet capture tools like Wireshark show millions of raw packets with
 
 ---
 
+## 📂 Where Everything is Located in this Repository
+
+| Path | What It Is | Purpose & How to Use It |
+| :--- | :--- | :--- |
+| **
+un.bat** | **1-Click Windows Launcher** | Double-click 
+un.bat in File Explorer or run .\run.bat --ui in terminal to launch the dark-mode desktop app. |
+| **	ools/workplace-agentic-kit/** | **🏢 Standalone Workplace AI Setup Kit** | **For your work computer**: Contains **zero** product code/drivers. Copy this folder to your work repository and run python setup_enterprise_agent_workspace.py for token-optimized Kiro IDE and GitHub Copilot multi-agent steering. |
+| **companion/** | **SentinelWire Python Companion & GUI** | Contains the offline Python application (desktop_ui.py, oice_engine.py, mcp_server.py, 	hreat_intel.py). |
+| **companion/SETUP_AND_TROUBLESHOOTING.md** | **Personal Setup & Troubleshooting Guide** | Detailed guide for Python environments, audio microphones, faster-whisper, and Npcap/Wireshark wire capture. |
+| **src/ & Cargo.toml** | **Rustinel Rust Engine** | High-performance compiled Rust engine for ETW (Windows), eBPF (Linux), and Endpoint Security (macOS). |
+| **kill.bat** | **Emergency Kill Switch** | 1-click script to immediately terminate all active SentinelWire background listeners. |
+| **%LOCALAPPDATA%\SentinelWire\logs\** | **Local Diagnostic Logs** | Where local operation logs (sentinelwire.log) and alerts (lerts.jsonl) are stored. You can also click [ 📋 Copy Logs for AI ] in the app header to instantly copy sanitized logs for AI debugging. |
+
+---
+
 ## Quick Start: 1-Click Launchers & Pre-Model Privacy MCP Server
 
 ### 1. Zero-Friction Desktop Launchers (Windows)

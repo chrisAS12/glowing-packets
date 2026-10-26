@@ -254,6 +254,18 @@ class PacketSentinelDesktopApp:
         action_frame = tk.Frame(header, bg=BG_SURFACE)
         action_frame.pack(side=tk.RIGHT)
 
+        copy_logs_btn = create_styled_button(
+            action_frame,
+            text="Copy Logs for AI",
+            icon="📋",
+            style="secondary",
+            command=self._copy_ai_diagnostic_summary,
+            font=FONT_BOLD,
+            padx=10,
+            pady=5,
+        )
+        copy_logs_btn.pack(side=tk.LEFT, padx=(0, 10))
+
         badge = create_status_pill(
             action_frame,
             text="🟢 AIRLOCK ACTIVE (0 OUTBOUND)",
@@ -3537,6 +3549,66 @@ class PacketSentinelDesktopApp:
             pady=6,
         )
         close_b.pack(side=tk.RIGHT)
+
+    def _copy_ai_diagnostic_summary(self) -> None:
+        """
+        Gathers sanitized recent operational logs, voice status, and threat alerts,
+        scrubs them via 5-Gate DLP to guarantee zero machine leaks, and copies directly
+        to the clipboard for instant AI assistant pasting and debugging.
+        """
+        lines = []
+        lines.append("=== SentinelWire Diagnostic & AI Debug Summary ===")
+        lines.append(f"Timestamp UTC: {time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())}")
+        lines.append(f"OS: {platform.system()} {platform.release()} ({platform.machine()})")
+        lines.append(f"Python: {platform.python_version()} ({platform.python_implementation()})")
+
+        # Telemetry Snapshot
+        snap = self._monitor_service.snapshot()
+        lines.append(f"Sniffer Running: {snap.running} (Mode: {snap.capture_mode})")
+        lines.append(f"Packets Monitored: {snap.events_inspected:,} | Threats Flagged: {snap.alerts_emitted:,}")
+
+        # Voice Engine Status
+        if self._voice_status:
+            lines.append(f"Voice Engine Ready: {self._voice_status.ready} (STT: {self._voice_status.stt_installed}, Cached: {self._voice_status.model_cached}, Detail: {self._voice_status.detail})")
+        else:
+            lines.append("Voice Engine Status: Uninitialized")
+
+        # Recent Threats
+        recent_alerts = list(self._monitor_service.recent_alerts(limit=10))
+        lines.append(f"\n--- Recent Intercepted Threats ({len(recent_alerts)}) ---")
+        if recent_alerts:
+            for a in recent_alerts:
+                lines.append(f"  * [{a.timestamp_utc}] {a.indicator} ({a.source_feed}) -> Process: {a.process_name} (Layer: {a.detection_layer})")
+        else:
+            lines.append("  (No suspicious network connections flagged)")
+
+        # Recent Logs (tail 40 lines of sentinelwire.log)
+        log_file = get_log_dir() / "sentinelwire.log"
+        lines.append("\n--- Recent Operational Logs (Tail 40 lines) ---")
+        if log_file.exists():
+            try:
+                with open(log_file, "r", encoding="utf-8", errors="replace") as f:
+                    log_lines = f.readlines()
+                    lines.extend(l.rstrip() for l in log_lines[-40:])
+            except Exception as exc:
+                lines.append(f"[Error reading log file: {exc}]")
+        else:
+            lines.append("  (Log file not created yet)")
+
+        raw_summary = "\n".join(lines)
+        clean_summary = sanitize_log_text(raw_summary, sanitizer=self.sanitizer)
+
+        try:
+            self.root.clipboard_clear()
+            self.root.clipboard_append(clean_summary)
+            messagebox.showinfo(
+                "Logs Copied for AI",
+                "✅ Sanitized diagnostic logs and alert summary copied to clipboard!\n\n"
+                "All personal usernames, IP addresses, and file paths have been scrubbed.\n"
+                "You can now paste (Ctrl + V) directly into chat for instant AI debugging.",
+            )
+        except Exception as exc:
+            logger.warning(f"Failed to copy AI diagnostic summary to clipboard: {exc}")
 
     def _view_kill_incidents(self) -> None:
         incidents = list_kill_switch_incidents(limit=10)
