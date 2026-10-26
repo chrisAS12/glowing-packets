@@ -142,6 +142,15 @@ class PacketSentinelDesktopApp:
         self._monitor_service = LiveMonitorService(self.config, lock_network_on_start=False)
         self._telemetry_timer_id: Optional[str] = None
         self._threat_rows_seen: Set[str] = set()
+        self._all_alerts_cache: List[Tuple[str, str, str, str, str]] = []
+        self._sort_col: str = "time"
+        self._sort_reverse: bool = True
+
+        # High-performance defaults: focus on AI tools & mute background streaming noise
+        self._monitor_service.set_ai_only_mode(True)
+        self._monitor_service.set_ignored_processes(
+            ["steam.exe", "steamservice.exe", "steamwebhelper.exe", "epicgameslauncher.exe", "onedrive.exe", "dropbox.exe", "spotify.exe"]
+        )
 
         self._packet_count = 0
         self._threat_count = 0
@@ -1656,6 +1665,69 @@ class PacketSentinelDesktopApp:
         )
         self.monitor_detail_lbl.pack(side=tk.LEFT, padx=(8, 0))
 
+        # Filter, Sorting & Overload Protection Toolbar
+        filter_bar = tk.Frame(card, bg=BG_CARD)
+        filter_bar.pack(fill=tk.X, pady=(0, 6))
+
+        tk.Label(filter_bar, text="🔍 Filter:", font=FONT_BOLD, fg=TEXT_MUTED, bg=BG_CARD).pack(side=tk.LEFT, padx=(0, 4))
+        self.alert_filter_var = tk.StringVar()
+        self.alert_filter_entry = ttk.Entry(filter_bar, textvariable=self.alert_filter_var, width=16)
+        self.alert_filter_entry.pack(side=tk.LEFT, padx=(0, 8))
+        self.alert_filter_var.trace_add("write", lambda *_: self._apply_alert_filters())
+
+        tk.Label(filter_bar, text="Feed:", font=FONT_BOLD, fg=TEXT_MUTED, bg=BG_CARD).pack(side=tk.LEFT, padx=(0, 4))
+        self.alert_feed_filter_var = tk.StringVar(value="All Feeds")
+        self.alert_feed_combo = ttk.Combobox(
+            filter_bar,
+            textvariable=self.alert_feed_filter_var,
+            values=["All Feeds", "LOTS", "Botnet / C2", "URLhaus", "OISD", "Canary"],
+            width=12,
+            state="readonly",
+        )
+        self.alert_feed_combo.pack(side=tk.LEFT, padx=(0, 10))
+        self.alert_feed_combo.bind("<<ComboboxSelected>>", lambda *_: self._apply_alert_filters())
+
+        # Overload Protection / Packet Rule Toggles
+        self.ai_only_mode_var = tk.BooleanVar(value=True)
+        ai_cb = tk.Checkbutton(
+            filter_bar,
+            text="⚡ AI Tools Only",
+            variable=self.ai_only_mode_var,
+            bg=BG_CARD,
+            fg=TEXT_MAIN,
+            selectcolor=BG_CARD,
+            activebackground=BG_CARD,
+            font=("Segoe UI", 9, "bold"),
+            command=self._on_toggle_ai_only_mode,
+        )
+        ai_cb.pack(side=tk.LEFT, padx=(0, 6))
+
+        self.mute_heavy_apps_var = tk.BooleanVar(value=True)
+        mute_cb = tk.Checkbutton(
+            filter_bar,
+            text="🔇 Mute Heavy Apps",
+            variable=self.mute_heavy_apps_var,
+            bg=BG_CARD,
+            fg=TEXT_MAIN,
+            selectcolor=BG_CARD,
+            activebackground=BG_CARD,
+            font=("Segoe UI", 9),
+            command=self._on_toggle_mute_heavy_apps,
+        )
+        mute_cb.pack(side=tk.LEFT, padx=(0, 8))
+
+        clear_btn = create_styled_button(
+            filter_bar,
+            text="Clear Feed",
+            icon="🧹",
+            style="secondary",
+            command=self._clear_alert_feed,
+            font=FONT_SMALL,
+            padx=8,
+            pady=2,
+        )
+        clear_btn.pack(side=tk.RIGHT)
+
         # Real-time Threat Alerts Treeview
         cols = ("time", "indicator", "feed", "process", "layer")
         display_names = {
@@ -1681,6 +1753,13 @@ class PacketSentinelDesktopApp:
             horizontal_scroll=True,
         )
         self.alert_container.pack(fill=tk.BOTH, expand=True)
+
+        for c in cols:
+            self.alert_tree.heading(
+                c,
+                text=f"{display_names[c]} ⇅",
+                command=lambda col=c: self._sort_alert_tree_by_column(col),
+            )
         self.alert_tree.bind("<Double-1>", lambda e: self._show_threat_explanation())
         self.alert_tree.bind("<<TreeviewSelect>>", self._on_alert_tree_select)
 
@@ -1852,6 +1931,14 @@ class PacketSentinelDesktopApp:
                 "Inject Copilot Rules",
             ),
             (
+                "Google Antigravity (AGY)",
+                "🪐",
+                "Configures .agents/rules/ and .gemini/ settings with SentinelWire zero-leak MCP boundaries and 0-outbound rules.",
+                self._copy_antigravity_config,
+                self._inject_antigravity_config,
+                "Inject AGY Rules",
+            ),
+            (
                 "Kiro IDE",
                 "⚡",
                 "Generates .kiro/steering/ spec-driven templates for product & tech boundaries, token minimization, and zero-outbound.",
@@ -1957,6 +2044,42 @@ class PacketSentinelDesktopApp:
         except Exception as e:
             messagebox.showerror("Injection Error", f"Could not write file: {e}")
 
+    def _copy_antigravity_config(self) -> None:
+        cfg = (
+            "{\n"
+            '  "mcpServers": {\n'
+            '    "packetsentinel-mcp": {\n'
+            '      "command": "python",\n'
+            '      "args": ["-m", "packetsentinel", "--mcp"]\n'
+            "    }\n"
+            "  }\n"
+            "}"
+        )
+        self.root.clipboard_clear()
+        self.root.clipboard_append(cfg)
+        messagebox.showinfo("Antigravity Config Copied", "Antigravity MCP configuration copied to clipboard!")
+
+    def _inject_antigravity_config(self) -> None:
+        target_dir = Path.cwd() / ".agents" / "rules"
+        target_dir.mkdir(parents=True, exist_ok=True)
+        target = target_dir / "sentinelwire-steering.md"
+        cfg = (
+            "# SentinelWire / PacketSentinel — Zero-Outbound & AI Privacy Rule\n\n"
+            "1. STRICT ZERO-OUTBOUND BOUNDARY:\n"
+            "   All models, packet monitors, and diagnostic tools run 100% locally. Zero telemetry is transmitted to cloud servers.\n"
+            "2. 5-GATE PRE-MODEL DLP:\n"
+            "   All prompt inputs, logs, and process telemetry must pass 5-Gate DLP scrubbers (Luhn payment cards, national IDs, credentials, and usernames).\n"
+            "3. SECRETS BOUNDARY:\n"
+            "   Never commit or display local API keys, tokens, or environment files (.env).\n"
+            "4. READ-ONLY MCP AIRLOCK:\n"
+            "   SentinelWire exposes a read-only MCP server (packetsentinel-mcp) providing safe security audit tools.\n"
+        )
+        try:
+            target.write_text(cfg, encoding="utf-8")
+            messagebox.showinfo("Injected Successfully", f"Created {target}!")
+        except Exception as e:
+            messagebox.showerror("Injection Error", f"Could not write file: {e}")
+
     def _copy_copilot_config(self) -> None:
         cfg = (
             "# GitHub Copilot Steering & Privacy Rules\n\n"
@@ -1983,6 +2106,42 @@ class PacketSentinelDesktopApp:
         try:
             target.write_text(cfg, encoding="utf-8")
             messagebox.showinfo("Injected Successfully", "Created .github/copilot-instructions.md!")
+        except Exception as e:
+            messagebox.showerror("Injection Error", f"Could not write file: {e}")
+
+    def _copy_antigravity_config(self) -> None:
+        cfg = (
+            "{\n"
+            '  "mcpServers": {\n'
+            '    "packetsentinel-mcp": {\n'
+            '      "command": "python",\n'
+            '      "args": ["-m", "packetsentinel", "--mcp"]\n'
+            "    }\n"
+            "  }\n"
+            "}"
+        )
+        self.root.clipboard_clear()
+        self.root.clipboard_append(cfg)
+        messagebox.showinfo("Antigravity Config Copied", "Antigravity MCP configuration copied to clipboard!")
+
+    def _inject_antigravity_config(self) -> None:
+        target_dir = Path.cwd() / ".agents" / "rules"
+        target_dir.mkdir(parents=True, exist_ok=True)
+        target = target_dir / "sentinelwire-steering.md"
+        cfg = (
+            "# SentinelWire / PacketSentinel — Zero-Outbound & AI Privacy Rule\n\n"
+            "1. STRICT ZERO-OUTBOUND BOUNDARY:\n"
+            "   All models, packet monitors, and diagnostic tools run 100% locally. Zero telemetry is transmitted to cloud servers.\n"
+            "2. 5-GATE PRE-MODEL DLP:\n"
+            "   All prompt inputs, logs, and process telemetry must pass 5-Gate DLP scrubbers (Luhn payment cards, national IDs, credentials, and usernames).\n"
+            "3. SECRETS BOUNDARY:\n"
+            "   Never commit or display local API keys, tokens, or environment files (.env).\n"
+            "4. READ-ONLY MCP AIRLOCK:\n"
+            "   SentinelWire exposes a read-only MCP server (packetsentinel-mcp) providing safe security audit tools.\n"
+        )
+        try:
+            target.write_text(cfg, encoding="utf-8")
+            messagebox.showinfo("Injected Successfully", f"Created {target}!")
         except Exception as e:
             messagebox.showerror("Injection Error", f"Could not write file: {e}")
 
@@ -2015,6 +2174,42 @@ class PacketSentinelDesktopApp:
         except Exception as e:
             messagebox.showerror("Injection Error", f"Could not write file: {e}")
 
+    def _copy_antigravity_config(self) -> None:
+        cfg = (
+            "{\n"
+            '  "mcpServers": {\n'
+            '    "packetsentinel-mcp": {\n'
+            '      "command": "python",\n'
+            '      "args": ["-m", "packetsentinel", "--mcp"]\n'
+            "    }\n"
+            "  }\n"
+            "}"
+        )
+        self.root.clipboard_clear()
+        self.root.clipboard_append(cfg)
+        messagebox.showinfo("Antigravity Config Copied", "Antigravity MCP configuration copied to clipboard!")
+
+    def _inject_antigravity_config(self) -> None:
+        target_dir = Path.cwd() / ".agents" / "rules"
+        target_dir.mkdir(parents=True, exist_ok=True)
+        target = target_dir / "sentinelwire-steering.md"
+        cfg = (
+            "# SentinelWire / PacketSentinel — Zero-Outbound & AI Privacy Rule\n\n"
+            "1. STRICT ZERO-OUTBOUND BOUNDARY:\n"
+            "   All models, packet monitors, and diagnostic tools run 100% locally. Zero telemetry is transmitted to cloud servers.\n"
+            "2. 5-GATE PRE-MODEL DLP:\n"
+            "   All prompt inputs, logs, and process telemetry must pass 5-Gate DLP scrubbers (Luhn payment cards, national IDs, credentials, and usernames).\n"
+            "3. SECRETS BOUNDARY:\n"
+            "   Never commit or display local API keys, tokens, or environment files (.env).\n"
+            "4. READ-ONLY MCP AIRLOCK:\n"
+            "   SentinelWire exposes a read-only MCP server (packetsentinel-mcp) providing safe security audit tools.\n"
+        )
+        try:
+            target.write_text(cfg, encoding="utf-8")
+            messagebox.showinfo("Injected Successfully", f"Created {target}!")
+        except Exception as e:
+            messagebox.showerror("Injection Error", f"Could not write file: {e}")
+
     def _copy_windsurf_config(self) -> None:
         cfg = (
             "# Windsurf Cascade AI Privacy Guidelines\n\n"
@@ -2037,6 +2232,42 @@ class PacketSentinelDesktopApp:
         try:
             target.write_text(cfg, encoding="utf-8")
             messagebox.showinfo("Injected Successfully", f"Created .windsurfrules in {target.parent}!")
+        except Exception as e:
+            messagebox.showerror("Injection Error", f"Could not write file: {e}")
+
+    def _copy_antigravity_config(self) -> None:
+        cfg = (
+            "{\n"
+            '  "mcpServers": {\n'
+            '    "packetsentinel-mcp": {\n'
+            '      "command": "python",\n'
+            '      "args": ["-m", "packetsentinel", "--mcp"]\n'
+            "    }\n"
+            "  }\n"
+            "}"
+        )
+        self.root.clipboard_clear()
+        self.root.clipboard_append(cfg)
+        messagebox.showinfo("Antigravity Config Copied", "Antigravity MCP configuration copied to clipboard!")
+
+    def _inject_antigravity_config(self) -> None:
+        target_dir = Path.cwd() / ".agents" / "rules"
+        target_dir.mkdir(parents=True, exist_ok=True)
+        target = target_dir / "sentinelwire-steering.md"
+        cfg = (
+            "# SentinelWire / PacketSentinel — Zero-Outbound & AI Privacy Rule\n\n"
+            "1. STRICT ZERO-OUTBOUND BOUNDARY:\n"
+            "   All models, packet monitors, and diagnostic tools run 100% locally. Zero telemetry is transmitted to cloud servers.\n"
+            "2. 5-GATE PRE-MODEL DLP:\n"
+            "   All prompt inputs, logs, and process telemetry must pass 5-Gate DLP scrubbers (Luhn payment cards, national IDs, credentials, and usernames).\n"
+            "3. SECRETS BOUNDARY:\n"
+            "   Never commit or display local API keys, tokens, or environment files (.env).\n"
+            "4. READ-ONLY MCP AIRLOCK:\n"
+            "   SentinelWire exposes a read-only MCP server (packetsentinel-mcp) providing safe security audit tools.\n"
+        )
+        try:
+            target.write_text(cfg, encoding="utf-8")
+            messagebox.showinfo("Injected Successfully", f"Created {target}!")
         except Exception as e:
             messagebox.showerror("Injection Error", f"Could not write file: {e}")
 
@@ -2120,14 +2351,14 @@ class PacketSentinelDesktopApp:
             self.metric_value_labels[3].config(text="DPAPI Protected" if platform.system().lower() == "windows" else "Local (chmod 600)")
 
         if hasattr(self, "alert_tree"):
+            new_alerts_added = False
             for alert in self._monitor_service.recent_alerts(limit=50):
                 row_key = f"{alert.timestamp_utc}|{alert.indicator}|{alert.process_name}"
                 if row_key not in self._threat_rows_seen:
                     self._threat_rows_seen.add(row_key)
-                    self.alert_tree.insert(
-                        "",
+                    self._all_alerts_cache.insert(
                         0,
-                        values=(
+                        (
                             alert.timestamp_utc,
                             alert.indicator,
                             alert.source_feed,
@@ -2135,18 +2366,107 @@ class PacketSentinelDesktopApp:
                             alert.detection_layer,
                         ),
                     )
-                    if hasattr(self, "mc_alert_tree"):
-                        self.mc_alert_tree.insert(
-                            "",
-                            0,
-                            values=(
-                                alert.timestamp_utc,
-                                alert.indicator,
-                                alert.source_feed,
-                                alert.process_name,
-                                alert.detection_layer,
-                            ),
-                        )
+                    new_alerts_added = True
+
+            if new_alerts_added:
+                if len(self._all_alerts_cache) > 200:
+                    self._all_alerts_cache = self._all_alerts_cache[:200]
+                self._apply_alert_filters()
+
+    def _apply_alert_filters(self) -> None:
+        """Filter and render alert table based on search query, feed category, and column sort."""
+        if not hasattr(self, "alert_tree"):
+            return
+
+        query = self.alert_filter_var.get().strip().lower() if hasattr(self, "alert_filter_var") else ""
+        selected_feed = self.alert_feed_filter_var.get().strip() if hasattr(self, "alert_feed_filter_var") else "All Feeds"
+
+        for item in self.alert_tree.get_children():
+            self.alert_tree.delete(item)
+
+        matched_rows: List[Tuple[str, str, str, str, str]] = []
+        for row in self._all_alerts_cache:
+            ts, ind, feed, proc, layer = row
+            if query and not any(query in str(field).lower() for field in (ts, ind, feed, proc, layer)):
+                continue
+            if selected_feed != "All Feeds":
+                feed_lower = feed.lower()
+                sel_lower = selected_feed.lower()
+                if sel_lower == "lots" and "lots" not in feed_lower:
+                    continue
+                elif sel_lower in ("botnet / c2", "c2") and not any(k in feed_lower for k in ("feodo", "threatfox", "botnet", "c2")):
+                    continue
+                elif sel_lower == "urlhaus" and "urlhaus" not in feed_lower:
+                    continue
+                elif sel_lower == "oisd" and "oisd" not in feed_lower:
+                    continue
+                elif sel_lower == "canary" and "canary" not in feed_lower:
+                    continue
+            matched_rows.append(row)
+
+        col_idx_map = {"time": 0, "indicator": 1, "feed": 2, "process": 3, "layer": 4}
+        idx = col_idx_map.get(self._sort_col, 0)
+        matched_rows.sort(key=lambda r: str(r[idx]).lower(), reverse=self._sort_reverse)
+
+        for r in matched_rows[:150]:
+            self.alert_tree.insert("", tk.END, values=r)
+
+    def _sort_alert_tree_by_column(self, col: str) -> None:
+        """Sort alert table by selected column header and toggle direction."""
+        if self._sort_col == col:
+            self._sort_reverse = not self._sort_reverse
+        else:
+            self._sort_col = col
+            self._sort_reverse = False
+
+        cols = ("time", "indicator", "feed", "process", "layer")
+        display_names = {
+            "time": "Timestamp (UTC)",
+            "indicator": "Flagged Domain / IP",
+            "feed": "Matched Threat Feed",
+            "process": "Attributed Process",
+            "layer": "Detection Layer",
+        }
+        for c in cols:
+            arrow = " ▼" if (c == self._sort_col and self._sort_reverse) else (" ▲" if c == self._sort_col else " ⇅")
+            self.alert_tree.heading(c, text=f"{display_names[c]}{arrow}")
+
+        self._apply_alert_filters()
+
+    def _clear_alert_feed(self) -> None:
+        """Clear alerts from memory and offer to purge local alerts file."""
+        if messagebox.askyesno(
+            "Clear Threat Feed",
+            "Clear all alerts from the view?\n\nClick 'Yes' to also wipe the local alerts.jsonl file on disk.",
+        ):
+            self._all_alerts_cache.clear()
+            self._threat_rows_seen.clear()
+            self._monitor_service.clear_alerts(wipe_disk=True)
+            self._apply_alert_filters()
+            self.show_notification("Threat alert feed cleared & alerts.jsonl reset.", level="success")
+        else:
+            self._all_alerts_cache.clear()
+            self._threat_rows_seen.clear()
+            self._monitor_service.clear_alerts(wipe_disk=False)
+            self._apply_alert_filters()
+
+    def _on_toggle_ai_only_mode(self) -> None:
+        """Toggle AI-only wire filtering mode to save CPU overhead."""
+        enabled = self.ai_only_mode_var.get()
+        self._monitor_service.set_ai_only_mode(enabled)
+        msg = "⚡ AI-Only Wire Filter Mode ENABLED (Low CPU / 60 FPS)" if enabled else "AI-Only Wire Filter Mode DISABLED (Inspecting all system traffic)"
+        self.show_notification(msg, level="info" if enabled else "warning")
+
+    def _on_toggle_mute_heavy_apps(self) -> None:
+        """Toggle ignoring heavy background apps to eliminate packet overload."""
+        enabled = self.mute_heavy_apps_var.get()
+        if enabled:
+            procs = ["steam.exe", "steamservice.exe", "steamwebhelper.exe", "epicgameslauncher.exe", "onedrive.exe", "dropbox.exe", "spotify.exe"]
+            self._monitor_service.set_ignored_processes(procs)
+            self.show_notification("🔇 Background heavy apps muted (Steam, Media, Cloud).", level="info")
+        else:
+            self._monitor_service.set_ignored_processes([])
+            self.show_notification("All background applications unmuted.", level="info")
 
     @property
     def threats_detected(self) -> int:
@@ -2161,7 +2481,7 @@ class PacketSentinelDesktopApp:
     def _on_alert_received(self, alert: Any) -> None:
         """
         Handle a live security alert emitted by the packet monitoring pipeline.
-        Updates counters and inserts a row into both alert tables.
+        Updates counters and inserts a row into the alert table with 5-Gate DLP safety.
         """
         ts = (
             getattr(alert, "timestamp_utc", None)
@@ -2194,10 +2514,10 @@ class PacketSentinelDesktopApp:
         if row_key not in self._threat_rows_seen:
             self._threat_rows_seen.add(row_key)
             row_values = (ts, ind, feed, proc, layer)
-            if hasattr(self, "alert_tree"):
-                self.alert_tree.insert("", 0, values=row_values)
-            if hasattr(self, "mc_alert_tree") and self.mc_alert_tree is not self.alert_tree:
-                self.mc_alert_tree.insert("", 0, values=row_values)
+            self._all_alerts_cache.insert(0, row_values)
+            if len(self._all_alerts_cache) > 200:
+                self._all_alerts_cache = self._all_alerts_cache[:200]
+            self._apply_alert_filters()
 
         self.show_notification(
             f"🚨 Threat Intercepted: {ind} ({proc or 'Unknown Process'})",

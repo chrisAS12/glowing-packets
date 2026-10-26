@@ -92,6 +92,27 @@ class LiveMonitorService:
             self._monitor.stop()
             self._running = False
 
+    def set_ai_only_mode(self, enabled: bool) -> None:
+        """Filter packet monitoring to AI IDE tools and script interpreters only."""
+        self._monitor.set_ai_only_mode(enabled)
+
+    def set_ignored_processes(self, procs: List[str]) -> None:
+        """Set process names to skip during packet inspection to save CPU."""
+        self._monitor.set_ignored_processes(procs)
+
+    def clear_alerts(self, wipe_disk: bool = False) -> None:
+        """Clear cached alerts and optionally wipe the local alerts.jsonl file."""
+        with self._lock:
+            self._cached_alerts.clear()
+            self._last_alerts_mtime = -1.0
+            self._last_alerts_size = -1
+        if wipe_disk:
+            try:
+                if self.alerts_file.exists():
+                    self.alerts_file.write_text("", encoding="utf-8")
+            except Exception:
+                pass
+
     def shutdown(self) -> None:
         self.stop()
         self._notifier.close()

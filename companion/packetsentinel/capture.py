@@ -31,6 +31,49 @@ from .threat_intel import ThreatIntelEngine, ThreatMatch
 
 logger = logging.getLogger("packetsentinel.capture")
 
+AI_PROCESS_NAMES: frozenset[str] = frozenset(
+    {
+        "cursor.exe",
+        "cursor",
+        "code.exe",
+        "code",
+        "kiro.exe",
+        "kiro",
+        "windsurf.exe",
+        "windsurf",
+        "claude.exe",
+        "claude",
+        "antigravity.exe",
+        "antigravity",
+        "python.exe",
+        "python",
+        "python3.exe",
+        "python3",
+        "node.exe",
+        "node",
+        "powershell.exe",
+        "pwsh.exe",
+        "cmd.exe",
+        "curl.exe",
+        "curl",
+        "sentinelwire-self-test",
+        "sentinelwire",
+        "test.exe",
+    }
+)
+
+DEFAULT_IGNORED_PROCESSES: frozenset[str] = frozenset(
+    {
+        "steam.exe",
+        "steamservice.exe",
+        "steamwebhelper.exe",
+        "epicgameslauncher.exe",
+        "onedrive.exe",
+        "dropbox.exe",
+        "spotify.exe",
+    }
+)
+
 
 @dataclass(frozen=True)
 class CaptureHealthStatus:
@@ -175,8 +218,26 @@ class PacketSentinelMonitor:
         self._baseline_initialized: bool = False
         self._process_packet_counts: Dict[str, int] = {}
         self._pid_packet_counts: Dict[int, int] = {}
+        self._ai_only_mode: bool = False
+        self._ignored_processes: Set[str] = set(DEFAULT_IGNORED_PROCESSES)
 
         atexit.register(self.stop)
+
+    def set_ai_only_mode(self, enabled: bool) -> None:
+        """Toggle AI-only filtering to eliminate 90%+ of non-AI background packet processing."""
+        self._ai_only_mode = bool(enabled)
+
+    def set_ignored_processes(self, procs: Sequence[str]) -> None:
+        """Set process basenames to ignore during packet inspection."""
+        self._ignored_processes = {p.lower().strip() for p in procs if p.strip()}
+
+    @property
+    def ai_only_mode(self) -> bool:
+        return self._ai_only_mode
+
+    @property
+    def ignored_processes(self) -> Set[str]:
+        return set(self._ignored_processes)
 
     @property
     def packets_inspected(self) -> int:
@@ -281,6 +342,26 @@ class PacketSentinelMonitor:
             if proc.pid > 0:
                 self._pid_packet_counts[proc.pid] = self._pid_packet_counts.get(proc.pid, 0) + 1
 
+            # Performance filtering: skip packet inspection for ignored background processes
+            # (unless an anomalous LOTS webhook connection is detected)
+            if self._ignored_processes and p_name in self._ignored_processes:
+                if domain:
+                    lots_risk = check_lots_risk(proc.name, domain, port=dst_port or 443)
+                    if not (lots_risk and lots_risk.is_threat):
+                        return
+                else:
+                    return
+
+            # AI-only mode: only inspect AI editors/tools, script interpreters, and test canaries
+            is_canary = bool(domain and "canary" in domain.lower())
+            if self._ai_only_mode and not is_canary and p_name not in AI_PROCESS_NAMES and p_name != "unknown":
+                if domain:
+                    lots_risk = check_lots_risk(proc.name, domain, port=dst_port or 443)
+                    if not (lots_risk and lots_risk.is_threat):
+                        return
+                else:
+                    return
+
         # 1. Check domain name (DNS query or TLS ClientHello SNI)
         if domain:
             for single_dom in domain.split(","):
@@ -354,8 +435,9 @@ class PacketSentinelMonitor:
         for idx_str, _ in ifaces:
             cmd.extend(["-i", idx_str])
 
-        # BPF filter captures only DNS (port 53), HTTPS/TLS handshakes (port 443), and new TCP SYN packets
-        bpf_filter = "udp port 53 or tcp port 53 or tcp dst port 443 or (tcp[tcpflags] & tcp-syn != 0)"
+        # Optimized BPF filter: captures DNS (port 53), TCP SYN handshakes, and TLS ClientHello records (0x16)
+        # Avoids capturing bulk encrypted payload segments (video/audio streaming) to eliminate CPU spikes
+        bpf_filter = "udp port 53 or tcp port 53 or (tcp[tcpflags] & tcp-syn != 0) or (tcp port 443 and tcp[((tcp[12:1] & 0xf0) >> 2):1] == 0x16)"
         cmd.extend(
             [
                 "-l",  # Flush stdout line-by-line immediately
@@ -509,7 +591,7 @@ class PacketSentinelMonitor:
             except Exception:
                 pass
 
-            self._stop_event.wait(1.0)
+            self._stop_event.wait(2.0)
 
     def _poll_windows_dns_cache(self, ipconfig_path: str) -> None:
         """
