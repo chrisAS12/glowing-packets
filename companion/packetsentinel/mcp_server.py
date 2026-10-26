@@ -13,14 +13,16 @@ from __future__ import annotations
 import json
 import os
 import sys
+import time
 from pathlib import Path
 from typing import Any, BinaryIO, Dict, List, Optional, Sequence
 
 from . import __version__
-from .config import AppConfig
+from .config import AppConfig, get_app_data_dir
 from .egress_guard import engage_runtime_network_lockdown, is_runtime_network_lockdown_active
 from .lots_guard import check_ai_package_safety
-from .mcp_privacy import PrivacySanitizer, sanitize_prompt_injection
+from .mcp_privacy import PrivacySanitizer, audit_code_secrets, sanitize_prompt_injection
+from .security_auditor import audit_environment_security, audit_listening_ports, audit_network_hygiene
 from .threat_intel import ThreatIntelEngine
 
 
@@ -230,6 +232,73 @@ MCP_TOOLS_SCHEMA: List[Dict[str, Any]] = [
                 },
             },
             "required": ["package_name"],
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "audit_staged_code_for_secrets",
+        "description": (
+            "Scan a code snippet, git diff, or staged file content for exposed API keys, "
+            "GitHub tokens, private keys, JWTs, and live credit cards/IBANs before committing or AI context ingestion."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "content": {
+                    "type": "string",
+                    "description": "Source code text, diff, or script content to scan for secret leaks.",
+                },
+            },
+            "required": ["content"],
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "audit_listening_ports",
+        "description": (
+            "Inspect local host listening ports (<5ms) to detect dev servers, databases (Redis, Postgres, Mongo), "
+            "or local LLM APIs (Ollama) accidentally exposed to the LAN/Wi-Fi on 0.0.0.0 instead of 127.0.0.1."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {},
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "audit_environment_security",
+        "description": (
+            "Inspect environment variables or a .env template for script execution hijack vectors "
+            "(NODE_OPTIONS, PYTHONPATH injection, LD_PRELOAD, proxy interception, or custom CA certs)."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "custom_env_text": {
+                    "type": "string",
+                    "description": "Optional raw .env file text to analyze instead of host environment.",
+                },
+            },
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "get_mcp_audit_log",
+        "description": (
+            "Retrieve recent local MCP tool-call invocation audit logs, showing which files and tools "
+            "AI coding assistants requested and whether any DLP redactions or prompt injections occurred."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "limit": {
+                    "type": "integer",
+                    "description": "Maximum number of recent audit records to return (1 to 50).",
+                    "default": 20,
+                    "minimum": 1,
+                    "maximum": 50,
+                },
+            },
             "additionalProperties": False,
         },
     },
@@ -532,6 +601,65 @@ class PacketSentinelMCPServer:
         result = check_ai_package_safety(package_name, ecosystem=ecosystem)
         return result.to_dict()
 
+    def tool_audit_staged_code_for_secrets(self, content: str) -> Dict[str, Any]:
+        """Scan code snippet or staged diff for exposed secrets and private keys."""
+        return audit_code_secrets(content)
+
+    def tool_audit_listening_ports(self) -> Dict[str, Any]:
+        """Inspect local listening sockets for exposed dev servers or databases."""
+        return audit_listening_ports()
+
+    def tool_audit_environment_security(self, custom_env_text: Optional[str] = None) -> Dict[str, Any]:
+        """Inspect environment variables for script injection and proxy hijack vectors."""
+        return audit_environment_security(custom_env_text=custom_env_text)
+
+    def tool_get_mcp_audit_log(self, limit: int = 20) -> Dict[str, Any]:
+        """Retrieve recent local MCP tool-call invocation audit logs."""
+        log_dir = get_app_data_dir()
+        log_path = log_dir / "mcp_audit.jsonl"
+        if not log_path.exists():
+            return {"status": "success", "count": 0, "audit_records": []}
+
+        try:
+            lines = log_path.read_text(encoding="utf-8", errors="replace").splitlines()
+            records: List[Dict[str, Any]] = []
+            for line in lines[-max(1, min(50, limit)) :]:
+                if line.strip():
+                    try:
+                        records.append(json.loads(line))
+                    except Exception:
+                        continue
+            records.reverse()
+            return {"status": "success", "count": len(records), "audit_records": records}
+        except Exception as exc:
+            return {"status": "error", "reason": self._sanitizer.sanitize_text(str(exc))}
+
+    def _log_mcp_audit(
+        self,
+        tool_name: str,
+        is_error: bool = False,
+        duration_ms: float = 0.0,
+        dlp_blocked: bool = False,
+        details: Optional[str] = None,
+    ) -> None:
+        """Write an anonymized, DLP-safe audit record to local mcp_audit.jsonl."""
+        try:
+            log_dir = get_app_data_dir()
+            log_path = log_dir / "mcp_audit.jsonl"
+            record = {
+                "timestamp_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                "tool_name": tool_name,
+                "is_error": is_error,
+                "duration_ms": round(duration_ms, 2),
+                "dlp_gate_blocked": dlp_blocked,
+            }
+            if details:
+                record["details"] = details[:120]
+            with log_path.open("a", encoding="utf-8") as fh:
+                fh.write(json.dumps(record) + "\n")
+        except Exception:
+            pass
+
     def handle_jsonrpc_message(self, request: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         if not isinstance(request, dict):
             return {
@@ -623,6 +751,20 @@ class PacketSentinelMCPServer:
                         package_name=str(tool_args.get("package_name", "")),
                         ecosystem=str(tool_args.get("ecosystem", "pypi")),
                     )
+                elif tool_name == "audit_staged_code_for_secrets":
+                    payload = self.tool_audit_staged_code_for_secrets(
+                        content=str(tool_args.get("content", ""))
+                    )
+                elif tool_name == "audit_listening_ports":
+                    payload = self.tool_audit_listening_ports()
+                elif tool_name == "audit_environment_security":
+                    payload = self.tool_audit_environment_security(
+                        custom_env_text=tool_args.get("custom_env_text")
+                    )
+                elif tool_name == "get_mcp_audit_log":
+                    payload = self.tool_get_mcp_audit_log(
+                        limit=int(tool_args.get("limit", 20))
+                    )
                 else:
                     return {
                         "jsonrpc": "2.0",
@@ -630,6 +772,7 @@ class PacketSentinelMCPServer:
                         "error": {"code": -32601, "message": f"Unknown tool: {tool_name}"},
                     }
 
+                self._log_mcp_audit(tool_name, is_error=False)
                 sanitized_json = self._sanitizer.sanitize_text(json.dumps(payload, indent=2))
                 return {
                     "jsonrpc": "2.0",
@@ -640,6 +783,7 @@ class PacketSentinelMCPServer:
                     },
                 }
             except Exception as exc:
+                self._log_mcp_audit(tool_name, is_error=True, dlp_blocked=("DLP_GATE_BLOCKED" in str(exc)))
                 safe_err = self._sanitizer.sanitize_text(str(exc))
                 return {
                     "jsonrpc": "2.0",

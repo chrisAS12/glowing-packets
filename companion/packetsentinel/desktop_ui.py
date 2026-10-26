@@ -62,6 +62,7 @@ from .live_monitor_service import AlertRow, LiveMonitorService, MonitorSnapshot
 from .mcp_privacy import PrivacySanitizer
 from .process_watchdog import inspect_child_lineage
 from .security import is_public_routable_ip
+from .security_auditor import audit_environment_security, audit_listening_ports
 from .vault import EncryptedVaultManager, VaultSettings
 from .voice_engine import (
     MicrophoneRecorder,
@@ -459,9 +460,21 @@ class PacketSentinelDesktopApp:
             btn.pack(fill=tk.X, padx=6, pady=2)
             self._nav_buttons.append(btn)
 
-        # Bottom of sidebar: AppData quick link
+        # Bottom of sidebar: Security audit & AppData quick links
         side_footer = tk.Frame(sidebar, bg=BG_SURFACE)
         side_footer.pack(side=tk.BOTTOM, fill=tk.X, padx=6, pady=8)
+
+        sec_audit_btn = create_styled_button(
+            side_footer,
+            text="Host Security Audit",
+            icon="🛡️",
+            style="ghost",
+            command=self._quick_run_security_audit,
+            font=FONT_SMALL,
+            padx=8,
+            pady=4,
+        )
+        sec_audit_btn.pack(fill=tk.X, pady=2)
 
         appdata_btn = create_styled_button(
             side_footer,
@@ -3800,6 +3813,53 @@ class PacketSentinelDesktopApp:
         )
         nuke_btn.pack(side=tk.RIGHT)
 
+        # Section 5: Developer Machine Security & Port Exposure Audit
+        s5 = create_card_frame(scrollable_frame, padx=14, pady=12)
+        s5.pack(fill=tk.X, pady=(0, 16))
+
+        tk.Label(s5, text="5. Developer Machine Security & Port Exposure Audit", font=FONT_SECTION, fg=TEXT_MAIN, bg=BG_CARD).pack(anchor=tk.W, pady=(0, 4))
+        tk.Label(
+            s5,
+            text="Scans local sockets (<5ms) for dev servers/databases accidentally exposed to the LAN on 0.0.0.0 (Ollama 11434, Redis, Postgres, Vite) and checks environment variables for hijacking:",
+            font=FONT_BODY,
+            fg=TEXT_MUTED,
+            bg=BG_CARD,
+            wraplength=700,
+            justify=tk.LEFT,
+        ).pack(anchor=tk.W, pady=(0, 6))
+
+        self.sec_audit_text = tk.Text(
+            s5,
+            bg=BG_CANVAS,
+            fg=TEXT_BODY,
+            font=FONT_MONO,
+            relief=tk.FLAT,
+            wrap=tk.NONE,
+            height=7,
+            highlightbackground=BORDER_COLOR,
+            highlightthickness=1,
+            padx=8,
+            pady=6,
+        )
+        self.sec_audit_text.pack(fill=tk.BOTH, expand=True, pady=(0, 8))
+        self.sec_audit_text.insert(tk.END, "Ready to audit. Click 'Run Security Audit' below to inspect listening ports & environment.")
+        self.sec_audit_text.config(state=tk.DISABLED)
+
+        sec_act_row = tk.Frame(s5, bg=BG_CARD)
+        sec_act_row.pack(fill=tk.X)
+
+        run_audit_btn = create_styled_button(
+            sec_act_row,
+            text="Run Security Audit",
+            icon="🛡️",
+            style="primary",
+            command=self._run_security_audit_handler,
+            font=FONT_BOLD,
+            padx=10,
+            pady=5,
+        )
+        run_audit_btn.pack(side=tk.LEFT, padx=(0, 6))
+
         self._refresh_diag_logs()
 
     def _save_settings_vault(self) -> None:
@@ -4104,6 +4164,45 @@ class PacketSentinelDesktopApp:
                 subprocess.run(["xdg-open", str(app_dir)], check=False, shell=False)
         except Exception as e:
             messagebox.showerror("Error Opening AppData", f"Could not open directory: {e}")
+
+    def _quick_run_security_audit(self) -> None:
+        self._select_nav(3)  # Switch to Settings & Vault tab
+        self._run_security_audit_handler()
+
+    def _run_security_audit_handler(self) -> None:
+        if not hasattr(self, "sec_audit_text"):
+            return
+        self.sec_audit_text.config(state=tk.NORMAL)
+        self.sec_audit_text.delete("1.0", tk.END)
+
+        port_res = audit_listening_ports()
+        env_res = audit_environment_security()
+
+        lines = [
+            f"=== Developer Machine Security Audit ({time.strftime('%Y-%m-%d %H:%M:%S')}) ===",
+            f"Total listening sockets evaluated: {port_res.get('total_listeners', 0)}",
+        ]
+
+        exposed = port_res.get("exposed_ports", [])
+        if exposed:
+            lines.append(f"\n⚠️  [WARN] {len(exposed)} Port(s) Exposed on 0.0.0.0 (Local Network Accessible):")
+            for p in exposed:
+                lines.append(
+                    f"  • Port {p['port']}/TCP ({p.get('service', 'unknown')}): PID {p.get('pid')} [{p.get('process_name')}] - {p.get('recommendation', '')}"
+                )
+        else:
+            lines.append("\n✅ All dev ports & databases safely bound to 127.0.0.1 (No 0.0.0.0 exposure).")
+
+        env_findings = env_res.get("findings", [])
+        if env_findings:
+            lines.append(f"\n⚠️  [WARN] {len(env_findings)} Suspicious Environment Variables:")
+            for f in env_findings:
+                lines.append(f"  • [{f.get('severity')}] {f.get('variable')}: {f.get('description')}")
+        else:
+            lines.append("✅ Environment variables clean (No proxy hijack or loader injection detected).")
+
+        self.sec_audit_text.insert(tk.END, "\n".join(lines))
+        self.sec_audit_text.config(state=tk.DISABLED)
 
     def _refresh_diag_logs(self) -> None:
         log_file = get_log_dir() / "sentinelwire.log"

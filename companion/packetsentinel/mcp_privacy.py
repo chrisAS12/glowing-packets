@@ -545,6 +545,105 @@ def sanitize_prompt_injection(text: str) -> PromptInjectionScanResult:
     )
 
 
+def audit_code_secrets(content: str) -> Dict[str, Any]:
+    """
+    Scan code diff or text for accidental secret leaks, uncommitted API keys,
+    private tokens, and private identifiers before git commit or AI ingestion.
+    Returns structured list of findings with line numbers and masked snippets.
+    """
+    if not content or not isinstance(content, str):
+        return {"has_secrets": False, "findings_count": 0, "findings": []}
+
+    findings: List[Dict[str, Any]] = []
+    lines = content.splitlines()
+
+    for line_idx, line in enumerate(lines, start=1):
+        # 1. API Keys
+        for m in _API_KEY_RE.finditer(line):
+            token = m.group(0)
+            masked = token[:4] + "..." + token[-4:] if len(token) > 8 else "***"
+            findings.append({
+                "line": line_idx,
+                "category": "API_KEY",
+                "severity": "HIGH",
+                "description": f"Exposed API key detected ({masked})",
+            })
+
+        # 2. GitHub Tokens
+        for m in _GITHUB_TOKEN_RE.finditer(line):
+            token = m.group(0)
+            masked = token[:4] + "..." + token[-4:] if len(token) > 8 else "***"
+            findings.append({
+                "line": line_idx,
+                "category": "GITHUB_TOKEN",
+                "severity": "CRITICAL",
+                "description": f"Exposed GitHub Personal Access Token detected ({masked})",
+            })
+
+        # 3. JWTs
+        for m in _JWT_RE.finditer(line):
+            findings.append({
+                "line": line_idx,
+                "category": "JWT_TOKEN",
+                "severity": "HIGH",
+                "description": "Exposed JSON Web Token (JWT) detected",
+            })
+
+        # 4. Bearer / Basic Auth headers
+        for m in _BEARER_HEADER_RE.finditer(line):
+            findings.append({
+                "line": line_idx,
+                "category": "BEARER_TOKEN",
+                "severity": "HIGH",
+                "description": "Hardcoded Authorization Bearer/Basic credential detected",
+            })
+
+        # 5. Secret assignments (e.g. password = "...")
+        for m in _SECRET_ASSIGNMENT_RE.finditer(line):
+            findings.append({
+                "line": line_idx,
+                "category": "HARDCODED_SECRET",
+                "severity": "MEDIUM",
+                "description": f"Hardcoded credential assignment: {m.group(1)}",
+            })
+
+        # 6. Payment cards
+        for m in _CARD_CANDIDATE_RE.finditer(line):
+            digits = "".join(ch for ch in m.group(0) if ch.isdigit())
+            if is_valid_luhn(digits):
+                findings.append({
+                    "line": line_idx,
+                    "category": "PAYMENT_CARD",
+                    "severity": "CRITICAL",
+                    "description": "Live Luhn-validated payment card number detected",
+                })
+
+        # 7. IBANs
+        for m in _IBAN_CANDIDATE_RE.finditer(line):
+            if is_valid_iban(m.group(0)):
+                findings.append({
+                    "line": line_idx,
+                    "category": "IBAN",
+                    "severity": "HIGH",
+                    "description": "Live ISO-7064 IBAN bank account detected",
+                })
+
+    # Multi-line check: PEM private keys
+    if _PEM_PRIVATE_KEY_RE.search(content):
+        findings.append({
+            "line": 1,
+            "category": "PRIVATE_KEY",
+            "severity": "CRITICAL",
+            "description": "Unencrypted PEM private key detected in code content",
+        })
+
+    return {
+        "has_secrets": len(findings) > 0,
+        "findings_count": len(findings),
+        "findings": findings,
+    }
+
+
 def _strip_embedded_media(out: str) -> str:
     out = _INLINE_IMAGE_DATA_URI_RE.sub("[REDACTED_INLINE_IMAGE_DATA_URI]", out)
     return strip_inline_svg_blocks(out)
