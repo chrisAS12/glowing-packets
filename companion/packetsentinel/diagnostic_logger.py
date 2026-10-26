@@ -2,7 +2,7 @@
 Diagnostic Logging, Anonymized Forum Export, and Local Privacy Purge.
 
 Stores diagnostic and operational logs in a user-inspectable, non-administrative
-directory (%LOCALAPPDATA%\\PacketSentinel\\logs\\).
+directory (%LOCALAPPDATA%\\SentinelWire\\logs\\).
 Enables users to inspect, export sanitized diagnostic bundles for GitHub Issues / forums,
 or permanently wipe all stored logs and temporary files with 1 click.
 """
@@ -235,7 +235,7 @@ def setup_diagnostic_logging(
     """Configure rotating file logging in the local user AppData directory.
 
     Ensures that root logger, `sentinelwire.*`, and `packetsentinel.*` all
-    properly write to `%LOCALAPPDATA%\\PacketSentinel\\logs\\sentinelwire.log`
+    properly write to `%LOCALAPPDATA%\\SentinelWire\\logs\\sentinelwire.log`
     with automatic 5-Gate DLP / PrivacySanitizer scrubbing.
     """
     global _diagnostic_file_handler
@@ -412,7 +412,7 @@ def record_kill_switch_incident(
 ) -> Path:
     """Record a post-mortem incident snapshot when the Emergency Kill Switch is triggered.
 
-    Stores the event under %LOCALAPPDATA%\\PacketSentinel\\logs\\incident_reports\\
+    Stores the event under %LOCALAPPDATA%\\SentinelWire\\logs\\incident_reports\\
     so the user can inspect or safely report what happened without exposing machine identifiers.
     """
     import json

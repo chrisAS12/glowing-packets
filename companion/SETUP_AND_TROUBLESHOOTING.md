@@ -15,14 +15,16 @@ python run_packetsentinel.py --setup
 ### What the 5 Steps Do & Test
 
 1. **Step 1 — Privacy & Local Storage Consent**
-   - **What it does**: Creates your user-scoped folder at `%LOCALAPPDATA%\PacketSentinel` (`cache/`, `logs/`, `config.json`, and `custom_sketchy_domains.txt`).
-   - **Why it's done this way**: Storing cached blocklists in `%LOCALAPPDATA%` instead of a shared `C:\Temp` directory prevents other local users or low-privilege processes from swapping cache files (TOCTOU / symlink attacks). Furthermore, `PacketSentinel` only inspects packet headers (DNS domain query, TLS SNI hostname, IP/port, and local `.exe` name)—it **never** captures or logs payload contents.
+   - **What it does**: Creates your user-scoped folder at `%LOCALAPPDATA%\SentinelWire` (`cache/`, `logs/`, `config.json`, and `custom_sketchy_domains.txt`).
+   - **Why it's done this way**: Storing cached blocklists in `%LOCALAPPDATA%` instead of a shared `C:\Temp` directory prevents other local users or low-privilege processes from swapping cache files (TOCTOU / symlink attacks).
+     Furthermore, `PacketSentinel` only inspects packet headers (DNS domain query, TLS SNI hostname, IP/port, and local `.exe` name)—it **never** captures or logs payload contents.
 2. **Step 2 — Process Attribution Check (`psutil`)**
    - **What it does**: Tests reading the active Windows TCP/UDP socket table and mapping local ports to running `.exe` processes.
    - **Why it's done this way**: Knowing that a packet went to a sketchy domain is only half the story; mapping the source port to a specific PID and `.exe` tells you *which application* sent it.
 3. **Step 3 — Wireshark (`tshark.exe`) & Npcap Driver Check**
    - **What it does**: Checks `C:\Program Files\Wireshark\tshark.exe` and queries the Windows `npcap` driver service (`sc query npcap`), then lists your active capture interfaces (`WiFi`, `Ethernet`, `NPF_Loopback`).
-   - **Why it's done this way**: We resolve `tshark.exe` strictly from verified absolute `Program Files` paths (never from the current working directory) to prevent Windows DLL/binary planting attacks. If Wireshark/Npcap is not installed, `PacketSentinel` automatically enables its **Zero-Admin Socket & Windows DNS Cache fallback** so you are still protected.
+   - **Why it's done this way**: We resolve `tshark.exe` strictly from verified absolute `Program Files` paths (never from the current working directory) to prevent Windows DLL/binary planting attacks.
+     If Wireshark/Npcap is not installed, `PacketSentinel` automatically enables its **Zero-Admin Socket & Windows DNS Cache fallback** so you are still protected.
 4. **Step 4 — HTTPS Threat Feed Download & SHA-256 Cache Verification**
    - **What it does**: Downloads community-maintained sketchy DNS and botnet C2 IP feeds over HTTPS (`TLS 1.2+` minimum, strict certificate verification, SSRF public-IP verification, and 15 MB stream size cap) and saves them atomically with a `SHA-256` integrity hash.
    - **Why it's done this way**: Verifying that every feed URL resolves strictly to a public routable IP prevents Server-Side/Client-Side Request Forgery (SSRF) against local LAN or cloud metadata services (`169.254.169.254`).
@@ -51,12 +53,12 @@ python run_packetsentinel.py --setup
   2. Confirm **Notifications** is toggled **On**.
   3. Turn **Do not disturb** (Focus Assist) **Off**.
   4. Scroll down the app list and ensure notifications are enabled for **Windows PowerShell**.
-  5. Note: Even when Windows mutes visual popups (e.g., while playing a full-screen game), every alert is still written in real time to `%LOCALAPPDATA%\PacketSentinel\logs\alerts.jsonl`.
+  5. Note: Even when Windows mutes visual popups (e.g., while playing a full-screen game), every alert is still written in real time to `%LOCALAPPDATA%\SentinelWire\logs\alerts.jsonl`.
 
 ### Issue C: Threat Feed Download Failed (Offline or Firewall Blocked)
 - **Symptom**: Step 4 warns that a feed could not be fetched over HTTPS.
 - **How to Fix**:
-  - `PacketSentinel` automatically falls back to its last SHA-256 verified local cache in `%LOCALAPPDATA%\PacketSentinel\cache` and your local custom file `%LOCALAPPDATA%\PacketSentinel\custom_sketchy_domains.txt`.
+  - `PacketSentinel` automatically falls back to its last SHA-256 verified local cache in `%LOCALAPPDATA%\SentinelWire\cache` and your local custom file `%LOCALAPPDATA%\SentinelWire\custom_sketchy_domains.txt`.
   - Ensure outbound HTTPS (`TCP port 443`) is allowed to `raw.githubusercontent.com`, `feodotracker.abuse.ch`, and `v.firebog.net`.
 
 ---

@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Set
@@ -138,15 +139,40 @@ HELP_REPO_URL = "https://github.com/chrisAS12/glowing-packets"
 
 
 def get_app_data_dir() -> Path:
-    override = os.environ.get("PACKETSENTINEL_HOME")
+    override = os.environ.get("SENTINELWIRE_HOME") or os.environ.get("PACKETSENTINEL_HOME")
     if override:
         base = Path(override).expanduser().resolve()
-    else:
-        local_app_data = os.environ.get("LOCALAPPDATA")
-        base = (Path(local_app_data) / "PacketSentinel") if local_app_data else (Path.home() / ".packetsentinel")
+        base.mkdir(parents=True, exist_ok=True)
+        return base
 
-    base.mkdir(parents=True, exist_ok=True)
-    return base
+    local_app_data = os.environ.get("LOCALAPPDATA")
+    canonical_base = (Path(local_app_data) / "SentinelWire") if local_app_data else (Path.home() / ".sentinelwire")
+    legacy_base = (Path(local_app_data) / "PacketSentinel") if local_app_data else (Path.home() / ".packetsentinel")
+
+    should_migrate = not canonical_base.exists() and legacy_base.exists()
+    canonical_base.mkdir(parents=True, exist_ok=True)
+
+    if should_migrate:
+        items_to_migrate = [
+            "config.json",
+            "custom_sketchy_domains.txt",
+            "latest_voice_prompt.json",
+            "models",
+            "vault.bin",
+        ]
+        for item_name in items_to_migrate:
+            src = legacy_base / item_name
+            dst = canonical_base / item_name
+            if src.exists() and not dst.exists():
+                try:
+                    if src.is_dir():
+                        shutil.copytree(src, dst)
+                    else:
+                        shutil.copy2(src, dst)
+                except Exception:
+                    pass
+
+    return canonical_base
 
 
 @dataclass

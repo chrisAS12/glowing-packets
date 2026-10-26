@@ -2077,7 +2077,7 @@ class PacketSentinelDesktopApp:
         if not children:
             self.watchdog_results.insert(tk.END, "    - No spawned child script interpreters detected.\n")
 
-    def _on_space_pressed(self, event) -> None:
+    def _on_space_pressed(self, event: tk.Event) -> None:
         if isinstance(event.widget, (tk.Entry, tk.Text, ttk.Entry, ttk.Combobox)):
             return
         self._toggle_voice_recording()
@@ -2299,7 +2299,7 @@ class PacketSentinelDesktopApp:
         # Action Buttons
         tk.Label(card, text="Recommended Remediation Actions:", font=("Segoe UI", 9, "bold"), fg=TEXT_TITLE, bg=BG_CARD).pack(anchor=tk.W, pady=(0, 6))
 
-        def _terminate_process():
+        def _terminate_process() -> None:
             if not proc or proc.lower() in ("unknown", "system"):
                 messagebox.showwarning("Cannot Terminate", "Origin process is system-level or unknown.")
                 return
@@ -2316,7 +2316,7 @@ class PacketSentinelDesktopApp:
                 messagebox.showinfo("Process Terminated", f"Successfully terminated {killed} instance(s) of '{proc}'.")
                 dialog.destroy()
 
-        def _copy_firewall_rule():
+        def _copy_firewall_rule() -> None:
             rule_cmd = (
                 f'New-NetFirewallRule -DisplayName "SentinelWire_Block_{indicator}" '
                 f'-Direction Outbound -RemoteAddress "{indicator}" -Action Block'
@@ -2328,7 +2328,7 @@ class PacketSentinelDesktopApp:
             except Exception as exc:
                 messagebox.showerror("Clipboard Error", str(exc))
 
-        def _ask_ai_remediation():
+        def _ask_ai_remediation() -> None:
             prompt = (
                 f"Security Incident Alert Analysis:\n"
                 f"Indicator: {indicator}\n"
@@ -2409,7 +2409,7 @@ class PacketSentinelDesktopApp:
         )
         canvas.configure(yscrollcommand=scrollbar.set)
 
-        def _on_mousewheel(event):
+        def _on_mousewheel(event: tk.Event) -> None:
             if event.delta:
                 canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
             elif event.num == 4:
@@ -2417,12 +2417,12 @@ class PacketSentinelDesktopApp:
             elif event.num == 5:
                 canvas.yview_scroll(1, "units")
 
-        def _bind_mousewheel(event):
+        def _bind_mousewheel(event: tk.Event) -> None:
             canvas.bind_all("<MouseWheel>", _on_mousewheel)
             canvas.bind_all("<Button-4>", _on_mousewheel)
             canvas.bind_all("<Button-5>", _on_mousewheel)
 
-        def _unbind_mousewheel(event):
+        def _unbind_mousewheel(event: tk.Event) -> None:
             canvas.unbind_all("<MouseWheel>")
             canvas.unbind_all("<Button-4>")
             canvas.unbind_all("<Button-5>")
@@ -2892,7 +2892,7 @@ class PacketSentinelDesktopApp:
                 ("h1", "What Happens When Engaged:"),
                 ("bullet", "• 1. Sockets Severed: Python PEP 578 runtime socket lockdown intercepts and terminates in-process network calls."),
                 ("bullet", "• 2. Processes Killed: Background sniffer threads and capture helpers (dumpcap, tshark) are terminated immediately."),
-                ("bullet", "• 3. Incident Recorded: An anonymized incident report is written to disk at %LOCALAPPDATA%\\PacketSentinel\\logs\\incident_reports\\kill_switch_incident_<timestamp>.json."),
+                ("bullet", "• 3. Incident Recorded: An anonymized incident report is written to disk at %LOCALAPPDATA%\\SentinelWire\\logs\\incident_reports\\kill_switch_incident_<timestamp>.json."),
                 ("h1", "Is the App Usable Afterwards?"),
                 ("body", "YES! The kill switch is temporary and immediate. It cleanly stops the running process. You can relaunch SentinelWire anytime using run.bat."),
                 ("h1", "Safe Reporting:"),
@@ -3337,6 +3337,9 @@ def launch_desktop_app(config: Optional[AppConfig] = None) -> None:
         raise
 
 
-# Backward-compatible alias
+# Backward-compatible aliases
+SentinelWireDesktopApp = PacketSentinelDesktopApp
 PacketSentinelApp = PacketSentinelDesktopApp
+SentinelWireApp = PacketSentinelDesktopApp
+
 

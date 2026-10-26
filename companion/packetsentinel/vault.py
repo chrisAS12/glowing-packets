@@ -134,16 +134,23 @@ def _dpapi_decrypt(ciphertext: bytes) -> bytes:
 def get_default_vault_path() -> Path:
     """Return default encrypted vault path in user's AppData or home directory.
 
-    PACKETSENTINEL_HOME relocates the vault together with logs and caches so that
-    tests and portable installs never touch the real user profile.
+    SENTINELWIRE_HOME or PACKETSENTINEL_HOME relocates the vault together with
+    logs and caches so that tests and portable installs never touch the real user profile.
     """
-    override = os.environ.get("PACKETSENTINEL_HOME")
+    override = os.environ.get("SENTINELWIRE_HOME") or os.environ.get("PACKETSENTINEL_HOME")
     if override:
         return Path(override).expanduser().resolve() / "vault.bin"
     base = os.environ.get("APPDATA")
     if base:
-        return Path(base) / "PacketSentinel" / "vault.bin"
-    return Path.home() / ".packetsentinel" / "vault.bin"
+        canonical = Path(base) / "SentinelWire" / "vault.bin"
+        legacy = Path(base) / "PacketSentinel" / "vault.bin"
+    else:
+        canonical = Path.home() / ".sentinelwire" / "vault.bin"
+        legacy = Path.home() / ".packetsentinel" / "vault.bin"
+
+    if not canonical.exists() and legacy.exists():
+        return legacy
+    return canonical
 
 
 _PLAINTEXT_MARKER = b"PLAINTEXT_0600:"
