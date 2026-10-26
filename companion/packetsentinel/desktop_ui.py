@@ -428,13 +428,23 @@ class PacketSentinelDesktopApp:
             bg=BG_SURFACE,
         ).pack(anchor=tk.W)
 
-        tk.Label(
+        self.cockpit_sub_lbl = tk.Label(
             h_left,
             text="Unified developer privacy airlock, voice dictation, live packet sniffer, and process watchdog.",
             font=FONT_BODY,
             fg=TEXT_MUTED,
             bg=BG_SURFACE,
-        ).pack(anchor=tk.W, pady=(2, 0))
+            wraplength=700,
+        )
+        self.cockpit_sub_lbl.pack(anchor=tk.W, pady=(2, 0))
+
+        def _on_cockpit_resize(event: tk.Event) -> None:
+            if event.width > 150:
+                self.cockpit_sub_lbl.configure(wraplength=max(250, event.width - 150))
+
+        cockpit_header.bind("<Configure>", _on_cockpit_resize)
+        self.cockpit_banner = cockpit_header
+        self.banner = cockpit_header
 
         h_right = tk.Frame(cockpit_header, bg=BG_SURFACE)
         h_right.pack(side=tk.RIGHT)
@@ -706,7 +716,7 @@ class PacketSentinelDesktopApp:
             "indicator": 240,
             "feed": 140,
             "process": 110,
-            "layer": 70,
+            "layer": 100,
         }
         self.mc_alert_tree, self.mc_alert_sb, self.mc_alert_container = create_data_table(
             right_col,
@@ -734,8 +744,16 @@ class PacketSentinelDesktopApp:
             relief=tk.FLAT,
             highlightbackground=BORDER_COLOR,
             highlightthickness=1,
+            wraplength=750,
         )
         banner.pack(fill=tk.X, pady=(0, 8))
+
+        def _on_airlock_banner_resize(event: tk.Event) -> None:
+            if event.width > 100:
+                banner.configure(wraplength=max(200, event.width - 32))
+
+        banner.bind("<Configure>", _on_airlock_banner_resize)
+        self.airlock_banner = banner
 
         # Hero Card for Voice Dictation & MCP Sync
         hero = tk.Frame(self.tab_airlock, bg=BG_CARD, padx=16, pady=10, highlightbackground=BORDER_COLOR, highlightthickness=1)
@@ -1936,6 +1954,95 @@ class PacketSentinelDesktopApp:
                                 alert.detection_layer,
                             ),
                         )
+
+    @property
+    def threats_detected(self) -> int:
+        """Total threats detected and emitted."""
+        return self._threat_count
+
+    @property
+    def packets_inspected(self) -> int:
+        """Total packets inspected by monitor service."""
+        return self._packet_count
+
+    def _on_alert_received(self, alert: Any) -> None:
+        """
+        Handle a live security alert emitted by the packet monitoring pipeline.
+        Updates counters and inserts a row into both alert tables.
+        """
+        ts = (
+            getattr(alert, "timestamp_utc", None)
+            or (alert.get("timestamp_utc") if isinstance(alert, dict) else None)
+            or (alert.get("timestamp") if isinstance(alert, dict) else None)
+            or ""
+        )
+        ind = (
+            getattr(alert, "indicator", None)
+            or (alert.get("indicator") if isinstance(alert, dict) else None)
+            or ""
+        )
+        feed = (
+            getattr(alert, "source_feed", None)
+            or (alert.get("source_feed") if isinstance(alert, dict) else None)
+            or ""
+        )
+        proc = (
+            getattr(alert, "process_name", None)
+            or (alert.get("process_name") if isinstance(alert, dict) else None)
+            or ""
+        )
+        layer = (
+            getattr(alert, "detection_layer", None)
+            or (alert.get("detection_layer") if isinstance(alert, dict) else None)
+            or ""
+        )
+
+        row_key = f"{ts}|{ind}|{proc}"
+        if row_key not in self._threat_rows_seen:
+            self._threat_rows_seen.add(row_key)
+            row_values = (ts, ind, feed, proc, layer)
+            if hasattr(self, "alert_tree"):
+                self.alert_tree.insert("", 0, values=row_values)
+            if hasattr(self, "mc_alert_tree"):
+                self.mc_alert_tree.insert("", 0, values=row_values)
+
+        self._threat_count += 1
+        if hasattr(self, "metric_value_labels") and len(self.metric_value_labels) >= 2:
+            threat_color = "#ef4444" if self._threat_count > 0 else "#22c55e"
+            self.metric_value_labels[1].config(text=f"{self._threat_count:,}", fg=threat_color)
+
+    def run_async_worker(
+        self,
+        worker_fn: Any,
+        on_success: Optional[Any] = None,
+        on_error: Optional[Any] = None,
+    ) -> threading.Thread:
+        """
+        Execute an asynchronous background worker on a real daemon thread and marshal
+        results or errors back to the Tkinter UI thread via self.root.after() with strict
+        Python 3 closure hygiene (avoiding 'NameError: free variable err').
+        """
+        def _worker_runner() -> None:
+            try:
+                result = worker_fn()
+                if on_success:
+                    self.root.after(0, lambda r=result: on_success(r))
+            except Exception as err:
+                err_msg = str(err)
+                if on_error:
+                    self.root.after(0, lambda m=err_msg: on_error(m))
+                else:
+                    self.root.after(0, lambda m=err_msg: self._on_async_worker_error(m))
+
+        t = threading.Thread(target=_worker_runner, daemon=True)
+        t.start()
+        return t
+
+    def _on_async_worker_error(self, message: str) -> None:
+        """Default error handler for async background workers."""
+        logger = logging.getLogger("sentinelwire.ui")
+        logger.warning(f"Async worker error: {message}")
+
 
     def _inspect_watchdog_target(self) -> None:
         target = ""
@@ -3228,3 +3335,8 @@ def launch_desktop_app(config: Optional[AppConfig] = None) -> None:
         logger = logging.getLogger("sentinelwire.ui")
         logger.critical("Fatal unhandled exception during desktop app launch: %s", exc, exc_info=True)
         raise
+
+
+# Backward-compatible alias
+PacketSentinelApp = PacketSentinelDesktopApp
+

@@ -277,6 +277,10 @@ class PacketSentinelMCPServer:
             "alerts": combined,
         }
 
+    def get_sanitized_security_alerts(self, limit: int = 20) -> Dict[str, Any]:
+        """Method alias matching MCP tool name."""
+        return self.tool_get_sanitized_security_alerts(limit=limit)
+
     def tool_check_indicator_reputation(self, indicator: str) -> Dict[str, Any]:
         raw_target = str(indicator or "").strip()
         if not raw_target or len(raw_target) > 255:
@@ -300,6 +304,10 @@ class PacketSentinelMCPServer:
             "ips_checked": self._threat_engine.ip_count,
             "zero_outbound_lookup": True,
         }
+
+    def check_indicator_reputation(self, indicator: str) -> Dict[str, Any]:
+        """Method alias matching MCP tool name."""
+        return self.tool_check_indicator_reputation(indicator=indicator)
 
     def tool_get_sanitized_system_diagnostics(self) -> Dict[str, Any]:
         return {
@@ -660,3 +668,24 @@ def run_mcp_stdio_server(
             _write_stdio_message(out_stream, err_resp, use_content_length=False)
 
     return 0
+
+
+def get_sanitized_security_alerts(
+    limit: int = 20,
+    server: Optional[PacketSentinelMCPServer] = None,
+    **kwargs: Any,
+) -> Dict[str, Any]:
+    """Module-level RPC exposure for get_sanitized_security_alerts."""
+    srv = server or PacketSentinelMCPServer(engage_lockdown=False)
+    return srv.tool_get_sanitized_security_alerts(limit=limit)
+
+
+def check_indicator_reputation(
+    indicator: str,
+    server: Optional[PacketSentinelMCPServer] = None,
+    **kwargs: Any,
+) -> Dict[str, Any]:
+    """Module-level RPC exposure for check_indicator_reputation."""
+    srv = server or PacketSentinelMCPServer(engage_lockdown=False)
+    return srv.tool_check_indicator_reputation(indicator=indicator)
+

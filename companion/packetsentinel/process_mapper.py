@@ -97,7 +97,7 @@ class ProcessMapper:
 
         try:
             conns = psutil.net_connections(kind="inet")
-        except (psutil.AccessDenied, OSError):
+        except (psutil.AccessDenied, OSError, RuntimeError, Exception):
             return
 
         for conn in conns:
@@ -167,7 +167,7 @@ class ProcessMapper:
         results: list[Tuple[str, int, str, int, ProcessInfo]] = []
         try:
             conns = psutil.net_connections(kind="inet")
-        except (psutil.AccessDenied, OSError):
+        except (psutil.AccessDenied, OSError, RuntimeError, Exception):
             return results
 
         with self._lock:

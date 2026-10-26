@@ -9,8 +9,22 @@ Zero outbound network calls - pure offline correlation logic.
 from __future__ import annotations
 
 import os
+import re
 from dataclasses import dataclass
 from typing import Optional, Tuple
+
+_BEARER_TOKEN_RE = re.compile(r"(?i)\bBearer\s+[A-Za-z0-9_\-\.\=\+]{8,}")
+_SENSITIVE_KEY_RE = re.compile(
+    r"(?i)(api[_-]?key|bot[_-]?token|access[_-]?token|auth[_-]?token|secret|password|bearer)\s*[:=]\s*['\"]?[A-Za-z0-9_\-\.]{8,}['\"]?"
+)
+
+
+def redact_sensitive_tokens(text: str) -> str:
+    """Redact Bearer authorization tokens, API keys, and sensitive parameters."""
+    if not text or not isinstance(text, str):
+        return ""
+    scrubbed = _BEARER_TOKEN_RE.sub("Bearer [REDACTED_TOKEN]", text)
+    return _SENSITIVE_KEY_RE.sub(r"\1=[REDACTED_SECRET]", scrubbed)
 
 
 @dataclass(frozen=True)
@@ -187,10 +201,18 @@ def format_lots_alert(
     pid: int,
     process_name: str,
     domain: str,
+    cmdline: Optional[str] = None,
 ) -> str:
-    """Format human-readable alert string for LOTS endpoint detection."""
-    proc_desc = f"{process_name} (PID: {pid})" if pid > 0 else process_name
-    return (
+    """Format human-readable alert string for LOTS endpoint detection with token redaction."""
+    safe_proc = redact_sensitive_tokens(process_name)
+    proc_desc = f"{safe_proc} (PID: {pid})" if pid > 0 else safe_proc
+    safe_domain = redact_sensitive_tokens(domain)
+    safe_reason = redact_sensitive_tokens(result.reason)
+    msg = (
         f"[LOTS ALERT - {result.severity}] Process '{proc_desc}' contacted "
-        f"{result.category} endpoint '{domain}' - {result.reason}"
+        f"{result.category} endpoint '{safe_domain}' - {safe_reason}"
     )
+    if cmdline:
+        safe_cmd = redact_sensitive_tokens(cmdline)
+        msg += f" | Command: {safe_cmd}"
+    return msg

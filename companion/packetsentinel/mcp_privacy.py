@@ -830,3 +830,28 @@ class PrivacySanitizer:
             "dlp_sanitized": True,
             "content": sanitized_content,
         }
+
+    def sanitize_for_ai(self, target: Any) -> Any:
+        """
+        Pass a structured alert record (dict), text (str), or payload through Gates 1-5.
+        Strips internal usernames, private IPs, and secrets before AI ingestion.
+        """
+        if isinstance(target, dict):
+            return self.sanitize_alert_record(target)
+        if isinstance(target, str):
+            return self.sanitize_text(target, redact_private_ips=True)
+        return target
+
+
+def sanitize_for_ai(
+    target: Any,
+    sanitizer: Optional[PrivacySanitizer] = None,
+    **kwargs: Any,
+) -> Any:
+    """
+    Module-level 5-Gate Pre-Model Privacy & DLP Airlock entrypoint.
+    Sanitizes alert records (stripping usernames, LAN IPs, tokens) or free text.
+    """
+    s = sanitizer or PrivacySanitizer()
+    return s.sanitize_for_ai(target)
+

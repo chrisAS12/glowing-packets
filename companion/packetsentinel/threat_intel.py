@@ -469,6 +469,9 @@ class ThreatIntelEngine:
             self._ips_set = frozenset(new_ip_sources.keys())
             self._last_updated_epoch = time.time()
 
+        stats["total_domains"] = len(self._domains_set)
+        stats["total_ips"] = len(self._ips_set)
+
         return stats
 
     def add_custom_indicator(self, raw_indicator: str) -> str:
