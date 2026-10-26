@@ -66,16 +66,39 @@ def get_model_dir(app_dir: Path) -> Path:
     return app_dir / "models" / "whisper"
 
 
+REQUIRED_MODEL_FILES = ("model.bin", "config.json")
+
+
+def _is_directory_complete_model(directory: Path) -> bool:
+    """Verifies that a directory has all essential files to run offline without network."""
+    if not directory.is_dir():
+        return False
+    if not all((directory / f).is_file() for f in REQUIRED_MODEL_FILES):
+        return False
+    has_vocab = (
+        (directory / "vocabulary.txt").is_file()
+        or (directory / "vocabulary.json").is_file()
+        or (directory / "tokenizer.json").is_file()
+    )
+    return has_vocab
+
+
 def is_model_cached(model_dir: Path, model_name: str = DEFAULT_MODEL_NAME) -> bool:
+    """Checks whether the offline speech model is fully downloaded and cached locally."""
     if not model_dir.exists():
         return False
-    # huggingface_hub cache layout: models--Systran--faster-whisper-<name>/snapshots/<rev>/model.bin
+    # 1. HuggingFace Hub snapshot directory layout:
+    # models--Systran--faster-whisper-<name>/snapshots/<rev>/
     repo_dir = model_dir / f"models--Systran--faster-whisper-{model_name}"
-    if any(repo_dir.glob("snapshots/*/model.bin")):
+    snapshots_dir = repo_dir / "snapshots"
+    if snapshots_dir.is_dir():
+        for snap in snapshots_dir.iterdir():
+            if snap.is_dir() and _is_directory_complete_model(snap):
+                return True
+    # 2. Direct directory layout (standalone / air-gapped bundle):
+    if _is_directory_complete_model(model_dir):
         return True
-    if (model_dir / "model.bin").is_file():
-        return True
-    if (model_dir / model_name / "model.bin").is_file():
+    if _is_directory_complete_model(model_dir / model_name):
         return True
     return False
 

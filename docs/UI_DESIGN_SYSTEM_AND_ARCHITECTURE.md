@@ -97,7 +97,8 @@ The Voice Airlock provides speech dictation with zero cloud audio leakage:
 
 1. **Hardware Ingestion**: Captures local microphone audio via WASAPI/ALSA through `sounddevice`.
 2. **Push-to-Talk Ergonomics**: Press the **Spacebar** key from anywhere in the app (outside active text fields) to instantly toggle dictation on or off.
-3. **Voice Activity Detection (VAD) Silence Auto-Stop**: The microphone recorder continuously measures RMS audio energy. If silence is detected for ~1.8 seconds after speech, recording stops automatically and transcription begins immediately.
+3. **Voice Activity Detection (VAD) Silence Auto-Stop**: The microphone recorder continuously measures RMS audio energy.
+   If silence is detected for ~1.8 seconds after speech, recording stops automatically and transcription begins immediately.
 4. **Offline Quantized Whisper**: Transcribes audio locally on CPU using `faster-whisper` (`base` model, `local_files_only=True`).
 5. **Pre-Model 5-Gate DLP Redaction**: Converts spoken transcripts through payment card Luhn validation, API key patterns, OS usernames, and national ID redaction.
 6. **Zero-Copy MCP Buffer**: Saves scrubbed text to `%LOCALAPPDATA%\PacketSentinel\latest_voice_prompt.json`, accessible directly by AI agents using the `get_latest_voice_prompt` MCP tool.
@@ -109,7 +110,8 @@ The Voice Airlock provides speech dictation with zero cloud audio leakage:
 When a network connection matches a verified threat intelligence feed (URLhaus, ThreatFox, Feodo Tracker, HaGeZi, Phishing Army):
 
 1. **Interactive Threat Ticker**: Double-clicking any row in the threat table or clicking `[ ℹ️ Explain Threat ]` opens a focused threat explanation modal.
-2. **Plain-English Intelligence**: Explains in plain terms what the feed represents (e.g. Botnet C2, malware payload dropper, or high-risk tracking telemetry).
+2. **Plain-English Intelligence**: Explains in plain terms what the feed represents (e.g.
+   Botnet C2, malware payload dropper, or high-risk tracking telemetry).
 3. **Actionable Remediation**:
    - `[ 🛑 Terminate Process ]`: Safely kills the originating process tree.
    - `[ 🛡️ Copy Firewall Block ]`: Copies an exact Windows PowerShell firewall block command (`New-NetFirewallRule`) to the clipboard.
