@@ -1,8 +1,8 @@
 <p align="center">
-  <img src="docs/images/logo-rustinel.png" alt="Glowing Packets / Rustinel" width="240">
+  <img src="docs/assets/sentinelwire_logo.jpg" alt="SentinelWire Emblem" width="160">
 </p>
 
-<h1 align="center">Glowing Packets (<code>Rustinel</code> + <code>PacketSentinel</code>)</h1>
+<h1 align="center">SentinelWire</h1>
 
 <p align="center">
   <b>Zero-Outbound, Zero-Monetization Bonus Defense Layer, Personal Micro-EDR & Pre-Model AI Privacy MCP Server.</b><br>

@@ -140,6 +140,20 @@ MCP_TOOLS_SCHEMA: List[Dict[str, Any]] = [
             "additionalProperties": False,
         },
     },
+    {
+        "name": "get_latest_voice_prompt",
+        "description": (
+            "Retrieve the most recent voice dictation recorded in SentinelWire. "
+            "Automatically pre-sanitized by the 5-Gate DLP airlock (credit cards, IBANs, "
+            "national IDs, and secrets masked). Feeds sanitized voice input directly into "
+            "the AI context with zero manual copy-pasting."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {},
+            "additionalProperties": False,
+        },
+    },
 ]
 
 
@@ -306,6 +320,31 @@ class PacketSentinelMCPServer:
             "file_size_bytes": res.file_size_bytes,
         }
 
+    def tool_get_latest_voice_prompt(self) -> Dict[str, Any]:
+        from .config import get_app_data_dir
+
+        voice_file = get_app_data_dir() / "latest_voice_prompt.json"
+        if not voice_file.exists():
+            return {
+                "status": "empty",
+                "message": "No voice prompt recorded yet in SentinelWire.",
+                "sanitized_prompt": "",
+            }
+        try:
+            raw = voice_file.read_text(encoding="utf-8", errors="replace")
+            parsed = json.loads(raw)
+            return {
+                "status": "success",
+                "timestamp": parsed.get("timestamp", ""),
+                "sanitized_prompt": parsed.get("sanitized_prompt", ""),
+            }
+        except Exception as exc:
+            return {
+                "status": "error",
+                "message": f"Failed to read voice buffer: {exc}",
+                "sanitized_prompt": "",
+            }
+
     def handle_jsonrpc_message(self, request: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         if not isinstance(request, dict):
             return {
@@ -331,7 +370,7 @@ class PacketSentinelMCPServer:
                     "protocolVersion": client_proto,
                     "capabilities": {"tools": {}},
                     "serverInfo": {
-                        "name": "packetsentinel-privacy-mcp",
+                        "name": "sentinelwire-privacy-mcp",
                         "version": __version__,
                     },
                 },
@@ -378,6 +417,8 @@ class PacketSentinelMCPServer:
                         content_text=str(tool_args.get("content_text", "")),
                         filename=str(tool_args.get("filename", "unnamed_payload")),
                     )
+                elif tool_name == "get_latest_voice_prompt":
+                    payload = self.tool_get_latest_voice_prompt()
                 else:
                     return {
                         "jsonrpc": "2.0",
