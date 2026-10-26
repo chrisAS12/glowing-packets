@@ -18,7 +18,7 @@ from pathlib import Path
 from typing import List, Optional, Set, Tuple
 
 from .config import VERIFIED_TSHARK_PATHS, AppConfig
-from .lots_guard import check_lots_risk
+from .lots_guard import PACKAGE_MANAGERS, check_lots_risk, check_supply_chain_risk
 from .notifier import AlertNotifier
 from .process_mapper import UNKNOWN_PROCESS, ProcessInfo, ProcessMapper
 from .security import (
@@ -56,6 +56,23 @@ AI_PROCESS_NAMES: frozenset[str] = frozenset(
         "cmd.exe",
         "curl.exe",
         "curl",
+        "npm.exe",
+        "npm",
+        "npm.cmd",
+        "pnpm.exe",
+        "pnpm",
+        "pnpm.cmd",
+        "yarn.exe",
+        "yarn",
+        "yarn.cmd",
+        "pip.exe",
+        "pip",
+        "pip3.exe",
+        "pip3",
+        "poetry.exe",
+        "poetry",
+        "cargo.exe",
+        "cargo",
         "sentinelwire-self-test",
         "sentinelwire",
         "test.exe",
@@ -251,6 +268,11 @@ class PacketSentinelMonitor:
     def tls_sni_seen(self) -> int:
         return self._tls_sni_seen
 
+    @property
+    def threat_engine(self) -> ThreatIntelEngine:
+        """Expose the threat intel engine for runtime allowlist updates and metric queries."""
+        return self._threat_engine
+
     def get_process_event_count(self, process_name: str, pid: Optional[int] = None) -> int:
         """Return total wire/socket events attributed to a specific process or PID."""
         if pid and pid in self._pid_packet_counts:
@@ -400,6 +422,24 @@ class PacketSentinelMonitor:
                         dst_ip=dst_ip or "",
                         dst_port=dst_port,
                         detection_layer="lots-wire",
+                    )
+                    return
+
+                supply_risk = check_supply_chain_risk(proc.name, clean_dom, port=dst_port or 443)
+                if supply_risk and supply_risk.is_threat:
+                    supply_match = ThreatMatch(
+                        indicator=clean_dom,
+                        matched_rule=supply_risk.matched_domain or clean_dom,
+                        source_feed=f"Supply-Chain-Guard ({supply_risk.category.upper()})",
+                        match_type=f"supply_chain_{supply_risk.severity.lower()}",
+                    )
+                    self._notifier.notify_match(
+                        match=supply_match,
+                        process=proc,
+                        protocol=protocol,
+                        dst_ip=dst_ip or "",
+                        dst_port=dst_port,
+                        detection_layer="supply-chain-wire",
                     )
                     return
 

@@ -6,6 +6,7 @@ from GitHub repositories and open-source threat feeds.
 
 from __future__ import annotations
 
+import collections
 import json
 import logging
 import threading
@@ -37,6 +38,7 @@ logger = logging.getLogger("packetsentinel.threat_intel")
 
 MAX_INDICATORS_PER_FEED = 200_000
 MAX_TOTAL_INDICATORS = 500_000
+MAX_BENIGN_DOMAIN_CACHE_SIZE = 16_384
 
 # High-confidence offline seed indicators loaded when network feeds are not yet cached
 EMBEDDED_FEED_SEEDS: Dict[str, Tuple[List[str], List[str]]] = {
@@ -131,6 +133,7 @@ class ThreatIntelEngine:
         self._domains_set: frozenset[str] = frozenset()
         self._ips_set: frozenset[str] = frozenset()
         self._allowlist_set: frozenset[str] = self._build_allowlist()
+        self._domain_cache: collections.OrderedDict[str, Optional[ThreatMatch]] = collections.OrderedDict()
         self._last_updated_epoch: float = 0.0
 
     def _build_allowlist(self) -> frozenset[str]:
@@ -140,6 +143,12 @@ class ThreatIntelEngine:
             if norm:
                 combined.add(norm)
         return frozenset(combined)
+
+    def sync_allowlist(self) -> None:
+        """Synchronize allowlist set from config and purge the in-memory domain cache."""
+        with self._lock:
+            self._allowlist_set = self._build_allowlist()
+            self._domain_cache.clear()
 
     @property
     def domain_count(self) -> int:
@@ -169,7 +178,17 @@ class ThreatIntelEngine:
         """
         Check a queried domain (and its parent domain suffixes) against loaded threat feeds
         in O(k) where k is the number of domain labels (typically 2-4, < 1 microsecond).
+        Uses a bounded LRU cache for sub-millisecond repeated lookups.
         """
+        if not raw_domain or not isinstance(raw_domain, str):
+            return None
+
+        # Ultra fast-path: exact raw string cache hit bypasses regex normalization
+        with self._lock:
+            if raw_domain in self._domain_cache:
+                self._domain_cache.move_to_end(raw_domain)
+                return self._domain_cache[raw_domain]
+
         domain = normalize_and_validate_domain(raw_domain, allow_underscore=True)
         if not domain:
             return None
@@ -178,35 +197,58 @@ class ThreatIntelEngine:
         while domain.startswith("_") and "." in domain:
             domain = domain.split(".", 1)[1]
 
+        # Fast-path normalized LRU lookup
+        with self._lock:
+            if domain in self._domain_cache:
+                self._domain_cache.move_to_end(domain)
+                cached_res = self._domain_cache[domain]
+                if raw_domain != domain:
+                    self._domain_cache[raw_domain] = cached_res
+                return cached_res
+
         if self.is_allowlisted_domain(domain):
+            with self._lock:
+                self._domain_cache[domain] = None
+                self._domain_cache[raw_domain] = None
+                if len(self._domain_cache) > MAX_BENIGN_DOMAIN_CACHE_SIZE:
+                    self._domain_cache.popitem(last=False)
             return None
 
         with self._lock:
             domains_set = self._domains_set
             domain_sources = self._domain_sources
 
+        match: Optional[ThreatMatch] = None
         # 1. Exact match check
         if domain in domains_set:
-            return ThreatMatch(
+            match = ThreatMatch(
                 indicator=domain,
                 matched_rule=domain,
                 source_feed=domain_sources.get(domain, "Threat Feed"),
                 match_type="domain_exact",
             )
+        else:
+            # 2. Subdomain suffix walk (e.g. beacon123.c2.evil.com -> c2.evil.com -> evil.com)
+            labels = domain.split(".")
+            for i in range(1, len(labels) - 1):
+                parent = ".".join(labels[i:])
+                if parent in domains_set:
+                    match = ThreatMatch(
+                        indicator=domain,
+                        matched_rule=parent,
+                        source_feed=domain_sources.get(parent, "Threat Feed"),
+                        match_type="domain_subdomain",
+                    )
+                    break
 
-        # 2. Subdomain suffix walk (e.g. beacon123.c2.evil.com -> c2.evil.com -> evil.com)
-        labels = domain.split(".")
-        for i in range(1, len(labels) - 1):
-            parent = ".".join(labels[i:])
-            if parent in domains_set:
-                return ThreatMatch(
-                    indicator=domain,
-                    matched_rule=parent,
-                    source_feed=domain_sources.get(parent, "Threat Feed"),
-                    match_type="domain_subdomain",
-                )
+        with self._lock:
+            self._domain_cache[domain] = match
+            if raw_domain != domain:
+                self._domain_cache[raw_domain] = match
+            while len(self._domain_cache) > MAX_BENIGN_DOMAIN_CACHE_SIZE:
+                self._domain_cache.popitem(last=False)
 
-        return None
+        return match
 
     def check_ip(self, raw_ip: str) -> Optional[ThreatMatch]:
         """
@@ -492,6 +534,7 @@ class ThreatIntelEngine:
             self._domains_set = frozenset(new_domain_sources.keys())
             self._ips_set = frozenset(new_ip_sources.keys())
             self._last_updated_epoch = time.time()
+            self._domain_cache.clear()
 
         stats["total_domains"] = len(self._domains_set)
         stats["total_ips"] = len(self._ips_set)
@@ -536,5 +579,6 @@ class ThreatIntelEngine:
                 new_doms[canonical] = "Local Custom Blocklist"
                 self._domain_sources = new_doms
                 self._domains_set = frozenset(new_doms.keys())
+                self._domain_cache.clear()
 
         return canonical

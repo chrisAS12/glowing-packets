@@ -1762,6 +1762,8 @@ class PacketSentinelDesktopApp:
             )
         self.alert_tree.bind("<Double-1>", lambda e: self._show_threat_explanation())
         self.alert_tree.bind("<<TreeviewSelect>>", self._on_alert_tree_select)
+        self.alert_tree.bind("<Button-3>", self._on_alert_tree_context_menu)
+        self.alert_tree.bind("<Button-2>", self._on_alert_tree_context_menu)
 
         # Lower Card: Target Process Watchdog & Script Interpreter Inspector
         w_card = tk.Frame(self.tab_monitor, bg=BG_CARD, padx=14, pady=10, highlightbackground=BORDER_COLOR, highlightthickness=1)
@@ -2854,6 +2856,90 @@ class PacketSentinelDesktopApp:
                 self.mc_proc_combo.set(combo_val)
                 self._inspect_mc_watchdog()
 
+    def _on_alert_tree_context_menu(self, event: tk.Event) -> None:
+        """Show context menu for selected alert row in the live threats table."""
+        row_id = self.alert_tree.identify_row(event.y)
+        if row_id:
+            self.alert_tree.selection_set(row_id)
+        selected = self.alert_tree.selection()
+        if not selected:
+            return
+
+        values = self.alert_tree.item(selected[0], "values")
+        if not values or len(values) < 2:
+            return
+
+        indicator = str(values[1]).strip()
+
+        menu = tk.Menu(self.root, tearoff=0, bg=BG_CARD, fg=TEXT_MAIN, activebackground=PRIMARY_COLOR, activeforeground="#ffffff")
+        menu.add_command(
+            label="🔍 Explain Threat & Forensic Scan",
+            command=self._show_threat_explanation,
+        )
+        menu.add_command(
+            label=f"🛡️ Trust Indicator ({indicator})",
+            command=lambda: self._trust_and_allowlist_domain(indicator),
+        )
+        menu.add_separator()
+        menu.add_command(
+            label="📋 Copy Indicator",
+            command=lambda: self._copy_to_clipboard(indicator),
+        )
+        try:
+            menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            menu.grab_release()
+
+    def _copy_to_clipboard(self, text: str) -> None:
+        """Safely copy string to clipboard."""
+        if not text:
+            return
+        try:
+            self.root.clipboard_clear()
+            self.root.clipboard_append(text)
+        except Exception as exc:
+            logger.warning("Failed to copy to clipboard: %s", exc)
+
+    def _trust_and_allowlist_domain(self, domain_or_ip: str) -> bool:
+        """Add domain or IP to the persistent user allowlist and purge benign alerts from memory."""
+        cleaned = domain_or_ip.strip().lower()
+        if not cleaned:
+            return False
+
+        if cleaned in self.config.user_allowlist_domains:
+            messagebox.showinfo("Already Trusted", f"'{cleaned}' is already in your trusted allowlist.")
+            return False
+
+        confirm = messagebox.askyesno(
+            "Trust & Allow Indicator",
+            f"Are you sure you want to trust and allow '{cleaned}'?\n\n"
+            "This will permanently add the indicator to your allowlist, silence future alerts, "
+            "and remove matching records from the active display.",
+        )
+        if not confirm:
+            return False
+
+        self.config.user_allowlist_domains.append(cleaned)
+        try:
+            self.config.save()
+        except Exception as exc:
+            logger.error("Failed saving allowlist to config: %s", exc)
+
+        # Hot-reload allowlist in running engine
+        if hasattr(self, "_monitor_service") and self._monitor_service and hasattr(self._monitor_service, "_threat_engine") and self._monitor_service._threat_engine:
+            self._monitor_service._threat_engine.sync_allowlist()
+
+        # Remove existing alerts matching this indicator from live cache
+        with self._alerts_lock:
+            self._all_alerts_cache = [
+                row for row in self._all_alerts_cache
+                if row[1].strip().lower() != cleaned
+            ]
+
+        self._apply_alert_filters()
+        messagebox.showinfo("Indicator Trusted", f"Indicator '{cleaned}' was successfully added to your trusted allowlist.")
+        return True
+
     def _inspect_selected_alert_in_monitor(self) -> None:
         """Explicit button action to inspect selected alert in Live Threat Monitor."""
         if hasattr(self, "alert_tree"):
@@ -3408,6 +3494,23 @@ class PacketSentinelDesktopApp:
         )
         quarantine_btn.pack(side=tk.LEFT, padx=(0, 6))
         quarantine_btn.config(state="disabled")
+
+        def _trust_indicator_action() -> None:
+            if not indicator:
+                return
+            if self._trust_and_allowlist_domain(indicator):
+                dialog.destroy()
+
+        create_styled_button(
+            btn_row,
+            text="Trust Indicator",
+            icon="🛡️",
+            style="accent",
+            command=_trust_indicator_action,
+            font=FONT_BOLD,
+            padx=10,
+            pady=5,
+        ).pack(side=tk.LEFT, padx=(0, 6))
 
         create_styled_button(
             btn_row,

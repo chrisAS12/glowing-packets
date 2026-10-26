@@ -110,6 +110,55 @@ KNOWN_SCRIPT_LOLBINS: frozenset[str] = frozenset(
     }
 )
 
+PACKAGE_MANAGERS: frozenset[str] = frozenset(
+    {
+        "npm.exe",
+        "npm",
+        "npm.cmd",
+        "pnpm.exe",
+        "pnpm",
+        "pnpm.cmd",
+        "yarn.exe",
+        "yarn",
+        "yarn.cmd",
+        "pip.exe",
+        "pip",
+        "pip3.exe",
+        "pip3",
+        "poetry.exe",
+        "poetry",
+        "cargo.exe",
+        "cargo",
+        "gem.exe",
+        "gem",
+        "go.exe",
+        "go",
+        "mvn.exe",
+        "mvn",
+        "gradle.exe",
+        "gradle",
+    }
+)
+
+LEGITIMATE_PACKAGE_REGISTRIES: frozenset[str] = frozenset(
+    {
+        "npmjs.org",
+        "npmjs.com",
+        "yarnpkg.com",
+        "pypi.org",
+        "pythonhosted.org",
+        "crates.io",
+        "github.com",
+        "githubusercontent.com",
+        "golang.org",
+        "pkg.go.dev",
+        "rubygems.org",
+        "maven.org",
+        "apache.org",
+        "nuget.org",
+    }
+)
+
 
 def normalize_domain_for_lots(raw_domain: str) -> str:
     """Normalize domain by trimming whitespace, trailing/leading dots, and lowercasing."""
@@ -153,6 +202,64 @@ def is_known_script_lolbin(process_name: str) -> bool:
     """Check if process basename is a known script interpreter or LOLBIN."""
     proc = normalize_process_name(process_name)
     return proc in KNOWN_SCRIPT_LOLBINS
+
+
+def is_package_manager_process(process_name: str) -> bool:
+    """Check if process basename is a known developer package manager."""
+    proc = normalize_process_name(process_name)
+    return proc in PACKAGE_MANAGERS
+
+
+def is_legitimate_registry_domain(domain: str) -> bool:
+    """Check if destination domain belongs to an official package registry or developer code host."""
+    norm = normalize_domain_for_lots(domain)
+    if not norm:
+        return False
+    for reg in LEGITIMATE_PACKAGE_REGISTRIES:
+        if norm == reg or norm.endswith(f".{reg}"):
+            return True
+    return False
+
+
+def check_supply_chain_risk(
+    process_name: str,
+    domain: str,
+    port: int = 443,
+) -> Optional[LOTSRiskResult]:
+    """
+    Evaluate if a developer package manager or build tool is connecting to an
+    unverified external domain (potential malicious postinstall hook or setup.py exfiltration).
+    """
+    if not is_package_manager_process(process_name):
+        return None
+
+    norm_dom = normalize_domain_for_lots(domain)
+    if not norm_dom:
+        return None
+
+    # Official package registries and code repos are expected egress
+    if is_legitimate_registry_domain(norm_dom):
+        return None
+
+    # Check if connecting to a known LOTS exfiltration service (webhook, tunnel, pastebin)
+    lots_match = find_matching_lots_endpoint(norm_dom)
+    proc_base = normalize_process_name(process_name)
+    if lots_match:
+        return LOTSRiskResult(
+            is_threat=True,
+            severity="CRITICAL",
+            reason=f"Supply-chain exfiltration alert: Package manager '{proc_base}' connecting to {lots_match.category} endpoint '{norm_dom}'",
+            category=f"supply_chain_{lots_match.category}",
+            matched_domain=norm_dom,
+        )
+
+    return LOTSRiskResult(
+        is_threat=True,
+        severity="HIGH",
+        reason=f"Supply-chain egress alert: Package manager '{proc_base}' contacting non-registry domain '{norm_dom}'",
+        category="supply_chain_unverified_egress",
+        matched_domain=norm_dom,
+    )
 
 
 def check_lots_risk(
