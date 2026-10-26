@@ -14,6 +14,8 @@ if str(COMPANION_DIR) not in sys.path:
     sys.path.insert(0, str(COMPANION_DIR))
 
 from packetsentinel.cli import main  # noqa: E402
+from packetsentinel.diagnostic_logger import setup_diagnostic_logging  # noqa: E402
 
 if __name__ == "__main__":
+    setup_diagnostic_logging()
     sys.exit(main())

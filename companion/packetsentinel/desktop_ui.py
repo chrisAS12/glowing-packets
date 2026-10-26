@@ -102,6 +102,7 @@ class PacketSentinelDesktopApp:
         self._nav_buttons: List[tk.Button] = []
 
         self.root = parent_root or tk.Tk()
+        self.root.report_callback_exception = self._on_tk_exception
         self.root.title("SentinelWire — Desktop Security & Privacy Airlock")
         self.root.geometry("1120x780")
         self.root.minsize(920, 640)
@@ -1019,44 +1020,60 @@ class PacketSentinelDesktopApp:
         try:
             self._voice_recorder = MicrophoneRecorder()
             self._voice_recorder.start()
-        except VoiceEngineError as err:
+        except Exception as err:
+            err_msg = str(err)
             self._is_recording = False
             if self._record_timer_id:
-                self.root.after_cancel(self._record_timer_id)
+                try:
+                    self.root.after_cancel(self._record_timer_id)
+                except Exception:
+                    pass
                 self._record_timer_id = None
-            self.voice_btn.config(
-                text="🎙️  CLICK TO START DICTATING",
-                bg=ACCENT_BLUE,
-                activebackground=ACCENT_HOVER,
-            )
-            self.voice_status_pill.config(text="⚠️ VOICE ENGINE NOT READY", bg="#78350f", fg="#fde047")
-            self.voice_feedback_lbl.config(text=f"❌ Microphone error: {err}", fg=ALERT_RED)
-            if hasattr(self, "mc_voice_btn"):
-                self.mc_voice_btn.config(text="🎙️  Start Dictation (Spacebar)", bg=ACCENT_BLUE, activebackground=ACCENT_HOVER)
-            if hasattr(self, "mc_voice_status_pill"):
-                self.mc_voice_status_pill.config(text="⚠️ VOICE NOTICE", bg="#78350f", fg="#fde047")
-            if hasattr(self, "mc_voice_feedback_lbl"):
-                self.mc_voice_feedback_lbl.config(text=f"❌ {err}", fg=ALERT_RED)
-            messagebox.showwarning("Voice Airlock Notice", str(err))
+            try:
+                self.voice_btn.config(
+                    text="🎙️  CLICK TO START DICTATING",
+                    bg=ACCENT_BLUE,
+                    activebackground=ACCENT_HOVER,
+                )
+                self.voice_status_pill.config(text="⚠️ VOICE ENGINE NOT READY", bg="#78350f", fg="#fde047")
+                self.voice_feedback_lbl.config(text=f"❌ Microphone error: {err_msg}", fg=ALERT_RED)
+                if hasattr(self, "mc_voice_btn"):
+                    self.mc_voice_btn.config(text="🎙️  Start Dictation (Spacebar)", bg=ACCENT_BLUE, activebackground=ACCENT_HOVER)
+                if hasattr(self, "mc_voice_status_pill"):
+                    self.mc_voice_status_pill.config(text="⚠️ VOICE NOTICE", bg="#78350f", fg="#fde047")
+                if hasattr(self, "mc_voice_feedback_lbl"):
+                    self.mc_voice_feedback_lbl.config(text=f"❌ {err_msg}", fg=ALERT_RED)
+            except Exception as ui_exc:
+                logger.warning(f"Failed to update voice status widgets: {ui_exc}")
+            try:
+                messagebox.showwarning("Voice Airlock Notice", err_msg)
+            except Exception:
+                pass
 
     def _stop_persistent_recording(self) -> None:
         self._is_recording = False
         if self._record_timer_id:
-            self.root.after_cancel(self._record_timer_id)
+            try:
+                self.root.after_cancel(self._record_timer_id)
+            except Exception:
+                pass
             self._record_timer_id = None
-        self.voice_btn.config(
-            text="⏳  PROCESSING AUDIO AIRLOCK...",
-            bg=ACCENT_BLUE,
-            activebackground=ACCENT_HOVER,
-        )
-        self.voice_status_pill.config(text="🟡 TRANSCRIBING & DLP SCRUBBING", bg="#78350f", fg="#fde047")
-        self.voice_feedback_lbl.config(text="Transcribing audio locally with offline Whisper model...", fg=BORDER_FOCUS)
-        if hasattr(self, "mc_voice_btn"):
-            self.mc_voice_btn.config(text="⏳  Transcribing Audio...", bg=ACCENT_BLUE, activebackground=ACCENT_HOVER)
-        if hasattr(self, "mc_voice_status_pill"):
-            self.mc_voice_status_pill.config(text="🟡 TRANSCRIBING & DLP SCRUBBING", bg="#78350f", fg="#fde047")
-        if hasattr(self, "mc_voice_feedback_lbl"):
-            self.mc_voice_feedback_lbl.config(text="Transcribing audio locally with offline Whisper model...", fg=BORDER_FOCUS)
+        try:
+            self.voice_btn.config(
+                text="⏳  PROCESSING AUDIO AIRLOCK...",
+                bg=ACCENT_BLUE,
+                activebackground=ACCENT_HOVER,
+            )
+            self.voice_status_pill.config(text="🟡 TRANSCRIBING & DLP SCRUBBING", bg="#78350f", fg="#fde047")
+            self.voice_feedback_lbl.config(text="Transcribing audio locally with offline Whisper model...", fg=BORDER_FOCUS)
+            if hasattr(self, "mc_voice_btn"):
+                self.mc_voice_btn.config(text="⏳  Transcribing Audio...", bg=ACCENT_BLUE, activebackground=ACCENT_HOVER)
+            if hasattr(self, "mc_voice_status_pill"):
+                self.mc_voice_status_pill.config(text="🟡 TRANSCRIBING & DLP SCRUBBING", bg="#78350f", fg="#fde047")
+            if hasattr(self, "mc_voice_feedback_lbl"):
+                self.mc_voice_feedback_lbl.config(text="Transcribing audio locally with offline Whisper model...", fg=BORDER_FOCUS)
+        except Exception as ui_exc:
+            logger.warning(f"Failed to update transcribing widgets: {ui_exc}")
 
         recorder = self._voice_recorder
         self._voice_recorder = None
@@ -1067,56 +1084,73 @@ class PacketSentinelDesktopApp:
             try:
                 audio_data = recorder.stop()
                 text = self._voice_transcriber.transcribe(audio_data)
-                self.root.after(0, lambda: self._on_voice_audio_received(text))
+                try:
+                    self.root.after(0, lambda t=text: self._on_voice_audio_received(t))
+                except Exception as post_exc:
+                    logger.warning(f"Could not post voice audio received to UI: {post_exc}")
             except VoiceEngineError as err:
                 msg = str(err)
                 logger.warning(f"Voice engine notice: {msg}")
-                self.root.after(0, lambda m=msg: self._on_voice_engine_error(m))
+                try:
+                    self.root.after(0, lambda m=msg: self._on_voice_engine_error(m))
+                except Exception as post_exc:
+                    logger.warning(f"Could not post voice engine notice to UI: {post_exc}")
             except Exception as exc:
                 msg = f"Transcription error: {exc}"
                 logger.error(f"Unexpected error in offline voice transcriber: {msg}")
-                self.root.after(0, lambda m=msg: self._on_voice_engine_error(m))
+                try:
+                    self.root.after(0, lambda m=msg: self._on_voice_engine_error(m))
+                except Exception as post_exc:
+                    logger.warning(f"Could not post voice error to UI: {post_exc}")
 
         threading.Thread(target=_bg_transcribe, daemon=True).start()
 
     def _on_voice_engine_error(self, message: str) -> None:
-        self._is_recording = False
-        self.voice_btn.config(
-            text="🎙️  CLICK TO START DICTATING",
-            bg=ACCENT_BLUE,
-            activebackground=ACCENT_HOVER,
-        )
-        self.voice_status_pill.config(text="⚠️ VOICE AIRLOCK NOTICE", bg="#78350f", fg="#fde047")
-        self.voice_feedback_lbl.config(text=f"❌ {message}", fg=ALERT_RED)
-        if hasattr(self, "mc_voice_btn"):
-            self.mc_voice_btn.config(text="🎙️  Start Dictation (Spacebar)", bg=ACCENT_BLUE, activebackground=ACCENT_HOVER)
-        if hasattr(self, "mc_voice_status_pill"):
-            self.mc_voice_status_pill.config(text="⚠️ VOICE NOTICE", bg="#78350f", fg="#fde047")
-        if hasattr(self, "mc_voice_feedback_lbl"):
-            self.mc_voice_feedback_lbl.config(text=f"❌ {message}", fg=ALERT_RED)
+        try:
+            self._is_recording = False
+            self.voice_btn.config(
+                text="🎙️  CLICK TO START DICTATING",
+                bg=ACCENT_BLUE,
+                activebackground=ACCENT_HOVER,
+            )
+            self.voice_status_pill.config(text="⚠️ VOICE AIRLOCK NOTICE", bg="#78350f", fg="#fde047")
+            self.voice_feedback_lbl.config(text=f"❌ {message}", fg=ALERT_RED)
+            if hasattr(self, "mc_voice_btn"):
+                self.mc_voice_btn.config(text="🎙️  Start Dictation (Spacebar)", bg=ACCENT_BLUE, activebackground=ACCENT_HOVER)
+            if hasattr(self, "mc_voice_status_pill"):
+                self.mc_voice_status_pill.config(text="⚠️ VOICE NOTICE", bg="#78350f", fg="#fde047")
+            if hasattr(self, "mc_voice_feedback_lbl"):
+                self.mc_voice_feedback_lbl.config(text=f"❌ {message}", fg=ALERT_RED)
+        except Exception as exc:
+            logger.error(f"Error displaying voice engine error: {exc}")
 
     def _update_recording_timer(self) -> None:
         if not self._is_recording:
             return
-        if self._voice_recorder and getattr(self._voice_recorder, "hit_silence_limit", False):
-            self.voice_feedback_lbl.config(
-                text="Auto-stopping: silence detected. Transcribing offline audio...",
-                fg=BORDER_FOCUS,
-            )
-            if hasattr(self, "mc_voice_feedback_lbl"):
-                self.mc_voice_feedback_lbl.config(
-                    text="Auto-stopping: silence detected. Transcribing offline audio...",
-                    fg=BORDER_FOCUS,
-                )
+        if self._voice_recorder and (
+            getattr(self._voice_recorder, "hit_silence_limit", False)
+            or getattr(self._voice_recorder, "hit_time_limit", False)
+        ):
+            reason = "time limit reached" if getattr(self._voice_recorder, "hit_time_limit", False) else "silence detected"
+            notice = f"Auto-stopping: {reason}. Transcribing offline audio..."
+            try:
+                self.voice_feedback_lbl.config(text=notice, fg=BORDER_FOCUS)
+                if hasattr(self, "mc_voice_feedback_lbl"):
+                    self.mc_voice_feedback_lbl.config(text=notice, fg=BORDER_FOCUS)
+            except Exception:
+                pass
             self._stop_persistent_recording()
             return
         elapsed = int(time.time() - self._record_start_time)
         mins = elapsed // 60
         secs = elapsed % 60
-        self.voice_status_pill.config(text=f"🔴 RECORDING LIVE AUDIO ({mins:02d}:{secs:02d})")
-        if hasattr(self, "mc_voice_status_pill"):
-            self.mc_voice_status_pill.config(text=f"🔴 RECORDING ({mins:02d}:{secs:02d})")
-        self._record_timer_id = self.root.after(500, self._update_recording_timer)
+        try:
+            self.voice_status_pill.config(text=f"🔴 RECORDING LIVE AUDIO ({mins:02d}:{secs:02d})")
+            if hasattr(self, "mc_voice_status_pill"):
+                self.mc_voice_status_pill.config(text=f"🔴 RECORDING ({mins:02d}:{secs:02d})")
+            self._record_timer_id = self.root.after(500, self._update_recording_timer)
+        except Exception:
+            pass
 
     def _save_voice_prompt_to_mcp_buffer(self, scrubbed_text: str) -> None:
         try:
@@ -1134,35 +1168,38 @@ class PacketSentinelDesktopApp:
             logger.warning(f"Failed to save voice prompt buffer: {e}")
 
     def _on_voice_audio_received(self, text: str) -> None:
-        self.voice_raw_text.delete("1.0", tk.END)
-        self.voice_raw_text.insert(tk.END, text)
+        try:
+            self.voice_raw_text.delete("1.0", tk.END)
+            self.voice_raw_text.insert(tk.END, text)
 
-        scrubbed = self.sanitizer.sanitize_text(text)
-        self.voice_scrubbed_text.delete("1.0", tk.END)
-        self.voice_scrubbed_text.insert(tk.END, scrubbed)
+            scrubbed = self.sanitizer.sanitize_text(text)
+            self.voice_scrubbed_text.delete("1.0", tk.END)
+            self.voice_scrubbed_text.insert(tk.END, scrubbed)
 
-        self._save_voice_prompt_to_mcp_buffer(scrubbed)
+            self._save_voice_prompt_to_mcp_buffer(scrubbed)
 
-        self._is_recording = False
-        self.voice_btn.config(
-            text="🎙️  CLICK TO START DICTATING",
-            bg=ACCENT_BLUE,
-            activebackground=ACCENT_HOVER,
-        )
-        self.voice_status_pill.config(text="🟢 VOICE AIRLOCK READY (OFFLINE)", bg="#064e3b", fg=ACCENT_EMERALD)
-        self.voice_feedback_lbl.config(
-            text="✅ Dictation processed and saved to local MCP airlock buffer! AI can now read this prompt directly.",
-            fg=ACCENT_EMERALD,
-        )
-        if hasattr(self, "mc_voice_btn"):
-            self.mc_voice_btn.config(text="🎙️  Start Dictation (Spacebar)", bg=ACCENT_BLUE, activebackground=ACCENT_HOVER)
-        if hasattr(self, "mc_voice_status_pill"):
-            self.mc_voice_status_pill.config(text="🟢 AIRLOCK READY (OFFLINE)", bg="#064e3b", fg=ACCENT_EMERALD)
-        if hasattr(self, "mc_voice_feedback_lbl"):
-            self.mc_voice_feedback_lbl.config(text="✅ Dictation scrubbed & saved to local MCP buffer!", fg=ACCENT_EMERALD)
-        if hasattr(self, "mc_quick_prompt_entry"):
-            self.mc_quick_prompt_entry.delete(0, tk.END)
-            self.mc_quick_prompt_entry.insert(0, scrubbed)
+            self._is_recording = False
+            self.voice_btn.config(
+                text="🎙️  CLICK TO START DICTATING",
+                bg=ACCENT_BLUE,
+                activebackground=ACCENT_HOVER,
+            )
+            self.voice_status_pill.config(text="🟢 VOICE AIRLOCK READY (OFFLINE)", bg="#064e3b", fg=ACCENT_EMERALD)
+            self.voice_feedback_lbl.config(
+                text="✅ Dictation processed and saved to local MCP airlock buffer! AI can now read this prompt directly.",
+                fg=ACCENT_EMERALD,
+            )
+            if hasattr(self, "mc_voice_btn"):
+                self.mc_voice_btn.config(text="🎙️  Start Dictation (Spacebar)", bg=ACCENT_BLUE, activebackground=ACCENT_HOVER)
+            if hasattr(self, "mc_voice_status_pill"):
+                self.mc_voice_status_pill.config(text="🟢 AIRLOCK READY (OFFLINE)", bg="#064e3b", fg=ACCENT_EMERALD)
+            if hasattr(self, "mc_voice_feedback_lbl"):
+                self.mc_voice_feedback_lbl.config(text="✅ Dictation scrubbed & saved to local MCP buffer!", fg=ACCENT_EMERALD)
+            if hasattr(self, "mc_quick_prompt_entry"):
+                self.mc_quick_prompt_entry.delete(0, tk.END)
+                self.mc_quick_prompt_entry.insert(0, scrubbed)
+        except Exception as exc:
+            logger.error(f"Error handling voice audio received in UI: {exc}")
 
     def _copy_sanitized_speech(self) -> None:
         self._copy_output()
@@ -2695,6 +2732,22 @@ class PacketSentinelDesktopApp:
         )
         min_btn.pack(side=tk.RIGHT)
 
+    def _on_tk_exception(
+        self,
+        exc_type: type[BaseException],
+        exc_value: BaseException,
+        exc_traceback: Any,
+    ) -> None:
+        """Capture and log unhandled Tkinter callback exceptions with sanitized tracebacks."""
+        logger = logging.getLogger("sentinelwire.ui")
+        logger.critical(
+            "Unhandled exception in Tkinter callback: %s",
+            exc_value,
+            exc_info=(exc_type, exc_value, exc_traceback),
+        )
+        import traceback
+        traceback.print_exception(exc_type, exc_value, exc_traceback, file=sys.stderr)
+
     def _on_window_close(self) -> None:
         res = messagebox.askyesnocancel(
             "SentinelWire Background Protection",
@@ -2854,6 +2907,10 @@ class PacketSentinelDesktopApp:
         """Run the main event loop and clean up background services on exit."""
         try:
             self.root.mainloop()
+        except Exception as exc:
+            logger = logging.getLogger("sentinelwire.ui")
+            logger.critical("Fatal exception in Tkinter main loop: %s", exc, exc_info=True)
+            raise
         finally:
             try:
                 self._monitor_service.shutdown()
@@ -2863,5 +2920,10 @@ class PacketSentinelDesktopApp:
 
 def launch_desktop_app(config: Optional[AppConfig] = None) -> None:
     """Entry point for CLI `--ui` command to launch the SentinelWire desktop app."""
-    app = PacketSentinelDesktopApp(config=config)
-    app.run()
+    try:
+        app = PacketSentinelDesktopApp(config=config)
+        app.run()
+    except Exception as exc:
+        logger = logging.getLogger("sentinelwire.ui")
+        logger.critical("Fatal unhandled exception during desktop app launch: %s", exc, exc_info=True)
+        raise

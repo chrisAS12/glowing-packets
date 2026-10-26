@@ -146,6 +146,9 @@ def print_status_report(config: AppConfig, monitor: PacketSentinelMonitor, feed_
 
 
 def main(argv: Optional[List[str]] = None) -> int:
+    from .diagnostic_logger import setup_diagnostic_logging
+
+    setup_diagnostic_logging()
     logging.basicConfig(
         level=logging.INFO,
         format="[%(asctime)s] [%(levelname)s] %(message)s",

@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import importlib.util
 import threading
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, List, Optional
@@ -37,7 +38,10 @@ class VoiceEngineStatus:
 
 
 def _module_available(name: str) -> bool:
-    return importlib.util.find_spec(name) is not None
+    try:
+        return importlib.util.find_spec(name) is not None
+    except Exception:
+        return False
 
 
 def get_model_dir(app_dir: Path) -> Path:
@@ -45,9 +49,17 @@ def get_model_dir(app_dir: Path) -> Path:
 
 
 def is_model_cached(model_dir: Path, model_name: str = DEFAULT_MODEL_NAME) -> bool:
+    if not model_dir.exists():
+        return False
     # huggingface_hub cache layout: models--Systran--faster-whisper-<name>/snapshots/<rev>/model.bin
     repo_dir = model_dir / f"models--Systran--faster-whisper-{model_name}"
-    return any(repo_dir.glob("snapshots/*/model.bin"))
+    if any(repo_dir.glob("snapshots/*/model.bin")):
+        return True
+    if (model_dir / "model.bin").is_file():
+        return True
+    if (model_dir / model_name / "model.bin").is_file():
+        return True
+    return False
 
 
 def check_voice_status(model_dir: Path, model_name: str = DEFAULT_MODEL_NAME) -> VoiceEngineStatus:
@@ -94,6 +106,8 @@ class MicrophoneRecorder:
             import sounddevice as sd
         except ImportError as exc:
             raise VoiceEngineError("Microphone capture needs 'sounddevice'. " + VOICE_INSTALL_HINT) from exc
+        except Exception as exc:
+            raise VoiceEngineError(f"Could not load audio library: {exc}") from exc
 
         self._chunks = []
         self._frames = 0
@@ -101,49 +115,90 @@ class MicrophoneRecorder:
         self.hit_silence_limit = False
         self._speech_detected = False
         self._last_speech_time = 0.0
+
+        # Pre-flight check: verify an input device exists
+        try:
+            default_device = getattr(sd, "default", None)
+            if default_device is not None and hasattr(default_device, "device"):
+                dev_pair = default_device.device
+                dev_idx = dev_pair[0] if isinstance(dev_pair, (list, tuple)) else dev_pair
+                if dev_idx is not None and dev_idx < 0:
+                    query_fn = getattr(sd, "query_devices", None)
+                    if callable(query_fn):
+                        devs = query_fn()
+                        has_input = any(d.get("max_input_channels", 0) > 0 for d in devs if isinstance(d, dict))
+                        if not has_input:
+                            raise VoiceEngineError("No microphone or audio input device found on this system.")
+        except VoiceEngineError:
+            raise
+        except Exception:
+            pass
+
         try:
             self._stream = sd.InputStream(
                 samplerate=SAMPLE_RATE_HZ, channels=1, dtype="float32", callback=self._on_audio
             )
             self._stream.start()
+        except VoiceEngineError:
+            self._stream = None
+            raise
         except Exception as exc:
             self._stream = None
             raise VoiceEngineError(f"Could not open the microphone: {exc}") from exc
 
     def _on_audio(self, indata: Any, frames: int, _time_info: Any, _status: Any) -> None:
-        import time
-        import numpy as np
+        try:
+            import numpy as np
 
-        with self._lock:
-            if self._frames >= self._max_frames:
-                self.hit_time_limit = True
-                return
-            self._chunks.append(indata.copy())
-            self._frames += frames
+            with self._lock:
+                if self._frames >= self._max_frames:
+                    self.hit_time_limit = True
+                    return
+                self._chunks.append(indata.copy())
+                self._frames += frames
 
-            if indata is not None and len(indata) > 0:
-                rms = float(np.sqrt(np.mean(indata**2)))
-                now = time.time()
-                if rms > 0.015:
-                    self._speech_detected = True
-                    self._last_speech_time = now
-                elif self._speech_detected and (now - self._last_speech_time) > self.silence_timeout_seconds:
-                    self.hit_silence_limit = True
+                if indata is not None and len(indata) > 0:
+                    try:
+                        rms = float(np.sqrt(np.mean(indata**2)))
+                    except Exception:
+                        rms = 0.0
+                    now = time.time()
+                    if rms > 0.015:
+                        self._speech_detected = True
+                        self._last_speech_time = now
+                    elif self._speech_detected and (now - self._last_speech_time) > self.silence_timeout_seconds:
+                        self.hit_silence_limit = True
+        except Exception:
+            # Audio callback must never raise into PortAudio native thread
+            pass
 
     def stop(self) -> Any:
         """Stop capture and return a 1-D float32 numpy array (may be empty)."""
-        import numpy as np
-
         stream, self._stream = self._stream, None
         if stream is not None:
             try:
                 stream.stop()
+            except Exception:
+                pass
             finally:
-                stream.close()
+                try:
+                    stream.close()
+                except Exception:
+                    pass
         with self._lock:
             if not self._chunks:
-                return np.zeros(0, dtype=np.float32)
-            return np.concatenate(self._chunks, axis=0).reshape(-1).astype(np.float32)
+                try:
+                    import numpy as np
+
+                    return np.zeros(0, dtype=np.float32)
+                except Exception:
+                    return []
+            try:
+                import numpy as np
+
+                return np.concatenate(self._chunks, axis=0).reshape(-1).astype(np.float32)
+            except Exception as exc:
+                raise VoiceEngineError(f"Failed to assemble captured audio: {exc}") from exc
 
 
 class OfflineTranscriber:
@@ -162,23 +217,39 @@ class OfflineTranscriber:
             status = check_voice_status(self._model_dir, self._model_name)
             if not status.transcriber_ready:
                 raise VoiceEngineError(status.detail)
-            from faster_whisper import WhisperModel
+            try:
+                from faster_whisper import WhisperModel
+            except ImportError as exc:
+                raise VoiceEngineError("faster-whisper is not installed. " + VOICE_INSTALL_HINT) from exc
+            except Exception as exc:
+                raise VoiceEngineError(f"Could not load faster-whisper library: {exc}. " + VOICE_INSTALL_HINT) from exc
 
-            self._model = WhisperModel(
-                self._model_name,
-                device="cpu",
-                compute_type="int8",
-                download_root=str(self._model_dir),
-                local_files_only=True,
-            )
+            try:
+                self._model = WhisperModel(
+                    self._model_name,
+                    device="cpu",
+                    compute_type="int8",
+                    download_root=str(self._model_dir),
+                    local_files_only=True,
+                )
+            except Exception as exc:
+                raise VoiceEngineError(
+                    f"Failed to load offline Whisper model '{self._model_name}': {exc}. " + VOICE_INSTALL_HINT
+                ) from exc
             return self._model
 
     def transcribe(self, audio: Any) -> str:
         if audio is None or len(audio) < SAMPLE_RATE_HZ // 4:
             raise VoiceEngineError("No speech captured (recording shorter than 0.25 s).")
         model = self._load()
-        segments, _info = model.transcribe(audio, beam_size=1, vad_filter=True)
-        text = " ".join(seg.text.strip() for seg in segments).strip()
+        try:
+            segments, _info = model.transcribe(audio, beam_size=1, vad_filter=True)
+            text = " ".join(seg.text.strip() for seg in segments).strip()
+        except VoiceEngineError:
+            raise
+        except Exception as exc:
+            raise VoiceEngineError(f"Transcription failed: {exc}") from exc
+
         if not text:
             raise VoiceEngineError("No speech detected in the recording. Check your microphone input level.")
         return text
