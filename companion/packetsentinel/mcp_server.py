@@ -154,6 +154,43 @@ MCP_TOOLS_SCHEMA: List[Dict[str, Any]] = [
             "additionalProperties": False,
         },
     },
+    {
+        "name": "sanitize_prompt_text",
+        "description": (
+            "Scrub arbitrary text, terminal logs, or code through SentinelWire's local 5-Gate DLP "
+            "airlock BEFORE sending it to any AI model. Redacts payment cards, IBANs, national personal IDs, "
+            "API keys, private tokens, passwords, and local OS usernames."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "text": {
+                    "type": "string",
+                    "description": "Raw prompt, logs, or code text to sanitize.",
+                },
+            },
+            "required": ["text"],
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "inspect_process_safety",
+        "description": (
+            "Inspect a running process by name or PID to audit its child lineage, identify "
+            "unauthorized script interpreters (powershell, node, python, curl), and evaluate living-off-the-land risk."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "process_name_or_pid": {
+                    "type": "string",
+                    "description": "Process executable name (e.g. 'python', 'node.exe') or numeric PID.",
+                },
+            },
+            "required": ["process_name_or_pid"],
+            "additionalProperties": False,
+        },
+    },
 ]
 
 
@@ -345,6 +382,91 @@ class PacketSentinelMCPServer:
                 "sanitized_prompt": "",
             }
 
+    def tool_sanitize_prompt_text(self, text: str) -> Dict[str, Any]:
+        """
+        Scrub arbitrary text, terminal logs, or code through SentinelWire's local 5-Gate DLP airlock.
+        """
+        raw_text = str(text or "")
+        sanitized = self._sanitizer.sanitize_text(raw_text)
+        was_modified = sanitized != raw_text
+        return {
+            "status": "success",
+            "was_modified": was_modified,
+            "original_length": len(raw_text),
+            "sanitized_length": len(sanitized),
+            "sanitized_text": sanitized,
+        }
+
+    def tool_inspect_process_safety(self, process_name_or_pid: str) -> Dict[str, Any]:
+        """
+        Inspect a running process by name or PID to audit child lineage and script execution risk.
+        """
+        from .process_watchdog import (
+            find_processes_by_name,
+            inspect_child_lineage,
+        )
+        import psutil
+
+        query = str(process_name_or_pid or "").strip()
+        matched_procs: List[Dict[str, Any]] = []
+
+        if query.isdigit():
+            pid = int(query)
+            try:
+                p = psutil.Process(pid)
+                matched_procs.append({
+                    "pid": pid,
+                    "name": p.name(),
+                    "exe": p.exe() if hasattr(p, "exe") else "unknown",
+                })
+            except (psutil.NoSuchProcess, psutil.AccessDenied, Exception) as exc:
+                return {
+                    "status": "not_found",
+                    "query": query,
+                    "error": str(exc),
+                    "processes": [],
+                }
+        else:
+            found = find_processes_by_name(query)
+            for p_pid, p_name, p_exe in found[:10]:
+                matched_procs.append({"pid": p_pid, "name": p_name, "exe": p_exe})
+
+        if not matched_procs:
+            return {
+                "status": "not_found",
+                "query": query,
+                "processes": [],
+            }
+
+        results: List[Dict[str, Any]] = []
+        for p_info in matched_procs:
+            pid = p_info["pid"]
+            lineage = inspect_child_lineage(pid)
+            script_events = [
+                {
+                    "child_pid": ev.child_pid,
+                    "child_name": ev.child_name,
+                    "cmdline": ev.cmdline,
+                    "is_script_interpreter": ev.is_script_interpreter,
+                }
+                for ev in lineage
+            ]
+            has_script_interpreters = any(ev["is_script_interpreter"] for ev in script_events)
+            results.append({
+                "pid": pid,
+                "name": p_info["name"],
+                "exe": p_info["exe"],
+                "child_count": len(lineage),
+                "has_script_interpreters": has_script_interpreters,
+                "children": script_events,
+            })
+
+        return {
+            "status": "success",
+            "query": query,
+            "processes": results,
+        }
+
     def handle_jsonrpc_message(self, request: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         if not isinstance(request, dict):
             return {
@@ -419,6 +541,14 @@ class PacketSentinelMCPServer:
                     )
                 elif tool_name == "get_latest_voice_prompt":
                     payload = self.tool_get_latest_voice_prompt()
+                elif tool_name == "sanitize_prompt_text":
+                    payload = self.tool_sanitize_prompt_text(
+                        text=str(tool_args.get("text", ""))
+                    )
+                elif tool_name == "inspect_process_safety":
+                    payload = self.tool_inspect_process_safety(
+                        process_name_or_pid=str(tool_args.get("process_name_or_pid", ""))
+                    )
                 else:
                     return {
                         "jsonrpc": "2.0",

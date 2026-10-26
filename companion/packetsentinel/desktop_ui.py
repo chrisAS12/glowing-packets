@@ -263,12 +263,10 @@ class PacketSentinelDesktopApp:
         ).pack(anchor=tk.W)
 
         nav_items = [
-            ("🎙️  Voice AI Airlock", 0),
-            ("🔒  Pre-Model DLP", 1),
-            ("📡  Wire & LOTS Monitor", 2),
-            ("👁️  Process Watchdog", 3),
-            ("⚙️  Settings & Vault", 4),
-            ("📋  Diagnostics & Logs", 5),
+            ("🛡️  AI Privacy Airlock", 0),
+            ("📡  Live Threat Monitor", 1),
+            ("⚙️  Settings & Security Vault", 2),
+            ("📖  Documentation & AI Guides", 3),
         ]
 
         for text, idx in nav_items:
@@ -312,35 +310,29 @@ class PacketSentinelDesktopApp:
         self.notebook = ttk.Notebook(container)
         self.notebook.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
 
-        # Tab 0: Voice AI Airlock
-        self.tab_voice = tk.Frame(self.notebook, bg="#0f172a", padx=14, pady=14)
-        self.notebook.add(self.tab_voice, text="Voice AI")
-        self._build_voice_tab()
+        # Tab 0: AI Privacy Airlock (Unified Speech & Text DLP)
+        self.tab_airlock = tk.Frame(self.notebook, bg="#0f172a", padx=14, pady=14)
+        self.notebook.add(self.tab_airlock, text="AI Privacy Airlock")
+        self.tab_voice = self.tab_airlock
+        self.tab_privacy = self.tab_airlock
+        self._build_airlock_tab()
 
-        # Tab 1: Privacy Scrubber (DLP)
-        self.tab_privacy = tk.Frame(self.notebook, bg="#0f172a", padx=14, pady=14)
-        self.notebook.add(self.tab_privacy, text="Privacy DLP")
-        self._build_privacy_tab()
-
-        # Tab 2: Wire Monitor & LOTS Guard
+        # Tab 1: Live Threat Monitor (Wire Sniffer, Alerts, and Process Watchdog)
         self.tab_monitor = tk.Frame(self.notebook, bg="#0f172a", padx=14, pady=14)
-        self.notebook.add(self.tab_monitor, text="Wire Monitor")
+        self.notebook.add(self.tab_monitor, text="Live Threat Monitor")
+        self.tab_watchdog = self.tab_monitor
         self._build_monitor_tab()
 
-        # Tab 3: Target Process Watchdog
-        self.tab_watchdog = tk.Frame(self.notebook, bg="#0f172a", padx=14, pady=14)
-        self.notebook.add(self.tab_watchdog, text="Process Watchdog")
-        self._build_watchdog_tab()
-
-        # Tab 4: Encrypted Settings Vault & Threat Feeds
+        # Tab 2: Settings & Security Vault (DPAPI Vault, 5-Gate Toggles, Alerts, Logs)
         self.tab_settings = tk.Frame(self.notebook, bg="#0f172a", padx=16, pady=16)
-        self.notebook.add(self.tab_settings, text="Settings")
+        self.notebook.add(self.tab_settings, text="Settings & Security Vault")
+        self.tab_diagnostics = self.tab_settings
         self._build_settings_tab()
 
-        # Tab 5: User-Deletable Diagnostics & Logs
-        self.tab_diagnostics = tk.Frame(self.notebook, bg="#0f172a", padx=16, pady=16)
-        self.notebook.add(self.tab_diagnostics, text="Diagnostics & Logs")
-        self._build_diagnostics_tab()
+        # Tab 3: Documentation & AI Guides
+        self.tab_docs = tk.Frame(self.notebook, bg="#0f172a", padx=16, pady=16)
+        self.notebook.add(self.tab_docs, text="Documentation & AI Guides")
+        self._build_documentation_tab()
 
     def _select_nav(self, index: int) -> None:
         self.notebook.select(index)
@@ -350,12 +342,12 @@ class PacketSentinelDesktopApp:
             else:
                 btn.config(bg="#020617", fg="#94a3b8", font=("Segoe UI", 10, "normal"))
 
-    def _build_voice_tab(self) -> None:
+    def _build_airlock_tab(self) -> None:
         banner = tk.Label(
-            self.tab_voice,
-            text="🎙️ 100% Offline Local Speech Dictation (Air-Gapped Whisper Engine)\n"
-            "Speak prompts or notes freely. Audio is transcribed completely offline on your CPU with zero cloud calls. "
-            "Transcripts are instantly passed through the 5-Gate DLP to mask credit cards, national IDs, and names.",
+            self.tab_airlock,
+            text="🛡️ 100% Offline AI Privacy Airlock (Speech Dictation & Prompt DLP)\n"
+            "Scrub voice prompts, terminal logs, and code locally before sending to AI. Audio and text are processed "
+            "strictly on your machine with 0 outbound network requests. Pre-Model 5-Gate DLP masks cards, IDs, and secrets.",
             font=("Segoe UI", 9),
             fg="#94a3b8",
             bg="#1e293b",
@@ -364,18 +356,18 @@ class PacketSentinelDesktopApp:
             justify=tk.LEFT,
             relief=tk.FLAT,
         )
-        banner.pack(fill=tk.X, pady=(0, 10))
+        banner.pack(fill=tk.X, pady=(0, 8))
 
-        # Hero Card
-        hero = tk.Frame(self.tab_voice, bg="#1e293b", padx=16, pady=12)
-        hero.pack(fill=tk.X, pady=(0, 10))
+        # Hero Card for Voice Dictation & MCP Sync
+        hero = tk.Frame(self.tab_airlock, bg="#1e293b", padx=16, pady=10)
+        hero.pack(fill=tk.X, pady=(0, 8))
 
         status_row = tk.Frame(hero, bg="#1e293b")
-        status_row.pack(fill=tk.X, pady=(0, 8))
+        status_row.pack(fill=tk.X, pady=(0, 6))
 
         self.voice_status_pill = tk.Label(
             status_row,
-            text="🟢 VOICE AIRLOCK READY (OFFLINE)",
+            text="🟢 AIRLOCK READY (OFFLINE)",
             font=("Segoe UI", 9, "bold"),
             fg="#22c55e",
             bg="#064e3b",
@@ -394,46 +386,47 @@ class PacketSentinelDesktopApp:
         )
         self.voice_model_lbl.pack(side=tk.LEFT)
 
-        # Huge interactive Push-to-Talk button
+        self.mcp_buffer_badge = tk.Label(
+            status_row,
+            text="🟢 MCP Buffer Active",
+            font=("Segoe UI", 8, "bold"),
+            fg="#38bdf8",
+            bg="#0c4a6e",
+            padx=8,
+            pady=2,
+        )
+        self.mcp_buffer_badge.pack(side=tk.RIGHT)
+
+        # Controls row: Dictate button + Quick Prompt Entry
+        ctrl_row = tk.Frame(hero, bg="#1e293b")
+        ctrl_row.pack(fill=tk.X, pady=(4, 4))
+
         self.voice_btn = tk.Button(
-            hero,
+            ctrl_row,
             text="🎙️  CLICK TO START DICTATING",
-            font=("Segoe UI", 12, "bold"),
+            font=("Segoe UI", 10, "bold"),
             bg="#0284c7",
             fg="#ffffff",
             activebackground="#0369a1",
             activeforeground="#ffffff",
-            padx=24,
-            pady=10,
+            padx=16,
+            pady=6,
             relief=tk.FLAT,
             cursor="hand2",
             command=self._toggle_voice_recording,
         )
-        self.voice_btn.pack(pady=4)
-
-        self.voice_feedback_lbl = tk.Label(
-            hero,
-            text="Microphone listening will remain 100% offline. Zero telemetry, zero cloud streaming.",
-            font=("Segoe UI", 8),
-            fg="#64748b",
-            bg="#1e293b",
-        )
-        self.voice_feedback_lbl.pack()
-
-        # Quick Direct Speech / Prompt Bar
-        quick_frame = tk.Frame(hero, bg="#1e293b")
-        quick_frame.pack(fill=tk.X, pady=(10, 2))
+        self.voice_btn.pack(side=tk.LEFT, padx=(0, 10))
 
         tk.Label(
-            quick_frame,
-            text="Direct Speech / Prompt Bar:",
+            ctrl_row,
+            text="Quick Prompt Bar:",
             font=("Segoe UI", 9, "bold"),
             fg="#94a3b8",
             bg="#1e293b",
-        ).pack(side=tk.LEFT, padx=(0, 8))
+        ).pack(side=tk.LEFT, padx=(0, 6))
 
         self.quick_speech_entry = tk.Entry(
-            quick_frame,
+            ctrl_row,
             bg="#0f172a",
             fg="#f8fafc",
             insertbackground="#38bdf8",
@@ -444,7 +437,7 @@ class PacketSentinelDesktopApp:
         self.quick_speech_entry.bind("<Return>", lambda e: self._process_quick_speech())
 
         quick_btn = tk.Button(
-            quick_frame,
+            ctrl_row,
             text="⚡ Scrub & Feed to MCP",
             font=("Segoe UI", 9, "bold"),
             bg="#0284c7",
@@ -459,23 +452,32 @@ class PacketSentinelDesktopApp:
         )
         quick_btn.pack(side=tk.RIGHT)
 
-        # Split Transcripts
-        panes = tk.Frame(self.tab_voice, bg="#0f172a")
+        self.voice_feedback_lbl = tk.Label(
+            hero,
+            text="Microphone listening will remain 100% offline. Zero telemetry, zero cloud streaming.",
+            font=("Segoe UI", 8),
+            fg="#64748b",
+            bg="#1e293b",
+        )
+        self.voice_feedback_lbl.pack(anchor=tk.W, pady=(4, 0))
+
+        # Central Split Panes
+        panes = tk.Frame(self.tab_airlock, bg="#0f172a")
         panes.pack(fill=tk.BOTH, expand=True, pady=(0, 8))
 
-        # Left: Spoken Audio Transcript
+        # Left: Raw Input / Transcript
         left_f = tk.Frame(panes, bg="#1e293b", padx=8, pady=8)
         left_f.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0, 6))
 
         tk.Label(
             left_f,
-            text="Raw Speech Audio Transcript:",
+            text="Raw Prompt / Spoken Audio Transcript (Local Only):",
             font=("Segoe UI", 10, "bold"),
             fg="#f8fafc",
             bg="#1e293b",
         ).pack(anchor=tk.W, pady=(0, 4))
 
-        self.voice_raw_text = tk.Text(
+        self.input_text = tk.Text(
             left_f,
             bg="#0f172a",
             fg="#f8fafc",
@@ -483,40 +485,44 @@ class PacketSentinelDesktopApp:
             font=("Consolas", 10),
             relief=tk.FLAT,
             wrap=tk.WORD,
-            height=8,
+            height=11,
         )
-        self.voice_raw_text.pack(fill=tk.BOTH, expand=True)
+        self.input_text.pack(fill=tk.BOTH, expand=True)
+        # Unified aliases for backward compatibility with tests & handlers
+        self.voice_raw_text = self.input_text
 
-        # Right: Sanitized Speech Output
+        # Right: Sanitized DLP Output (Ready for AI)
         right_f = tk.Frame(panes, bg="#1e293b", padx=8, pady=8)
         right_f.pack(side=tk.RIGHT, fill=tk.BOTH, expand=True, padx=(6, 0))
 
         tk.Label(
             right_f,
-            text="Sanitized 5-Gate DLP Output (MCP Ready):",
+            text="Sanitized 5-Gate DLP Output (Safe for AI / Active in MCP):",
             font=("Segoe UI", 10, "bold"),
             fg="#38bdf8",
             bg="#1e293b",
         ).pack(anchor=tk.W, pady=(0, 4))
 
-        self.voice_scrubbed_text = tk.Text(
+        self.output_text = tk.Text(
             right_f,
             bg="#0f172a",
             fg="#22c55e",
             font=("Consolas", 10),
             relief=tk.FLAT,
             wrap=tk.WORD,
-            height=8,
+            height=11,
         )
-        self.voice_scrubbed_text.pack(fill=tk.BOTH, expand=True)
+        self.output_text.pack(fill=tk.BOTH, expand=True)
+        # Unified aliases for backward compatibility with tests & handlers
+        self.voice_scrubbed_text = self.output_text
 
-        # Action bar
-        act_bar = tk.Frame(self.tab_voice, bg="#0f172a")
+        # Action Bar
+        act_bar = tk.Frame(self.tab_airlock, bg="#0f172a")
         act_bar.pack(fill=tk.X)
 
-        copy_speech_btn = tk.Button(
+        scrub_btn = tk.Button(
             act_bar,
-            text="📋 Copy Sanitized Speech",
+            text="🧹 Scrub with 5-Gate DLP",
             font=("Segoe UI", 9, "bold"),
             bg="#0284c7",
             fg="#ffffff",
@@ -526,27 +532,29 @@ class PacketSentinelDesktopApp:
             pady=6,
             relief=tk.FLAT,
             cursor="hand2",
-            command=self._copy_sanitized_speech,
+            command=self._scrub_input,
         )
-        copy_speech_btn.pack(side=tk.LEFT, padx=(0, 8))
+        scrub_btn.pack(side=tk.LEFT, padx=(0, 8))
 
-        send_to_dlp_btn = tk.Button(
+        copy_btn = tk.Button(
             act_bar,
-            text="➡️ Transfer to DLP Editor",
+            text="📋 Copy Sanitized Text",
             font=("Segoe UI", 9),
             bg="#334155",
             fg="#f8fafc",
+            activebackground="#475569",
+            activeforeground="#f8fafc",
             padx=12,
             pady=6,
             relief=tk.FLAT,
             cursor="hand2",
-            command=self._transfer_speech_to_dlp,
+            command=self._copy_output,
         )
-        send_to_dlp_btn.pack(side=tk.LEFT, padx=(0, 8))
+        copy_btn.pack(side=tk.LEFT, padx=(0, 8))
 
-        clear_voice_btn = tk.Button(
+        canary_btn = tk.Button(
             act_bar,
-            text="🗑️ Clear Transcripts",
+            text="🧪 Load Test Canary Sample",
             font=("Segoe UI", 9),
             bg="#1e293b",
             fg="#94a3b8",
@@ -554,9 +562,26 @@ class PacketSentinelDesktopApp:
             pady=6,
             relief=tk.FLAT,
             cursor="hand2",
-            command=self._clear_voice_text,
+            command=self._load_sample_canary,
         )
-        clear_voice_btn.pack(side=tk.LEFT)
+        canary_btn.pack(side=tk.LEFT, padx=(0, 8))
+
+        clear_btn = tk.Button(
+            act_bar,
+            text="🗑️ Clear Airlock",
+            font=("Segoe UI", 9),
+            bg="#1e293b",
+            fg="#94a3b8",
+            padx=12,
+            pady=6,
+            relief=tk.FLAT,
+            cursor="hand2",
+            command=self._clear_privacy_inputs,
+        )
+        clear_btn.pack(side=tk.LEFT)
+
+    def _build_voice_tab(self) -> None:
+        self._build_airlock_tab()
 
     def _process_quick_speech(self) -> None:
         txt = self.quick_speech_entry.get().strip()
@@ -693,150 +718,17 @@ class PacketSentinelDesktopApp:
         )
 
     def _copy_sanitized_speech(self) -> None:
-        txt = self.voice_scrubbed_text.get("1.0", tk.END).strip()
-        if txt:
-            self.root.clipboard_clear()
-            self.root.clipboard_append(txt)
-            self.voice_feedback_lbl.config(text="✅ Sanitized speech copied to clipboard!", fg="#22c55e")
+        self._copy_output()
 
     def _transfer_speech_to_dlp(self) -> None:
-        txt = self.voice_scrubbed_text.get("1.0", tk.END).strip()
-        if txt:
-            self.input_text.delete("1.0", tk.END)
-            self.input_text.insert(tk.END, txt)
-            self._scrub_input()
-            self._select_nav(1)
+        self.input_text.focus_set()
 
     def _clear_voice_text(self) -> None:
-        self.voice_raw_text.delete("1.0", tk.END)
-        self.voice_scrubbed_text.delete("1.0", tk.END)
-        self.voice_feedback_lbl.config(text="Transcript cleared.", fg="#64748b")
+        self._clear_privacy_inputs()
 
     def _build_privacy_tab(self) -> None:
-        lbl = tk.Label(
-            self.tab_privacy,
-            text="Type or paste prompts, terminal output, or code below. The 5-Gate DLP engine redacts cards, IBANs, API keys, national IDs, and machine paths locally before sending to AI:",
-            font=("Segoe UI", 9),
-            fg="#94a3b8",
-            bg="#0f172a",
-            wraplength=880,
-            justify=tk.LEFT,
-        )
-        lbl.pack(fill=tk.X, pady=(0, 8))
-
-        panes = tk.Frame(self.tab_privacy, bg="#0f172a")
-        panes.pack(fill=tk.BOTH, expand=True)
-
-        # Left: Input
-        left_frame = tk.Frame(panes, bg="#1e293b", padx=8, pady=8)
-        left_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0, 6))
-
-        tk.Label(
-            left_frame,
-            text="Raw Prompt / Code Input:",
-            font=("Segoe UI", 10, "bold"),
-            fg="#f8fafc",
-            bg="#1e293b",
-        ).pack(anchor=tk.W, pady=(0, 4))
-
-        self.input_text = tk.Text(
-            left_frame,
-            bg="#0f172a",
-            fg="#f8fafc",
-            insertbackground="#38bdf8",
-            font=("Consolas", 10),
-            relief=tk.FLAT,
-            wrap=tk.WORD,
-            height=14,
-        )
-        self.input_text.pack(fill=tk.BOTH, expand=True)
-
-        # Right: Output
-        right_frame = tk.Frame(panes, bg="#1e293b", padx=8, pady=8)
-        right_frame.pack(side=tk.RIGHT, fill=tk.BOTH, expand=True, padx=(6, 0))
-
-        tk.Label(
-            right_frame,
-            text="Sanitized Output (Safe for AI Context):",
-            font=("Segoe UI", 10, "bold"),
-            fg="#38bdf8",
-            bg="#1e293b",
-        ).pack(anchor=tk.W, pady=(0, 4))
-
-        self.output_text = tk.Text(
-            right_frame,
-            bg="#0f172a",
-            fg="#22c55e",
-            font=("Consolas", 10),
-            relief=tk.FLAT,
-            wrap=tk.WORD,
-            height=14,
-        )
-        self.output_text.pack(fill=tk.BOTH, expand=True)
-
-        # Buttons
-        btn_bar = tk.Frame(self.tab_privacy, bg="#0f172a", pady=8)
-        btn_bar.pack(fill=tk.X)
-
-        scrub_btn = tk.Button(
-            btn_bar,
-            text="🧹 Scrub with 5-Gate DLP",
-            font=("Segoe UI", 10, "bold"),
-            bg="#0284c7",
-            fg="#ffffff",
-            activebackground="#0369a1",
-            activeforeground="#ffffff",
-            padx=16,
-            pady=6,
-            relief=tk.FLAT,
-            cursor="hand2",
-            command=self._scrub_input,
-        )
-        scrub_btn.pack(side=tk.LEFT, padx=(0, 8))
-
-        copy_btn = tk.Button(
-            btn_bar,
-            text="📋 Copy Sanitized Text",
-            font=("Segoe UI", 9),
-            bg="#334155",
-            fg="#f8fafc",
-            activebackground="#475569",
-            activeforeground="#f8fafc",
-            padx=12,
-            pady=6,
-            relief=tk.FLAT,
-            cursor="hand2",
-            command=self._copy_output,
-        )
-        copy_btn.pack(side=tk.LEFT, padx=(0, 8))
-
-        canary_btn = tk.Button(
-            btn_bar,
-            text="🧪 Load Test Canary Sample",
-            font=("Segoe UI", 9),
-            bg="#1e293b",
-            fg="#94a3b8",
-            padx=12,
-            pady=6,
-            relief=tk.FLAT,
-            cursor="hand2",
-            command=self._load_sample_canary,
-        )
-        canary_btn.pack(side=tk.LEFT, padx=(0, 8))
-
-        clear_btn = tk.Button(
-            btn_bar,
-            text="🗑️ Clear",
-            font=("Segoe UI", 9),
-            bg="#1e293b",
-            fg="#94a3b8",
-            padx=12,
-            pady=6,
-            relief=tk.FLAT,
-            cursor="hand2",
-            command=self._clear_privacy_inputs,
-        )
-        clear_btn.pack(side=tk.LEFT)
+        """Compatibility wrapper; functionality now merged into _build_airlock_tab."""
+        pass
 
     def _scrub_input(self) -> None:
         raw_text = self.input_text.get("1.0", tk.END).strip()
@@ -868,16 +760,17 @@ class PacketSentinelDesktopApp:
         self._scrub_input()
 
     def _build_monitor_tab(self) -> None:
-        card = tk.Frame(self.tab_monitor, bg="#1e293b", padx=16, pady=16)
-        card.pack(fill=tk.BOTH, expand=True)
+        # Upper Card: Wire Sniffer & Real-Time Alerts
+        card = tk.Frame(self.tab_monitor, bg="#1e293b", padx=14, pady=10)
+        card.pack(fill=tk.BOTH, expand=True, pady=(0, 6))
 
         header_row = tk.Frame(card, bg="#1e293b")
-        header_row.pack(fill=tk.X, pady=(0, 8))
+        header_row.pack(fill=tk.X, pady=(0, 6))
 
         tk.Label(
             header_row,
-            text="Live Packet Capture & Real-Time Threat Alerts",
-            font=("Segoe UI", 12, "bold"),
+            text="Live Wire Packet Capture & Threat Alerts",
+            font=("Segoe UI", 11, "bold"),
             fg="#f8fafc",
             bg="#1e293b",
         ).pack(side=tk.LEFT)
@@ -895,7 +788,7 @@ class PacketSentinelDesktopApp:
 
         # Control Bar
         ctrl_bar = tk.Frame(card, bg="#1e293b")
-        ctrl_bar.pack(fill=tk.X, pady=(0, 10))
+        ctrl_bar.pack(fill=tk.X, pady=(0, 6))
 
         self.btn_toggle_monitor = tk.Button(
             ctrl_bar,
@@ -906,7 +799,7 @@ class PacketSentinelDesktopApp:
             activebackground="#0369a1",
             activeforeground="#ffffff",
             padx=12,
-            pady=5,
+            pady=4,
             relief=tk.FLAT,
             cursor="hand2",
             command=self._toggle_sniffer,
@@ -922,7 +815,7 @@ class PacketSentinelDesktopApp:
             activebackground="#475569",
             activeforeground="#ffffff",
             padx=12,
-            pady=5,
+            pady=4,
             relief=tk.FLAT,
             cursor="hand2",
             command=self._trigger_canary_alert,
@@ -948,7 +841,7 @@ class PacketSentinelDesktopApp:
             columns=cols,
             show="headings",
             selectmode="browse",
-            height=12,
+            height=6,
         )
         self.alert_tree.heading("time", text="Timestamp (UTC)")
         self.alert_tree.heading("indicator", text="Flagged Domain / IP")
@@ -957,8 +850,8 @@ class PacketSentinelDesktopApp:
         self.alert_tree.heading("layer", text="Detection Layer")
 
         self.alert_tree.column("time", width=140, anchor="w")
-        self.alert_tree.column("indicator", width=260, anchor="w")
-        self.alert_tree.column("feed", width=220, anchor="w")
+        self.alert_tree.column("indicator", width=240, anchor="w")
+        self.alert_tree.column("feed", width=180, anchor="w")
         self.alert_tree.column("process", width=140, anchor="w")
         self.alert_tree.column("layer", width=110, anchor="center")
 
@@ -966,6 +859,80 @@ class PacketSentinelDesktopApp:
         self.alert_tree.configure(yscrollcommand=sb.set)
         self.alert_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         sb.pack(side=tk.RIGHT, fill=tk.Y)
+
+        # Lower Card: Target Process Watchdog & Script Interpreter Inspector
+        w_card = tk.Frame(self.tab_monitor, bg="#1e293b", padx=14, pady=10)
+        w_card.pack(fill=tk.X, pady=(0, 0))
+
+        w_head = tk.Frame(w_card, bg="#1e293b")
+        w_head.pack(fill=tk.X, pady=(0, 4))
+
+        tk.Label(
+            w_head,
+            text="👁️ Target Process Watchdog & Script Lineage Inspector",
+            font=("Segoe UI", 10, "bold"),
+            fg="#f8fafc",
+            bg="#1e293b",
+        ).pack(side=tk.LEFT)
+
+        tk.Label(
+            w_head,
+            text="Traces child process trees & flags LOLBINs (powershell, node, curl, cmd)",
+            font=("Segoe UI", 8),
+            fg="#94a3b8",
+            bg="#1e293b",
+        ).pack(side=tk.RIGHT)
+
+        input_bar = tk.Frame(w_card, bg="#1e293b")
+        input_bar.pack(fill=tk.X, pady=(0, 6))
+
+        tk.Label(
+            input_bar,
+            text="Process Name or PID:",
+            font=("Segoe UI", 9),
+            fg="#94a3b8",
+            bg="#1e293b",
+        ).pack(side=tk.LEFT, padx=(0, 6))
+
+        self.proc_entry = tk.Entry(
+            input_bar,
+            bg="#0f172a",
+            fg="#f8fafc",
+            insertbackground="#38bdf8",
+            font=("Segoe UI", 9),
+            width=22,
+        )
+        self.proc_entry.insert(0, "python")
+        self.proc_entry.pack(side=tk.LEFT, padx=(0, 8))
+
+        inspect_btn = tk.Button(
+            input_bar,
+            text="Inspect Process Tree",
+            font=("Segoe UI", 9, "bold"),
+            bg="#0284c7",
+            fg="#ffffff",
+            padx=12,
+            pady=3,
+            relief=tk.FLAT,
+            cursor="hand2",
+            command=self._inspect_watchdog_target,
+        )
+        inspect_btn.pack(side=tk.LEFT)
+
+        self.watchdog_results = tk.Text(
+            w_card,
+            bg="#0f172a",
+            fg="#f8fafc",
+            font=("Consolas", 9),
+            relief=tk.FLAT,
+            wrap=tk.WORD,
+            height=4,
+        )
+        self.watchdog_results.pack(fill=tk.BOTH, expand=True)
+
+    def _build_watchdog_tab(self) -> None:
+        """Compatibility wrapper; functionality now merged into _build_monitor_tab."""
+        pass
 
     def _toggle_sniffer(self) -> None:
         snap = self._monitor_service.snapshot()
@@ -1048,65 +1015,6 @@ class PacketSentinelDesktopApp:
                             alert.detection_layer,
                         ),
                     )
-
-    def _build_watchdog_tab(self) -> None:
-        card = tk.Frame(self.tab_watchdog, bg="#1e293b", padx=16, pady=16)
-        card.pack(fill=tk.BOTH, expand=True)
-
-        tk.Label(
-            card,
-            text="Target Process Watchdog Inspector",
-            font=("Segoe UI", 12, "bold"),
-            fg="#f8fafc",
-            bg="#1e293b",
-        ).pack(anchor=tk.W, pady=(0, 4))
-
-        tk.Label(
-            card,
-            text="Attach to a running process to trace its child processes and flag unauthorized script execution:",
-            font=("Segoe UI", 9),
-            fg="#94a3b8",
-            bg="#1e293b",
-        ).pack(anchor=tk.W, pady=(0, 8))
-
-        input_bar = tk.Frame(card, bg="#1e293b")
-        input_bar.pack(fill=tk.X, pady=(0, 8))
-
-        self.proc_entry = tk.Entry(
-            input_bar,
-            bg="#0f172a",
-            fg="#f8fafc",
-            insertbackground="#38bdf8",
-            font=("Segoe UI", 10),
-            width=28,
-        )
-        self.proc_entry.insert(0, "python")
-        self.proc_entry.pack(side=tk.LEFT, padx=(0, 8))
-
-        inspect_btn = tk.Button(
-            input_bar,
-            text="Inspect Process Tree",
-            font=("Segoe UI", 9, "bold"),
-            bg="#0284c7",
-            fg="#ffffff",
-            padx=12,
-            pady=4,
-            relief=tk.FLAT,
-            cursor="hand2",
-            command=self._inspect_watchdog_target,
-        )
-        inspect_btn.pack(side=tk.LEFT)
-
-        self.watchdog_results = tk.Text(
-            card,
-            bg="#0f172a",
-            fg="#f8fafc",
-            font=("Consolas", 10),
-            relief=tk.FLAT,
-            wrap=tk.WORD,
-            height=14,
-        )
-        self.watchdog_results.pack(fill=tk.BOTH, expand=True)
 
     def _inspect_watchdog_target(self) -> None:
         target = self.proc_entry.get().strip()
@@ -1283,6 +1191,111 @@ class PacketSentinelDesktopApp:
         )
         self.vault_status_lbl.pack(side=tk.LEFT, fill=tk.X, expand=True)
 
+        # Section 4: User-Inspectable Diagnostic Logs & Maintenance
+        s4 = tk.Frame(scrollable_frame, bg="#1e293b", padx=14, pady=12)
+        s4.pack(fill=tk.X, pady=(0, 16))
+
+        tk.Label(s4, text="4. Diagnostic Logs & Maintenance", font=("Segoe UI", 10, "bold"), fg="#f8fafc", bg="#1e293b").pack(anchor=tk.W, pady=(0, 4))
+        tk.Label(
+            s4,
+            text="Logs are stored 100% locally. Export forum-safe anonymized bundles or permanently purge local caches:",
+            font=("Segoe UI", 9),
+            fg="#94a3b8",
+            bg="#1e293b",
+        ).pack(anchor=tk.W, pady=(0, 6))
+
+        self.diag_log_text = tk.Text(
+            s4,
+            bg="#0f172a",
+            fg="#e2e8f0",
+            font=("Consolas", 9),
+            relief=tk.FLAT,
+            wrap=tk.NONE,
+            height=8,
+        )
+        self.diag_log_text.pack(fill=tk.BOTH, expand=True, pady=(0, 8))
+
+        act_row = tk.Frame(s4, bg="#1e293b")
+        act_row.pack(fill=tk.X)
+
+        open_dir_btn = tk.Button(
+            act_row,
+            text="📁 Open Logs Directory",
+            font=("Segoe UI", 9, "bold"),
+            bg="#0284c7",
+            fg="#ffffff",
+            activebackground="#0369a1",
+            activeforeground="#ffffff",
+            padx=10,
+            pady=5,
+            relief=tk.FLAT,
+            cursor="hand2",
+            command=self._open_logs_dir,
+        )
+        open_dir_btn.pack(side=tk.LEFT, padx=(0, 6))
+
+        export_bundle_btn = tk.Button(
+            act_row,
+            text="📦 Export Anonymized Bundle",
+            font=("Segoe UI", 9, "bold"),
+            bg="#10b981",
+            fg="#ffffff",
+            activebackground="#059669",
+            activeforeground="#ffffff",
+            padx=10,
+            pady=5,
+            relief=tk.FLAT,
+            cursor="hand2",
+            command=self._export_forum_bundle,
+        )
+        export_bundle_btn.pack(side=tk.LEFT, padx=(0, 6))
+
+        refresh_logs_btn = tk.Button(
+            act_row,
+            text="🔄 Refresh Logs",
+            font=("Segoe UI", 9),
+            bg="#334155",
+            fg="#f8fafc",
+            padx=8,
+            pady=5,
+            relief=tk.FLAT,
+            cursor="hand2",
+            command=self._refresh_diag_logs,
+        )
+        refresh_logs_btn.pack(side=tk.LEFT, padx=(0, 6))
+
+        incidents_btn = tk.Button(
+            act_row,
+            text="🚨 Kill Incidents",
+            font=("Segoe UI", 9),
+            bg="#334155",
+            fg="#fca5a5",
+            padx=8,
+            pady=5,
+            relief=tk.FLAT,
+            cursor="hand2",
+            command=self._view_kill_incidents,
+        )
+        incidents_btn.pack(side=tk.LEFT, padx=(0, 6))
+
+        nuke_btn = tk.Button(
+            act_row,
+            text="🗑️ Nuke All Local Data",
+            font=("Segoe UI", 9, "bold"),
+            bg="#dc2626",
+            fg="#ffffff",
+            activebackground="#b91c1c",
+            activeforeground="#ffffff",
+            padx=10,
+            pady=5,
+            relief=tk.FLAT,
+            cursor="hand2",
+            command=self._nuke_local_data,
+        )
+        nuke_btn.pack(side=tk.RIGHT)
+
+        self._refresh_diag_logs()
+
     def _save_settings_vault(self) -> None:
         raw_names = self.entry_custom_names.get()
         names = [n.strip() for n in raw_names.split(",") if n.strip()]
@@ -1333,138 +1346,269 @@ class PacketSentinelDesktopApp:
             )
 
     def _build_diagnostics_tab(self) -> None:
-        card = tk.Frame(self.tab_diagnostics, bg="#1e293b", padx=16, pady=16)
-        card.pack(fill=tk.BOTH, expand=True)
+        """Compatibility wrapper; functionality now merged into _build_settings_tab."""
+        self._refresh_diag_logs()
 
-        header_row = tk.Frame(card, bg="#1e293b")
-        header_row.pack(fill=tk.X, pady=(0, 8))
+    def _build_documentation_tab(self) -> None:
+        header_card = tk.Frame(self.tab_docs, bg="#1e293b", padx=16, pady=10)
+        header_card.pack(fill=tk.X, pady=(0, 10))
 
         tk.Label(
-            header_row,
-            text="User-Inspectable Diagnostic Logs & Forum Bundle",
+            header_card,
+            text="📖 SentinelWire System Architecture & AI Integration Guides",
             font=("Segoe UI", 12, "bold"),
             fg="#f8fafc",
             bg="#1e293b",
-        ).pack(side=tk.LEFT)
+        ).pack(anchor=tk.W)
 
-        log_path_badge = tk.Label(
-            header_row,
-            text=f"Log: {get_log_dir() / 'sentinelwire.log'}",
-            font=("Segoe UI", 8),
-            fg="#94a3b8",
-            bg="#0f172a",
-            padx=8,
-            pady=3,
-        )
-        log_path_badge.pack(side=tk.RIGHT)
-
-        desc = tk.Label(
-            card,
-            text="SentinelWire logs operational events completely locally. You can open the log directory in Explorer, "
-            "export an anonymized diagnostic bundle to post on GitHub or forums (with zero private usernames, IPs, or paths), "
-            "or permanently purge all local logs and temporary data with 1 click.",
+        tk.Label(
+            header_card,
+            text="Offline reference for privacy airlocks, 5-Gate DLP, threat detection, and AI MCP integration.",
             font=("Segoe UI", 9),
             fg="#94a3b8",
             bg="#1e293b",
-            wraplength=800,
-            justify=tk.LEFT,
-        )
-        desc.pack(anchor=tk.W, pady=(0, 8))
+        ).pack(anchor=tk.W, pady=(2, 6))
 
-        # Log viewer area
-        self.diag_log_text = tk.Text(
-            card,
+        mcp_bar = tk.Frame(header_card, bg="#0f172a", padx=10, pady=8, highlightbackground="#334155", highlightthickness=1)
+        mcp_bar.pack(fill=tk.X, pady=(4, 2))
+
+        tk.Label(
+            mcp_bar,
+            text="🤖 Connect AI to SentinelWire MCP:",
+            font=("Segoe UI", 9, "bold"),
+            fg="#38bdf8",
             bg="#0f172a",
-            fg="#e2e8f0",
-            font=("Consolas", 9),
-            relief=tk.FLAT,
-            wrap=tk.NONE,
-            height=14,
-        )
-        self.diag_log_text.pack(fill=tk.BOTH, expand=True, pady=(0, 10))
+        ).pack(side=tk.LEFT, padx=(0, 10))
 
-        # Action bar
-        act_row = tk.Frame(card, bg="#1e293b")
-        act_row.pack(fill=tk.X)
-
-        open_dir_btn = tk.Button(
-            act_row,
-            text="📁 Open Logs Directory",
+        copy_mcp_btn = tk.Button(
+            mcp_bar,
+            text="📋 Copy MCP Configuration JSON (Cursor / Claude / Antigravity)",
             font=("Segoe UI", 9, "bold"),
             bg="#0284c7",
             fg="#ffffff",
             activebackground="#0369a1",
             activeforeground="#ffffff",
             padx=12,
-            pady=6,
+            pady=4,
             relief=tk.FLAT,
             cursor="hand2",
-            command=self._open_logs_dir,
+            command=self._copy_mcp_config_json,
         )
-        open_dir_btn.pack(side=tk.LEFT, padx=(0, 8))
+        copy_mcp_btn.pack(side=tk.LEFT)
 
-        export_bundle_btn = tk.Button(
-            act_row,
-            text="📦 Export Anonymized Bundle (Forum-Safe)",
-            font=("Segoe UI", 9, "bold"),
-            bg="#10b981",
-            fg="#ffffff",
-            activebackground="#059669",
-            activeforeground="#ffffff",
-            padx=12,
-            pady=6,
-            relief=tk.FLAT,
-            cursor="hand2",
-            command=self._export_forum_bundle,
-        )
-        export_bundle_btn.pack(side=tk.LEFT, padx=(0, 8))
+        tk.Label(
+            mcp_bar,
+            text="7 tools: voice prompt, prompt sanitizer, process safety, file reader, malware scan, reputation, alerts.",
+            font=("Segoe UI", 8),
+            fg="#94a3b8",
+            bg="#0f172a",
+        ).pack(side=tk.RIGHT)
 
-        refresh_logs_btn = tk.Button(
-            act_row,
-            text="🔄 Refresh Logs",
-            font=("Segoe UI", 9),
-            bg="#334155",
+        # Split Container: Left Topic List, Right Document Text
+        doc_container = tk.Frame(self.tab_docs, bg="#0f172a")
+        doc_container.pack(fill=tk.BOTH, expand=True)
+
+        topic_sidebar = tk.Frame(doc_container, bg="#1e293b", width=230, padx=8, pady=8)
+        topic_sidebar.pack(side=tk.LEFT, fill=tk.Y, padx=(0, 10))
+        topic_sidebar.pack_propagate(False)
+
+        tk.Label(
+            topic_sidebar,
+            text="TOPICS",
+            font=("Segoe UI", 8, "bold"),
+            fg="#64748b",
+            bg="#1e293b",
+            padx=4,
+            pady=4,
+        ).pack(anchor=tk.W)
+
+        self._doc_topic_buttons = []
+        topics = [
+            ("🛡️ Offline AI Airlock", "airlock"),
+            ("🔒 5-Gate DLP Engine", "dlp"),
+            ("📡 Wire Sniffer & LOTS", "wire"),
+            ("🤖 AI MCP Tools Guide", "mcp"),
+            ("🚨 Kill Switch Recovery", "killswitch"),
+            ("📜 License & Privacy", "privacy"),
+        ]
+
+        for text, tid in topics:
+            btn = tk.Button(
+                topic_sidebar,
+                text=text,
+                font=("Segoe UI", 9),
+                anchor="w",
+                bg="#0f172a" if tid == "airlock" else "#1e293b",
+                fg="#38bdf8" if tid == "airlock" else "#94a3b8",
+                activebackground="#0f172a",
+                activeforeground="#ffffff",
+                padx=8,
+                pady=6,
+                relief=tk.FLAT,
+                cursor="hand2",
+                command=lambda t=tid: self._show_doc_topic(t),
+            )
+            btn.pack(fill=tk.X, pady=2)
+            self._doc_topic_buttons.append((tid, btn))
+
+        # Right Text Display
+        right_doc = tk.Frame(doc_container, bg="#1e293b", padx=12, pady=10)
+        right_doc.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+        self.doc_content_text = tk.Text(
+            right_doc,
+            bg="#0f172a",
             fg="#f8fafc",
-            padx=10,
-            pady=6,
-            relief=tk.FLAT,
-            cursor="hand2",
-            command=self._refresh_diag_logs,
-        )
-        refresh_logs_btn.pack(side=tk.LEFT, padx=(0, 8))
-
-        incidents_btn = tk.Button(
-            act_row,
-            text="🚨 Kill Incidents",
             font=("Segoe UI", 9),
-            bg="#334155",
-            fg="#fca5a5",
-            padx=10,
-            pady=6,
             relief=tk.FLAT,
-            cursor="hand2",
-            command=self._view_kill_incidents,
+            wrap=tk.WORD,
+            padx=14,
+            pady=12,
         )
-        incidents_btn.pack(side=tk.LEFT, padx=(0, 8))
+        doc_scroll = ttk.Scrollbar(right_doc, orient="vertical", command=self.doc_content_text.yview)
+        self.doc_content_text.configure(yscrollcommand=doc_scroll.set)
+        self.doc_content_text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        doc_scroll.pack(side=tk.RIGHT, fill=tk.Y)
 
-        nuke_btn = tk.Button(
-            act_row,
-            text="🗑️ Nuke All Local Data & Logs",
-            font=("Segoe UI", 9, "bold"),
-            bg="#dc2626",
-            fg="#ffffff",
-            activebackground="#b91c1c",
-            activeforeground="#ffffff",
-            padx=12,
-            pady=6,
-            relief=tk.FLAT,
-            cursor="hand2",
-            command=self._nuke_local_data,
+        self._show_doc_topic("airlock")
+
+    def _show_doc_topic(self, topic_id: str) -> None:
+        for tid, btn in self._doc_topic_buttons:
+            if tid == topic_id:
+                btn.config(bg="#0f172a", fg="#38bdf8", font=("Segoe UI", 9, "bold"))
+            else:
+                btn.config(bg="#1e293b", fg="#94a3b8", font=("Segoe UI", 9, "normal"))
+
+        doc_texts = {
+            "airlock": (
+                "🛡️ 100% OFFLINE AI AIRLOCK & SPEECH DICTATION\n"
+                "======================================================================\n\n"
+                "SentinelWire acts as a protective airlock between your machine and external AI models "
+                "(such as Claude, ChatGPT, Gemini, Cursor, and VS Code Copilot).\n\n"
+                "• ZERO OUTBOUND TELEMETRY:\n"
+                "  During active monitoring, SentinelWire engages PEP 578 runtime socket isolation. "
+                "  The app never phones home, sends crash reports to cloud servers, or transmits data.\n\n"
+                "• AIR-GAPPED SPEECH DICTATION:\n"
+                "  Audio is captured via your local microphone using sounddevice and transcribed completely "
+                "  offline on your CPU using faster-whisper with local_files_only=True. "
+                "  No audio is ever streamed to cloud speech-to-text APIs.\n\n"
+                "• AUTOMATIC MCP AIRLOCK BUFFER:\n"
+                "  Every dictated prompt and scrubbed snippet is automatically stored in a secure local buffer "
+                "  (%LOCALAPPDATA%\\PacketSentinel\\latest_voice_prompt.json). Your connected AI assistant "
+                "  can fetch it directly through the MCP tool 'get_latest_voice_prompt' without any copy-paste."
+            ),
+            "dlp": (
+                "🔒 PRE-MODEL 5-GATE DATA LOSS PREVENTION (DLP) ENGINE\n"
+                "======================================================================\n\n"
+                "Before any file, log, or prompt text reaches an AI model or external API, it passes "
+                "through 5 defensive redaction gates:\n\n"
+                "Gate 1: File Extension & Magic-Byte Guard\n"
+                "  Prevents AI from accidentally reading sensitive binaries, passport photos (.png, .jpg), "
+                "  tax documents (.pdf, .xlsx), SQLite databases, or SSH private keys (.id_rsa, .pem).\n\n"
+                "Gate 2: Payment Cards & Financial Data (Luhn Algorithm)\n"
+                "  Detects Visa, Mastercard, Amex, Discover, and IBAN bank account numbers with full "
+                "  checksum validation, replacing them with [REDACTED_PAYMENT_CARD] / [REDACTED_IBAN].\n\n"
+                "Gate 3: OS Usernames & Machine Paths (Zero Machine-Binding)\n"
+                "  Redacts Windows user profile names (e.g. C:\\Users\\<username>\\) and local MAC addresses "
+                "  to ensure no prompt leaks your host machine identity.\n\n"
+                "Gate 4: National Personal Identity Codes\n"
+                "  Redacts US SSNs, UK National Insurance numbers, and Nordic Personal Identity Codes.\n\n"
+                "Gate 5: API Keys, JWTs & Secret Tokens\n"
+                "  Scans for OpenAI keys (sk-...), Anthropic keys (sk-ant-...), GitHub tokens (ghp_...), "
+                "  AWS access keys (AKIA...), bearer tokens, and RSA private key headers."
+            ),
+            "wire": (
+                "📡 LIVE WIRE PACKET CAPTURE & LOTS EXFILTRATION DEFENSE\n"
+                "======================================================================\n\n"
+                "SentinelWire continuously audits system network sockets, DNS queries, and TLS handshakes.\n\n"
+                "• LIVING-OFF-THE-LAND (LOTS / LOLBIN) DEFENSE:\n"
+                "  Attackers and rogue scripts often use legitimate Windows utilities (powershell.exe, "
+                "  curl.exe, bitsadmin.exe, certutil.exe) to silently exfiltrate stolen credentials. "
+                "  SentinelWire traces every outbound network connection back to its originating process "
+                "  and warns when an interpreter makes unexpected connections.\n\n"
+                "• MULTI-FEED OFFLINE THREAT INTEL:\n"
+                "  Evaluates IP and domain destinations against built-in ThreatFox, URLhaus, and custom "
+                "  threat feeds stored completely locally."
+            ),
+            "mcp": (
+                "🤖 AI MCP TOOLS REFERENCE (MODEL CONTEXT PROTOCOL)\n"
+                "======================================================================\n\n"
+                "SentinelWire exposes 7 offline, DLP-enforced MCP tools over JSON-RPC stdio:\n\n"
+                "1. get_latest_voice_prompt\n"
+                "   Fetches the most recent pre-sanitized voice dictation without manual copy-paste.\n\n"
+                "2. sanitize_prompt_text(text)\n"
+                "   Scans and sanitizes arbitrary prompts, logs, or terminal outputs using the 5-Gate DLP.\n\n"
+                "3. inspect_process_safety(process_name_or_pid)\n"
+                "   Inspects a running process to audit its child lineage and detect rogue script interpreters.\n\n"
+                "4. read_sanitized_project_text(relative_path, start_line, end_line)\n"
+                "   Safely reads workspace files with all secrets, tokens, and machine names scrubbed.\n\n"
+                "5. scan_downloaded_payload_malware(content_text, filename)\n"
+                "   Pure offline scan for deceptive extensions, polyglot binaries, and encoded scripts.\n\n"
+                "6. check_indicator_reputation(indicator)\n"
+                "   Verifies domains/IPs against offline threat feeds.\n\n"
+                "7. get_sanitized_security_alerts(limit)\n"
+                "   Returns recent threat detection events."
+            ),
+            "killswitch": (
+                "🚨 EMERGENCY KILL SWITCH & POST-MORTEM INCIDENT LOGGING\n"
+                "======================================================================\n\n"
+                "The Emergency Kill Switch provides an instantaneous panic button if you detect suspicious "
+                "traffic or unapproved network behavior.\n\n"
+                "• WHAT HAPPENS WHEN ENGAGED:\n"
+                "  1. Sockets Severed: Python PEP 578 runtime socket lockdown intercepts and terminates "
+                "     in-process network calls.\n"
+                "  2. Processes Killed: Background sniffer threads and capture helpers (dumpcap, tshark) "
+                "     are terminated immediately.\n"
+                "  3. Incident Recorded: An anonymized incident report is written to disk at "
+                "     %LOCALAPPDATA%\\PacketSentinel\\logs\\incident_reports\\kill_switch_incident_<timestamp>.json.\n\n"
+                "• IS THE APP USABLE AFTERWARDS?\n"
+                "  YES! The kill switch is temporary and immediate. It cleanly stops the running process. "
+                "  You can relaunch SentinelWire anytime using run.bat.\n\n"
+                "• SAFE REPORTING:\n"
+                "  All incident reports are scrubbed by the 5-Gate DLP. You can click 'Copy Incident Report' "
+                "  and paste it directly into GitHub Issues or forums with 0 risk of leaking secrets."
+            ),
+            "privacy": (
+                "📜 OPEN SOURCE & PRIVACY GUARANTEES\n"
+                "======================================================================\n\n"
+                "• LICENSE: Apache License 2.0 (100% Permissive Open Source).\n"
+                "• ZERO COPYLEFT CONTAMINATION: Zero GPL or AGPL dependencies.\n"
+                "• ZERO MACHINE IDENTIFIERS IN REPO: Automated scanning guarantees no private hostnames, "
+                "  MACs, or usernames are stored in source code.\n"
+                "• LOCAL DPAPI ENCRYPTION: Custom user blocklists and sensitive terms are encrypted "
+                "  using Windows CryptProtectData tied to your Windows user account.\n"
+                "• 1-CLICK COMPLETE PURGE: Click 'Nuke All Local Data & Logs' in Settings to completely "
+                "  erase diagnostic files and voice audio buffers."
+            ),
+        }
+
+        self.doc_content_text.delete("1.0", tk.END)
+        self.doc_content_text.insert(tk.END, doc_texts.get(topic_id, "Topic not found."))
+        self.doc_content_text.see("1.0")
+
+    def _copy_mcp_config_json(self) -> None:
+        snippet = {
+            "mcpServers": {
+                "sentinelwire": {
+                    "command": "python",
+                    "args": ["-m", "packetsentinel.cli", "--mcp"],
+                    "env": {
+                        "PYTHONUNBUFFERED": "1"
+                    }
+                }
+            }
+        }
+        text_to_copy = json.dumps(snippet, indent=2)
+        self.root.clipboard_clear()
+        self.root.clipboard_append(text_to_copy)
+        messagebox.showinfo(
+            "MCP Configuration Copied",
+            "SentinelWire MCP server configuration copied to clipboard!\n\n"
+            "Paste this snippet into your IDE or AI assistant config:\n"
+            "• Antigravity / Cursor: ~/.gemini/antigravity/mcp_config.json\n"
+            "• Claude Desktop: %APPDATA%\\Claude\\claude_desktop_config.json\n"
+            "• VS Code Copilot: .vscode/mcp.json",
         )
-        nuke_btn.pack(side=tk.RIGHT)
-
-        # Initial populate
-        self._refresh_diag_logs()
 
     def _open_logs_dir(self) -> None:
         log_dir = get_log_dir()
