@@ -33,20 +33,25 @@ BANNER = r"""
  |  __/ (_| | (__|   <  __/ |_ ___) |  __/ | | | |_| | | | |  __/ |
  |_|   \__,_|\___|_|\_\___|\__|____/ \___|_| |_|\__|_|_| |_|\___|_|
 
-  Open-Source Windows Packet & Sketchy DNS Threat Monitor (v{version})
+  SentinelWire • Zero-Outbound Windows Threat & Packet Monitor (v{version})
 ======================================================================
 """.strip("\n")
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        prog="packetsentinel",
+        prog="sentinelwire",
         description="Real-time Windows packet & sketchy DNS monitor using Wireshark/tshark and open-source threat feeds.",
     )
     parser.add_argument(
         "--setup",
         action="store_true",
         help="Run the interactive step-by-step installation, explanation, and self-test wizard.",
+    )
+    parser.add_argument(
+        "--setup-voice",
+        action="store_true",
+        help="Install dependencies and download the offline faster-whisper speech model while online.",
     )
     parser.add_argument(
         "--non-interactive",
@@ -106,6 +111,19 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=None,
         help="Workspace root directory allowed for sanitized MCP file inspection (defaults to CWD).",
     )
+    parser.add_argument(
+        "--watch-process",
+        metavar="APP_OR_PID",
+        default=None,
+        help="Target a specific application name or PID to monitor all its sockets, DNS queries, and spawned child scripts.",
+    )
+    parser.add_argument(
+        "--ui",
+        "--desktop-ui",
+        action="store_true",
+        dest="desktop_ui",
+        help="Launch the native offline desktop window with Pre-Model Privacy Scrubber, Wire Monitor, and Process Watchdog.",
+    )
     return parser
 
 
@@ -133,6 +151,9 @@ def print_status_report(config: AppConfig, monitor: PacketSentinelMonitor, feed_
 
 
 def main(argv: Optional[List[str]] = None) -> int:
+    from .diagnostic_logger import setup_diagnostic_logging
+
+    setup_diagnostic_logging()
     logging.basicConfig(
         level=logging.INFO,
         format="[%(asctime)s] [%(levelname)s] %(message)s",
@@ -153,6 +174,38 @@ def main(argv: Optional[List[str]] = None) -> int:
     if args.setup:
         return run_interactive_setup(config, interactive=not args.non_interactive)
 
+    if args.setup_voice:
+        from .voice_engine import check_voice_status, download_voice_model, get_model_dir
+        print("=" * 68)
+        print("  SentinelWire Voice Engine Setup and Offline Model Installer")
+        print("=" * 68)
+        m_dir = get_model_dir(config.app_dir)
+        status = check_voice_status(m_dir)
+        print(f"[*] Current voice engine status: {status.detail}")
+        if not status.stt_installed:
+            print("[*] Installing voice engine packages ('sounddevice', 'numpy', 'faster-whisper')...")
+            try:
+                import subprocess
+                subprocess.run(
+                    [sys.executable, "-m", "pip", "install", "sounddevice>=0.4.6", "numpy>=1.24.0", "faster-whisper>=1.0.0"],
+                    check=True,
+                    shell=False,
+                )
+                print("[+] Dependencies successfully installed.")
+            except Exception as exc:
+                print(f"[!] Failed to install packages via pip: {exc}")
+                print("[*] You can install manually with: pip install -r requirements-voice.txt")
+                return 1
+        print(f"[*] Downloading offline speech model ('base') into: {m_dir}...")
+        try:
+            download_voice_model(m_dir, model_name="base")
+            print(f"[+] Offline Whisper model successfully downloaded to: {m_dir}")
+            print("[+] Voice Airlock is ready for 100% offline dictation.")
+            return 0
+        except Exception as exc:
+            print(f"[!] Failed to download offline speech model: {exc}")
+            return 1
+
     if args.add_feed:
         try:
             validated_url = validate_https_feed_url(args.add_feed)
@@ -167,7 +220,7 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     # On first interactive run with no flags, walk the user through the explanatory setup wizard
     is_default_monitor_launch = not any(
-        (args.status, args.update_feeds, args.check, args.add_domain, args.test_alert)
+        (args.status, args.update_feeds, args.check, args.add_domain, args.test_alert, getattr(args, "setup_voice", False))
     )
     if is_default_monitor_launch and not config.setup_completed and sys.stdin and sys.stdin.isatty():
         print("[*] First launch detected — starting interactive setup & verification wizard...\n")
@@ -223,6 +276,49 @@ def main(argv: Optional[List[str]] = None) -> int:
             f"[+] CLEAN: '{target}' was not found in {threat_engine.domain_count:,} domains "
             f"or {threat_engine.ip_count:,} IPs."
         )
+        return 0
+
+    if args.watch_process:
+        from .process_watchdog import (
+            WatchdogTargetStatus,
+            find_processes_by_name,
+            format_watchdog_banner,
+            inspect_child_lineage,
+        )
+
+        target = args.watch_process.strip()
+        print(f"[*] Activating Target Process Watchdog on: '{target}'")
+        target_pid = int(target) if target.isdigit() else None
+        target_name = target
+        if target_pid is None:
+            matches = find_processes_by_name(target)
+            if not matches:
+                print(f"[!] No running process matching '{target}' found.")
+                return 1
+            target_pid, target_name, _ = matches[0]
+            print(f"[+] Found {len(matches)} matching instance(s). Attached to PID {target_pid} ({target_name}).")
+
+        children = inspect_child_lineage(target_pid)
+        status = WatchdogTargetStatus(
+            target_pid=target_pid,
+            target_name=target_name,
+            is_alive=True,
+            active_children_count=len(children),
+        )
+        print(format_watchdog_banner(status))
+        if children:
+            print("[*] Active child processes / scripts spawned:")
+            for c in children:
+                tag = "[SCRIPT INTERPRETER]" if c.is_script_interpreter else ""
+                print(f"    - PID {c.child_pid}: {c.child_name} {tag} (cmd: {c.cmdline[:80]})")
+        return 0
+
+    if args.desktop_ui:
+        print_status_report(config, monitor, feed_stats)
+        from .desktop_ui import launch_desktop_app
+
+        print("[*] Launching Native Desktop Security & Privacy Airlock UI...")
+        launch_desktop_app(config=config)
         return 0
 
     if args.test_alert:

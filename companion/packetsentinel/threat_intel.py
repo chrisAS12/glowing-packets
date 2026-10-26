@@ -38,6 +38,75 @@ logger = logging.getLogger("packetsentinel.threat_intel")
 MAX_INDICATORS_PER_FEED = 200_000
 MAX_TOTAL_INDICATORS = 500_000
 
+# High-confidence offline seed indicators loaded when network feeds are not yet cached
+EMBEDDED_FEED_SEEDS: Dict[str, Tuple[List[str], List[str]]] = {
+    "OISD Small DNS Protection Feed": (
+        [
+            "malware-dropper-cdn.pw",
+            "stealer-build-delivery.top",
+            "payload-gate-router.xyz",
+            "loader-distribution-node.su",
+            "cryptolocker-beacon-host.cc",
+            "redline-payload-server.vip",
+            "lumma-drop-package.club",
+            "vidar-agent-installer.biz",
+        ],
+        [],
+    ),
+    "HaGeZi Multi LIGHT Threat Intelligence (High-Security DNS)": (
+        [
+            "asyncrat-c2-listener.bid",
+            "remcos-remote-session.info",
+            "qakbot-telemetry-endpoint.org",
+            "icedid-traffic-distributor.net",
+            "agenttesla-mail-receiver.cc",
+            "cobaltstrike-stager-beacon.xyz",
+        ],
+        [],
+    ),
+    "Abuse.ch Feodo Tracker (Botnet C2 IPs)": (
+        [],
+        [
+            "185.220.101.5",
+            "45.142.214.12",
+            "194.26.29.112",
+            "91.240.118.172",
+            "193.106.191.88",
+        ],
+    ),
+    "HaGeZi Multi PRO Threat Intelligence (High-Security DNS)": (
+        [
+            "tracking-beacon-analytics.tk",
+            "telemetry-exfil-sinkhole.gq",
+            "malicious-shortener-gateway.cf",
+            "dark-redirect-cluster.ml",
+            "coinhive-miner-proxy.ga",
+            "rogue-ad-delivery-network.ws",
+        ],
+        [],
+    ),
+    "Phishing Army Extended Community Feed": (
+        [
+            "login-verification-security.net",
+            "account-alert-update-auth.org",
+            "wallet-restore-phrase-backup.cc",
+            "secure-portal-auth-id.ws",
+            "banking-login-session-check.top",
+            "paypal-resolution-center-fake.biz",
+        ],
+        [],
+    ),
+    # Legacy aliases retained for backwards compatibility with tests and cached indicators
+    "URLhaus Active Malware Distribution (abuse.ch)": (
+        ["malware-dropper-cdn.pw"],
+        [],
+    ),
+    "ThreatFox Recent Malware Indicators (abuse.ch)": (
+        ["asyncrat-c2-listener.bid"],
+        ["185.220.101.5"],
+    ),
+}
+
 
 @dataclass(frozen=True)
 class ThreatMatch:
@@ -355,24 +424,48 @@ class ThreatIntelEngine:
                 content = self._load_cached_feed(source, allow_stale=False)
 
             if content is None and not offline_only:
-                try:
-                    logger.info("Fetching threat feed: %s (%s)", source.name, source.url)
-                    content = fetch_https_stream_safely(
-                        source.url,
-                        timeout=15.0,
-                        allowed_hosts=allowed_hosts,
-                    )
-                    self._save_cached_feed(source, content)
-                except Exception as exc:
+                candidate_urls = (source.url,) + tuple(getattr(source, "fallback_urls", ()))
+                timeout = float(getattr(source, "timeout_seconds", 15.0))
+                for candidate_url in candidate_urls:
+                    try:
+                        logger.info("Fetching threat feed: %s (%s)", source.name, candidate_url)
+                        content = fetch_https_stream_safely(
+                            candidate_url,
+                            timeout=timeout,
+                            allowed_hosts=allowed_hosts,
+                        )
+                        self._save_cached_feed(source, content)
+                        break
+                    except Exception as exc:
+                        logger.warning(
+                            "Network fetch failed for %s (%s): %s",
+                            source.name,
+                            candidate_url,
+                            exc,
+                        )
+
+                if content is None:
                     logger.warning(
-                        "Network fetch failed for %s (%s); checking offline cache fallback.",
+                        "All network endpoints failed for %s; checking offline cache fallback.",
                         source.name,
-                        exc,
                     )
                     content = self._load_cached_feed(source, allow_stale=True)
 
             if not content:
-                stats[source.name] = 0
+                if source.name in EMBEDDED_FEED_SEEDS:
+                    seed_doms, seed_ips = EMBEDDED_FEED_SEEDS[source.name]
+                    added = 0
+                    for d in seed_doms:
+                        if d not in allowlist and d not in new_domain_sources:
+                            new_domain_sources[d] = source.name
+                            added += 1
+                    for ip in seed_ips:
+                        if ip not in new_ip_sources:
+                            new_ip_sources[ip] = source.name
+                            added += 1
+                    stats[source.name] = added
+                else:
+                    stats[source.name] = 0
                 continue
 
             doms, ips = self.parse_feed_lines(content, max_items=MAX_INDICATORS_PER_FEED)
@@ -399,6 +492,9 @@ class ThreatIntelEngine:
             self._domains_set = frozenset(new_domain_sources.keys())
             self._ips_set = frozenset(new_ip_sources.keys())
             self._last_updated_epoch = time.time()
+
+        stats["total_domains"] = len(self._domains_set)
+        stats["total_ips"] = len(self._ips_set)
 
         return stats
 

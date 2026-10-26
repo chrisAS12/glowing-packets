@@ -72,3 +72,41 @@ __pycache__/
 # Endpoint Security messages recorded on a real Mac, read by the decoder tests
 # in src/sensor/macos/esf/fixture_tests.rs. See docs/development.md.
 !tests/fixtures/esf/**
+
+# Python bytecode & cache
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Python packaging & virtual environments
+dist/
+build/
+*.egg-info/
+.venv/
+venv/
+env/
+
+# PacketSentinel companion runtime data & local telemetry
+alerts.jsonl
+companion/alerts.jsonl
+mcp_audit.jsonl
+companion/mcp_audit.jsonl
+threat_intel_cache.json
+companion/threat_intel_cache.json
+threat_intel_cache.json.tmp*
+*.pcap
+*.pcapng
+
+# Secrets and local configurations
+.env
+.env.*
+!.env.example
+!.env.template
+.secrets/
+
+# Windows & macOS OS junk
+Thumbs.db
+ehthumbs.db
+Desktop.ini

@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Set
@@ -18,34 +19,74 @@ class ThreatFeedSource:
     name: str
     url: str
     category: str
+    fallback_urls: tuple[str, ...] = ()
+    timeout_seconds: float = 15.0
     enabled_by_default: bool = True
 
 
 DEFAULT_THREAT_FEEDS: tuple[ThreatFeedSource, ...] = (
     ThreatFeedSource(
-        name="DandelionSprout Anti-Malware Hosts (GitHub)",
-        url="https://raw.githubusercontent.com/DandelionSprout/adfilt/master/Alternate%20versions%20Anti-Malware%20List/AntiMalwareHosts.txt",
+        name="OISD Small DNS Protection Feed",
+        url="https://small.oisd.nl",
         category="malware_domain",
+        fallback_urls=("https://raw.githubusercontent.com/sjhgvr/oisd/main/hosts_small.txt",),
+        timeout_seconds=12.0,
     ),
     ThreatFeedSource(
-        name="Prigent Malware & Cryptojacking Domains",
-        url="https://v.firebog.net/hosts/Prigent-Crypto.txt",
+        name="HaGeZi Multi LIGHT Threat Intelligence (High-Security DNS)",
+        url="https://raw.githubusercontent.com/hagezi/dns-blocklists/main/hosts/light.txt",
         category="malware_domain",
+        fallback_urls=("https://raw.githubusercontent.com/hagezi/dns-blocklists/main/hosts/pro.txt",),
+        timeout_seconds=15.0,
     ),
     ThreatFeedSource(
         name="Abuse.ch Feodo Tracker (Botnet C2 IPs)",
         url="https://feodotracker.abuse.ch/downloads/ipblocklist_recommended.txt",
         category="botnet_c2_ip",
+        fallback_urls=("https://feodotracker.abuse.ch/downloads/ipblocklist.txt",),
+        timeout_seconds=15.0,
+    ),
+    ThreatFeedSource(
+        name="HaGeZi Multi PRO Threat Intelligence (High-Security DNS)",
+        url="https://raw.githubusercontent.com/hagezi/dns-blocklists/main/hosts/pro.txt",
+        category="malware_domain",
+        fallback_urls=("https://raw.githubusercontent.com/hagezi/dns-blocklists/main/hosts/light.txt",),
+        timeout_seconds=20.0,
     ),
     ThreatFeedSource(
         name="StevenBlack Unified Hosts (Sketchy/Malware/Trackers)",
         url="https://raw.githubusercontent.com/StevenBlack/hosts/master/hosts",
         category="sketchy_dns",
+        fallback_urls=(),
+        timeout_seconds=20.0,
     ),
     ThreatFeedSource(
-        name="OpenPhish GitHub Community Feed (Phishing Domains)",
+        name="Phishing Army Extended Community Feed",
+        url="https://phishing.army/download/phishing_army_blocklist_extended.txt",
+        category="phishing_domain",
+        fallback_urls=("https://phishing.army/download/phishing_army_blocklist.txt",),
+        timeout_seconds=15.0,
+    ),
+    ThreatFeedSource(
+        name="DandelionSprout Anti-Malware Hosts (GitHub)",
+        url="https://raw.githubusercontent.com/DandelionSprout/adfilt/master/Alternate%20versions%20Anti-Malware%20List/AntiMalwareHosts.txt",
+        category="malware_domain",
+        fallback_urls=(),
+        timeout_seconds=15.0,
+    ),
+    ThreatFeedSource(
+        name="Prigent Malware & Cryptojacking Domains",
+        url="https://v.firebog.net/hosts/Prigent-Crypto.txt",
+        category="malware_domain",
+        fallback_urls=(),
+        timeout_seconds=15.0,
+    ),
+    ThreatFeedSource(
+        name="OpenPhish Community Feed (Phishing Domains)",
         url="https://raw.githubusercontent.com/openphish/public_feed/refs/heads/main/feed.txt",
         category="phishing_domain",
+        fallback_urls=("https://openphish.com/feed.txt",),
+        timeout_seconds=15.0,
     ),
 )
 
@@ -55,11 +96,14 @@ DEFAULT_TRUSTED_FEED_HOSTS: Set[str] = {
     "raw.githubusercontent.com",
     "gist.githubusercontent.com",
     "urlhaus.abuse.ch",
+    "threatfox.abuse.ch",
     "feodotracker.abuse.ch",
     "sslbl.abuse.ch",
     "openphish.com",
     "phishing.army",
     "v.firebog.net",
+    "small.oisd.nl",
+    "oisd.nl",
 }
 
 # Core OS, DNS, and repo hosts are pinned here so a poisoned upstream community feed
@@ -79,8 +123,12 @@ SAFE_ALLOWLIST_DOMAINS: frozenset[str] = frozenset(
         "gist.githubusercontent.com",
         "objects.githubusercontent.com",
         "urlhaus.abuse.ch",
+        "threatfox.abuse.ch",
         "feodotracker.abuse.ch",
         "abuse.ch",
+        "phishing.army",
+        "oisd.nl",
+        "small.oisd.nl",
         "microsoft.com",
         "windows.com",
         "windowsupdate.com",
@@ -113,15 +161,40 @@ HELP_REPO_URL = "https://github.com/chrisAS12/glowing-packets"
 
 
 def get_app_data_dir() -> Path:
-    override = os.environ.get("PACKETSENTINEL_HOME")
+    override = os.environ.get("SENTINELWIRE_HOME") or os.environ.get("PACKETSENTINEL_HOME")
     if override:
         base = Path(override).expanduser().resolve()
-    else:
-        local_app_data = os.environ.get("LOCALAPPDATA")
-        base = (Path(local_app_data) / "PacketSentinel") if local_app_data else (Path.home() / ".packetsentinel")
+        base.mkdir(parents=True, exist_ok=True)
+        return base
 
-    base.mkdir(parents=True, exist_ok=True)
-    return base
+    local_app_data = os.environ.get("LOCALAPPDATA")
+    canonical_base = (Path(local_app_data) / "SentinelWire") if local_app_data else (Path.home() / ".sentinelwire")
+    legacy_base = (Path(local_app_data) / "PacketSentinel") if local_app_data else (Path.home() / ".packetsentinel")
+
+    should_migrate = not canonical_base.exists() and legacy_base.exists()
+    canonical_base.mkdir(parents=True, exist_ok=True)
+
+    if should_migrate:
+        items_to_migrate = [
+            "config.json",
+            "custom_sketchy_domains.txt",
+            "latest_voice_prompt.json",
+            "models",
+            "vault.bin",
+        ]
+        for item_name in items_to_migrate:
+            src = legacy_base / item_name
+            dst = canonical_base / item_name
+            if src.exists() and not dst.exists():
+                try:
+                    if src.is_dir():
+                        shutil.copytree(src, dst)
+                    else:
+                        shutil.copy2(src, dst)
+                except Exception:
+                    pass
+
+    return canonical_base
 
 
 @dataclass

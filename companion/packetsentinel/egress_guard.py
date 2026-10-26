@@ -35,9 +35,39 @@ _BLOCKED_AUDIT_EVENTS = frozenset(
         "ftplib.connect",
         "smtplib.connect",
         "telnetlib.open",
-        "ctypes.dlopen",
-        "ctypes.dlsym",
-        "ctypes.call_function",
+    }
+)
+
+_BLOCKED_NETWORK_DLLS = frozenset(
+    {
+        "ws2_32",
+        "wsock32",
+        "wininet",
+        "winhttp",
+        "urlmon",
+        "libcurl",
+        "libsocket",
+    }
+)
+
+_BLOCKED_NETWORK_SYMBOLS = frozenset(
+    {
+        "connect",
+        "send",
+        "sendto",
+        "sendmsg",
+        "wsaconnect",
+        "wsasend",
+        "wsasendto",
+        "internetopen",
+        "internetopena",
+        "internetopenw",
+        "internetconnect",
+        "httpopenrequest",
+        "winhttpopen",
+        "winhttpconnect",
+        "curl_easy_init",
+        "curl_easy_perform",
     }
 )
 
@@ -50,6 +80,21 @@ def _pep578_network_airlock_hook(event: str, args: tuple) -> None:
             f"EGRESS_GUARD_BLOCKED: Operation '{event}' is forbidden while "
             "PacketSentinel zero-outbound lockdown is active."
         )
+    if event == "ctypes.dlopen" and args:
+        dll_name = str(args[0]).lower()
+        for net_dll in _BLOCKED_NETWORK_DLLS:
+            if net_dll in dll_name:
+                raise PermissionError(
+                    f"EGRESS_GUARD_BLOCKED: ctypes loading of network library '{args[0]}' is forbidden while "
+                    "PacketSentinel zero-outbound lockdown is active."
+                )
+    elif event == "ctypes.dlsym" and len(args) >= 2:
+        symbol = str(args[1]).lower()
+        if symbol in _BLOCKED_NETWORK_SYMBOLS:
+            raise PermissionError(
+                f"EGRESS_GUARD_BLOCKED: ctypes resolution of network symbol '{args[1]}' is forbidden while "
+                "PacketSentinel zero-outbound lockdown is active."
+            )
 
 
 def engage_runtime_network_lockdown() -> None:
