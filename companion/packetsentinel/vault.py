@@ -40,6 +40,15 @@ class VaultSettings:
     custom_feeds: List[str] = field(default_factory=list)
     default_watch_process: str = "python"
     enable_toasts: bool = True
+    enable_console_beep: bool = False
+    log_level: str = "INFO"
+    alert_cooldown_seconds: int = 60
+    capture_loopback: bool = True
+    dlp_gate_cards: bool = True
+    dlp_gate_keys: bool = True
+    dlp_gate_usernames: bool = True
+    dlp_gate_national_ids: bool = True
+    dlp_gate_ips: bool = True
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -52,6 +61,15 @@ class VaultSettings:
             custom_feeds=list(data.get("custom_feeds", [])),
             default_watch_process=str(data.get("default_watch_process", "python")),
             enable_toasts=bool(data.get("enable_toasts", True)),
+            enable_console_beep=bool(data.get("enable_console_beep", False)),
+            log_level=str(data.get("log_level", "INFO")),
+            alert_cooldown_seconds=int(data.get("alert_cooldown_seconds", 60)),
+            capture_loopback=bool(data.get("capture_loopback", True)),
+            dlp_gate_cards=bool(data.get("dlp_gate_cards", True)),
+            dlp_gate_keys=bool(data.get("dlp_gate_keys", True)),
+            dlp_gate_usernames=bool(data.get("dlp_gate_usernames", True)),
+            dlp_gate_national_ids=bool(data.get("dlp_gate_national_ids", True)),
+            dlp_gate_ips=bool(data.get("dlp_gate_ips", True)),
         )
 
 
