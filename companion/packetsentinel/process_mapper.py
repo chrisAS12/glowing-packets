@@ -42,7 +42,7 @@ class ProcessMapper:
     and bounded LRU caching (OWASP #40, #49).
     """
 
-    def __init__(self, refresh_min_interval: float = 0.15, max_cache_size: int = 2048) -> None:
+    def __init__(self, refresh_min_interval: float = 1.0, max_cache_size: int = 2048) -> None:
         self._self_pid = os.getpid()
         self._lock = threading.RLock()
         self._refresh_min_interval = refresh_min_interval
@@ -55,6 +55,9 @@ class ProcessMapper:
         self._remote_ip_map: OrderedDict[str, ProcessInfo] = OrderedDict()
         # PID metadata cache: (pid, create_time_int) -> ProcessInfo
         self._pid_cache: OrderedDict[Tuple[int, int], ProcessInfo] = OrderedDict()
+        # Outbound connection snapshot cache to eliminate continuous psutil socket polling
+        self._cached_outbound_conns: list[Tuple[str, int, str, int, ProcessInfo]] = []
+        self._last_outbound_refresh_ts = 0.0
 
     def _resolve_pid(self, pid: Optional[int]) -> ProcessInfo:
         if not pid or pid <= 0:
@@ -130,6 +133,7 @@ class ProcessMapper:
     ) -> ProcessInfo:
         """
         Look up the process responsible for a given local port or remote destination IP.
+        Fast in-memory cache check first; rate-limited background refresh on cache misses.
         """
         proto = protocol.lower()
         with self._lock:
@@ -141,20 +145,22 @@ class ProcessMapper:
             if remote_ip and remote_ip in self._remote_ip_map:
                 return self._remote_ip_map[remote_ip]
 
-            # Not found in cache -> refresh active OS sockets
-            self._refresh_tables_locked(force=False)
+            # Only refresh active OS sockets if the minimum interval has elapsed
+            now = time.monotonic()
+            if (now - self._last_refresh_ts) >= self._refresh_min_interval:
+                self._refresh_tables_locked(force=False)
 
-            if local_port and local_port > 0:
-                key = (proto, int(local_port))
-                if key in self._port_map:
-                    return self._port_map[key]
-                # Also check the other transport protocol in case of fallback
-                alt_key = ("tcp" if proto == "udp" else "udp", int(local_port))
-                if alt_key in self._port_map:
-                    return self._port_map[alt_key]
+                if local_port and local_port > 0:
+                    key = (proto, int(local_port))
+                    if key in self._port_map:
+                        return self._port_map[key]
+                    # Also check the other transport protocol in case of fallback
+                    alt_key = ("tcp" if proto == "udp" else "udp", int(local_port))
+                    if alt_key in self._port_map:
+                        return self._port_map[alt_key]
 
-            if remote_ip and remote_ip in self._remote_ip_map:
-                return self._remote_ip_map[remote_ip]
+                if remote_ip and remote_ip in self._remote_ip_map:
+                    return self._remote_ip_map[remote_ip]
 
         return UNKNOWN_PROCESS
 
@@ -162,15 +168,22 @@ class ProcessMapper:
         """
         Return a snapshot of active outbound socket tuples:
         (proto, local_port, remote_ip, remote_port, ProcessInfo)
-        Used by the zero-admin socket monitor layer.
+        Cached for 1.0s to avoid hammering psutil.net_connections() in high-frequency loops.
         """
+        now = time.monotonic()
+        with self._lock:
+            if self._cached_outbound_conns and (now - self._last_outbound_refresh_ts) < self._refresh_min_interval:
+                return list(self._cached_outbound_conns)
+
         results: list[Tuple[str, int, str, int, ProcessInfo]] = []
         try:
             conns = psutil.net_connections(kind="inet")
         except (psutil.AccessDenied, OSError, RuntimeError, Exception):
-            return results
+            with self._lock:
+                return list(self._cached_outbound_conns)
 
         with self._lock:
+            self._last_outbound_refresh_ts = now
             for conn in conns:
                 if not conn.raddr or len(conn.raddr) < 2:
                     continue
@@ -182,4 +195,5 @@ class ProcessMapper:
                 if info.is_self:
                     continue
                 results.append((proto, lport, rip, rport, info))
+            self._cached_outbound_conns = results
         return results

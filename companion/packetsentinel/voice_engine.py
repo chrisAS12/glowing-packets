@@ -350,8 +350,14 @@ class OfflineTranscriber:
                 raise VoiceEngineError(f"Could not load faster-whisper library: {exc}. " + VOICE_INSTALL_HINT) from exc
 
             try:
+                active_snap = get_active_snapshot_dir(self._model_dir, self._model_name)
+                model_target: str = (
+                    str(active_snap)
+                    if (active_snap and _is_directory_complete_model(active_snap))
+                    else self._model_name
+                )
                 self._model = WhisperModel(
-                    self._model_name,
+                    model_target,
                     device="cpu",
                     compute_type="int8",
                     download_root=str(self._model_dir),
@@ -427,13 +433,16 @@ def _ensure_snapshot_files_complete(model_dir: Path, model_name: str = DEFAULT_M
     repo_id = f"Systran/faster-whisper-{model_name}"
 
     try:
-        from huggingface_hub import hf_hub_download
+        from .egress_guard import is_network_lockdown_active
 
-        for fname in ("config.json", "vocabulary.txt", "tokenizer.json"):
-            try:
-                hf_hub_download(repo_id=repo_id, filename=fname, cache_dir=str(model_dir))
-            except Exception:
-                pass
+        if not is_network_lockdown_active():
+            from huggingface_hub import hf_hub_download
+
+            for fname in ("config.json", "vocabulary.txt", "tokenizer.json"):
+                try:
+                    hf_hub_download(repo_id=repo_id, filename=fname, cache_dir=str(model_dir))
+                except Exception:
+                    pass
     except Exception:
         pass
 

@@ -499,9 +499,10 @@ class PacketSentinelMonitor:
                             explicit_process=proc_info,
                         )
 
-                # 2. Check Windows DNS Resolver Cache every 2.0 seconds
+                # 2. Check Windows DNS Resolver Cache only when tshark is not active, throttled to 4.0s
                 now = time.monotonic()
-                if ipconfig_path and (now - last_dnscache_poll) >= 2.0:
+                tshark_alive = self._tshark_proc is not None and self._tshark_proc.poll() is None
+                if not tshark_alive and ipconfig_path and (now - last_dnscache_poll) >= 4.0:
                     last_dnscache_poll = now
                     self._poll_windows_dns_cache(ipconfig_path)
 
