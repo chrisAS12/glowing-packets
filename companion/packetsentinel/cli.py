@@ -33,14 +33,14 @@ BANNER = r"""
  |  __/ (_| | (__|   <  __/ |_ ___) |  __/ | | | |_| | | | |  __/ |
  |_|   \__,_|\___|_|\_\___|\__|____/ \___|_| |_|\__|_|_| |_|\___|_|
 
-  Open-Source Windows Packet & Sketchy DNS Threat Monitor (v{version})
+  SentinelWire • Zero-Outbound Windows Threat & Packet Monitor (v{version})
 ======================================================================
 """.strip("\n")
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        prog="packetsentinel",
+        prog="sentinelwire",
         description="Real-time Windows packet & sketchy DNS monitor using Wireshark/tshark and open-source threat feeds.",
     )
     parser.add_argument(

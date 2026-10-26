@@ -14,4 +14,5 @@ dependencies = [
 ]
 
 [project.scripts]
+sentinelwire = "packetsentinel.cli:main"
 packetsentinel = "packetsentinel.cli:main"

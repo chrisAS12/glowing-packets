@@ -1019,8 +1019,8 @@ class PacketSentinelDesktopApp:
     def _on_window_close(self) -> None:
         # Prompt user whether to minimize to background or exit completely
         res = messagebox.askyesnocancel(
-            "PacketSentinel Background Protection",
-            "Do you want to keep PacketSentinel running in the background to protect your system?\n\n"
+            "SentinelWire Background Protection",
+            "Do you want to keep SentinelWire running in the background to protect your system?\n\n"
             "• Click YES to minimize to the background.\n"
             "• Click NO to exit completely.\n"
             "• Click CANCEL to stay in the window.",
