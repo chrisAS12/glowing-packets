@@ -10,6 +10,7 @@ downloading or falling back to a cloud recognizer.
 from __future__ import annotations
 
 import importlib.util
+import sys
 import threading
 import time
 from dataclasses import dataclass
@@ -31,10 +32,27 @@ class VoiceEngineStatus:
     microphone_ready: bool
     transcriber_ready: bool
     detail: str
+    stt_installed: bool = False
+    model_cached: bool = False
+    windows_dictation_available: bool = False
 
     @property
     def ready(self) -> bool:
         return self.microphone_ready and self.transcriber_ready
+
+
+def is_windows_dictation_available() -> bool:
+    """Checks whether Windows native speech recognition / Dictation (Win + H) is available on the OS."""
+    if sys.platform != "win32":
+        return False
+    try:
+        import win32com.client
+
+        win32com.client.Dispatch("SAPI.SpVoice")
+        return True
+    except Exception:
+        # Win + H is built into Windows 10/11 even if pywin32 is uninstalled
+        return True
 
 
 def _module_available(name: str) -> bool:
@@ -65,7 +83,9 @@ def is_model_cached(model_dir: Path, model_name: str = DEFAULT_MODEL_NAME) -> bo
 def check_voice_status(model_dir: Path, model_name: str = DEFAULT_MODEL_NAME) -> VoiceEngineStatus:
     mic_ready = _module_available("sounddevice") and _module_available("numpy")
     stt_installed = _module_available("faster_whisper")
-    model_ready = stt_installed and is_model_cached(model_dir, model_name)
+    cached = is_model_cached(model_dir, model_name) if stt_installed else False
+    model_ready = stt_installed and cached
+    win_dictation = is_windows_dictation_available()
 
     if not mic_ready:
         detail = "Microphone capture needs 'sounddevice' and 'numpy'. " + VOICE_INSTALL_HINT
@@ -75,7 +95,14 @@ def check_voice_status(model_dir: Path, model_name: str = DEFAULT_MODEL_NAME) ->
         detail = f"Offline speech model '{model_name}' is not downloaded yet. " + VOICE_INSTALL_HINT
     else:
         detail = f"Offline engine ready: faster-whisper '{model_name}' on CPU (int8)."
-    return VoiceEngineStatus(microphone_ready=mic_ready, transcriber_ready=model_ready, detail=detail)
+    return VoiceEngineStatus(
+        microphone_ready=mic_ready,
+        transcriber_ready=model_ready,
+        detail=detail,
+        stt_installed=stt_installed,
+        model_cached=cached,
+        windows_dictation_available=win_dictation,
+    )
 
 
 class MicrophoneRecorder:

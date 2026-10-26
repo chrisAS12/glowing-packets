@@ -49,6 +49,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Run the interactive step-by-step installation, explanation, and self-test wizard.",
     )
     parser.add_argument(
+        "--setup-voice",
+        action="store_true",
+        help="Install dependencies and download the offline faster-whisper speech model while online.",
+    )
+    parser.add_argument(
         "--non-interactive",
         action="store_true",
         help="Accept default prompts automatically when running --setup in automated scripts.",
@@ -169,6 +174,38 @@ def main(argv: Optional[List[str]] = None) -> int:
     if args.setup:
         return run_interactive_setup(config, interactive=not args.non_interactive)
 
+    if args.setup_voice:
+        from .voice_engine import check_voice_status, download_voice_model, get_model_dir
+        print("=" * 68)
+        print("  SentinelWire Voice Engine Setup and Offline Model Installer")
+        print("=" * 68)
+        m_dir = get_model_dir(config.app_dir)
+        status = check_voice_status(m_dir)
+        print(f"[*] Current voice engine status: {status.detail}")
+        if not status.stt_installed:
+            print("[*] Installing voice engine packages ('sounddevice', 'numpy', 'faster-whisper')...")
+            try:
+                import subprocess
+                subprocess.run(
+                    [sys.executable, "-m", "pip", "install", "sounddevice>=0.4.6", "numpy>=1.24.0", "faster-whisper>=1.0.0"],
+                    check=True,
+                    shell=False,
+                )
+                print("[+] Dependencies successfully installed.")
+            except Exception as exc:
+                print(f"[!] Failed to install packages via pip: {exc}")
+                print("[*] You can install manually with: pip install -r requirements-voice.txt")
+                return 1
+        print(f"[*] Downloading offline speech model ('base') into: {m_dir}...")
+        try:
+            download_voice_model(m_dir, model_name="base")
+            print(f"[+] Offline Whisper model successfully downloaded to: {m_dir}")
+            print("[+] Voice Airlock is ready for 100% offline dictation.")
+            return 0
+        except Exception as exc:
+            print(f"[!] Failed to download offline speech model: {exc}")
+            return 1
+
     if args.add_feed:
         try:
             validated_url = validate_https_feed_url(args.add_feed)
@@ -183,7 +220,7 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     # On first interactive run with no flags, walk the user through the explanatory setup wizard
     is_default_monitor_launch = not any(
-        (args.status, args.update_feeds, args.check, args.add_domain, args.test_alert)
+        (args.status, args.update_feeds, args.check, args.add_domain, args.test_alert, getattr(args, "setup_voice", False))
     )
     if is_default_monitor_launch and not config.setup_completed and sys.stdin and sys.stdin.isatty():
         print("[*] First launch detected — starting interactive setup & verification wizard...\n")

@@ -45,28 +45,46 @@ from .voice_engine import (
     MicrophoneRecorder,
     OfflineTranscriber,
     VoiceEngineError,
+    VoiceEngineStatus,
     check_voice_status,
     get_model_dir,
+    is_windows_dictation_available,
+)
+from .ui_components import (
+    ACCENT_BLUE,
+    ACCENT_EMERALD,
+    ACCENT_GREEN,
+    ACCENT_HOVER,
+    ACCENT_RED,
+    ACCENT_YELLOW,
+    ALERT_RED,
+    BG_CANVAS,
+    BG_CARD,
+    BG_ELEVATED,
+    BG_SURFACE,
+    BORDER_COLOR,
+    BORDER_FOCUS,
+    FONT_BODY,
+    FONT_BOLD,
+    FONT_HEADER,
+    FONT_MONO,
+    FONT_SECTION,
+    FONT_SMALL,
+    FONT_SMALL_BOLD,
+    TEXT_BODY,
+    TEXT_HINT,
+    TEXT_MAIN,
+    TEXT_MUTED,
+    TEXT_TITLE,
+    create_card_frame,
+    create_data_table,
+    create_status_pill,
+    create_styled_button,
+    create_styled_entry,
+    update_status_pill,
 )
 
 logger = logging.getLogger("sentinelwire.ui")
-
-
-# Theme Palette: Modern Linear / Obsidian Charcoal Dark Mode
-BG_CANVAS = "#09090b"          # Pure dark charcoal background
-BG_SURFACE = "#121215"         # Sidebar & container surface
-BG_CARD = "#18181b"            # Cards, editors, panels
-BG_ELEVATED = "#222227"        # Headers, buttons, toolbars
-BORDER_COLOR = "#2e2e38"       # Crisp, high-contrast border
-BORDER_FOCUS = "#38bdf8"       # Active focus cyan border
-TEXT_TITLE = "#ffffff"         # Pure white headings
-TEXT_BODY = "#e4e4e7"          # Crisp silver body text (high readability!)
-TEXT_MUTED = "#a1a1aa"         # Readable muted descriptions (never muddy!)
-TEXT_HINT = "#71717a"          # Subtle metadata
-ACCENT_BLUE = "#0284c7"        # Electric Sentinel Blue
-ACCENT_HOVER = "#0369a1"       # Interactive hover state
-ACCENT_EMERALD = "#10b981"     # Verified safe / DLP passed
-ALERT_RED = "#ef4444"          # Threat / kill switch coral
 
 
 class PacketSentinelDesktopApp:
@@ -92,6 +110,8 @@ class PacketSentinelDesktopApp:
         self._record_start_time = 0.0
         self._record_timer_id: Optional[str] = None
         self._audio_stream = None
+        self._voice_status: Optional[VoiceEngineStatus] = None
+        self._voice_setup_dialog: Optional[tk.Toplevel] = None
 
         self._monitor_service = LiveMonitorService(self.config, lock_network_on_start=False)
         self._telemetry_timer_id: Optional[str] = None
@@ -120,6 +140,9 @@ class PacketSentinelDesktopApp:
         # Start periodic telemetry refresh
         self._schedule_telemetry_poll()
 
+        # Check initial voice status proactively on startup
+        self._refresh_voice_status()
+
         # Handle close: minimize to background/tray rather than accidental kill
         self.root.protocol("WM_DELETE_WINDOW", self._on_window_close)
 
@@ -139,14 +162,14 @@ class PacketSentinelDesktopApp:
             fieldbackground=BG_CARD,
             rowheight=30,
             borderwidth=0,
-            font=("Segoe UI", 9),
+            font=FONT_BODY,
         )
         style.configure(
             "Treeview.Heading",
             background=BG_ELEVATED,
             foreground=TEXT_TITLE,
             relief="flat",
-            font=("Segoe UI", 9, "bold"),
+            font=FONT_BOLD,
             padding=[8, 6],
         )
         style.map(
@@ -167,6 +190,13 @@ class PacketSentinelDesktopApp:
 
         style.configure(
             "Vertical.TScrollbar",
+            troughcolor=BG_CANVAS,
+            background=BG_ELEVATED,
+            arrowsize=0,
+            borderwidth=0,
+        )
+        style.configure(
+            "Horizontal.TScrollbar",
             troughcolor=BG_CANVAS,
             background=BG_ELEVATED,
             arrowsize=0,
@@ -215,31 +245,25 @@ class PacketSentinelDesktopApp:
         action_frame = tk.Frame(header, bg=BG_SURFACE)
         action_frame.pack(side=tk.RIGHT)
 
-        badge = tk.Label(
+        badge = create_status_pill(
             action_frame,
             text="🟢 AIRLOCK ACTIVE (0 OUTBOUND)",
-            font=("Segoe UI", 9, "bold"),
-            fg=ACCENT_EMERALD,
-            bg="#064e3b",
+            status="ok",
+            font=FONT_BOLD,
             padx=12,
             pady=5,
-            relief=tk.FLAT,
         )
         badge.pack(side=tk.LEFT, padx=(0, 12))
 
-        kill_btn = tk.Button(
+        kill_btn = create_styled_button(
             action_frame,
-            text="🚨 EMERGENCY KILL SWITCH",
-            font=("Segoe UI", 9, "bold"),
-            fg="#ffffff",
-            bg=ALERT_RED,
-            activebackground="#b91c1c",
-            activeforeground="#ffffff",
+            text="EMERGENCY KILL SWITCH",
+            icon="🚨",
+            style="danger",
+            command=self._emergency_kill,
+            font=FONT_BOLD,
             padx=12,
             pady=5,
-            relief=tk.FLAT,
-            cursor="hand2",
-            command=self._emergency_kill,
         )
         kill_btn.pack(side=tk.LEFT)
 
@@ -332,17 +356,15 @@ class PacketSentinelDesktopApp:
         side_footer = tk.Frame(sidebar, bg=BG_SURFACE)
         side_footer.pack(side=tk.BOTTOM, fill=tk.X, padx=6, pady=8)
 
-        appdata_btn = tk.Button(
+        appdata_btn = create_styled_button(
             side_footer,
-            text="📁 Open Local AppData",
-            font=("Segoe UI", 8),
-            bg=BG_CARD,
-            fg=TEXT_MUTED,
-            activebackground=BG_ELEVATED,
-            activeforeground=TEXT_TITLE,
-            relief=tk.FLAT,
-            cursor="hand2",
+            text="Open Local AppData",
+            icon="📁",
+            style="ghost",
             command=self._open_appdata_dir,
+            font=FONT_SMALL,
+            padx=8,
+            pady=4,
         )
         appdata_btn.pack(fill=tk.X, pady=2)
 
@@ -392,7 +414,7 @@ class PacketSentinelDesktopApp:
         mc_container.pack(fill=tk.BOTH, expand=True)
 
         # Cockpit Banner
-        cockpit_header = tk.Frame(mc_container, bg=BG_SURFACE, padx=16, pady=10, highlightbackground=BORDER_COLOR, highlightthickness=1)
+        cockpit_header = create_card_frame(mc_container, padx=16, pady=10, bg=BG_SURFACE)
         cockpit_header.pack(fill=tk.X, pady=(0, 10))
 
         h_left = tk.Frame(cockpit_header, bg=BG_SURFACE)
@@ -401,15 +423,15 @@ class PacketSentinelDesktopApp:
         tk.Label(
             h_left,
             text="🏠 Mission Control Cockpit",
-            font=("Segoe UI", 12, "bold"),
-            fg=TEXT_TITLE,
+            font=FONT_HEADER,
+            fg=TEXT_MAIN,
             bg=BG_SURFACE,
         ).pack(anchor=tk.W)
 
         tk.Label(
             h_left,
             text="Unified developer privacy airlock, voice dictation, live packet sniffer, and process watchdog.",
-            font=("Segoe UI", 9),
+            font=FONT_BODY,
             fg=TEXT_MUTED,
             bg=BG_SURFACE,
         ).pack(anchor=tk.W, pady=(2, 0))
@@ -417,92 +439,91 @@ class PacketSentinelDesktopApp:
         h_right = tk.Frame(cockpit_header, bg=BG_SURFACE)
         h_right.pack(side=tk.RIGHT)
 
-        self.mc_sniffer_badge = tk.Label(
+        self.mc_sniffer_badge = create_status_pill(
             h_right,
             text="🔴 SNIFFER STOPPED",
-            font=("Segoe UI", 9, "bold"),
-            fg="#fca5a5",
-            bg="#7f1d1d",
+            status="error",
+            font=FONT_BOLD,
             padx=10,
             pady=4,
         )
         self.mc_sniffer_badge.pack(side=tk.LEFT, padx=(0, 8))
 
-        self.mc_sniffer_btn = tk.Button(
+        self.mc_sniffer_btn = create_styled_button(
             h_right,
-            text="▶️ Start Sniffer",
-            font=("Segoe UI", 9, "bold"),
-            bg=ACCENT_BLUE,
-            fg="#ffffff",
-            activebackground=ACCENT_HOVER,
-            activeforeground="#ffffff",
+            text="Start Sniffer",
+            icon="▶️",
+            style="primary",
+            command=self._toggle_sniffer,
+            font=FONT_BOLD,
             padx=12,
             pady=4,
-            relief=tk.FLAT,
-            cursor="hand2",
-            command=self._toggle_sniffer,
         )
         self.mc_sniffer_btn.pack(side=tk.LEFT)
 
         # Top Card: Quick Voice & Prompt Scrubber Card
-        top_card = tk.Frame(mc_container, bg=BG_CARD, padx=16, pady=12, highlightbackground=BORDER_COLOR, highlightthickness=1)
+        top_card = create_card_frame(mc_container, padx=16, pady=12)
         top_card.pack(fill=tk.X, pady=(0, 10))
 
         # Row 1: Voice Dictation & Status
         v_row = tk.Frame(top_card, bg=BG_CARD)
-        v_row.pack(fill=tk.X, pady=(0, 8))
+        v_row.pack(fill=tk.X, pady=(0, 4))
 
-        self.mc_voice_btn = tk.Button(
+        self.mc_voice_btn = create_styled_button(
             v_row,
-            text="🎙️  Start Dictation (Spacebar)",
-            font=("Segoe UI", 10, "bold"),
-            bg=ACCENT_BLUE,
-            fg="#ffffff",
-            activebackground=ACCENT_HOVER,
-            activeforeground="#ffffff",
-            padx=16,
-            pady=6,
-            relief=tk.FLAT,
-            cursor="hand2",
+            text="Start Dictation (Spacebar)",
+            icon="🎙️",
+            style="primary",
             command=self._toggle_voice_recording,
+            font=FONT_BOLD,
+            padx=14,
+            pady=5,
         )
         self.mc_voice_btn.pack(side=tk.LEFT, padx=(0, 10))
 
-        self.mc_voice_status_pill = tk.Label(
+        self.mc_voice_status_pill = create_status_pill(
             v_row,
             text="🟢 AIRLOCK READY (OFFLINE)",
-            font=("Segoe UI", 9, "bold"),
-            fg=ACCENT_EMERALD,
-            bg="#064e3b",
+            status="ok",
+            font=FONT_BOLD,
             padx=10,
-            pady=3,
+            pady=4,
         )
         self.mc_voice_status_pill.pack(side=tk.LEFT, padx=(0, 10))
 
-        self.mc_voice_feedback_lbl = tk.Label(
+        copy_mcp_latest_btn = create_styled_button(
             v_row,
-            text="Push-to-talk ready. Auto-stops on silence (~1.8s) or press Spacebar.",
-            font=("Segoe UI", 9),
-            fg=TEXT_MUTED,
-            bg=BG_CARD,
-        )
-        self.mc_voice_feedback_lbl.pack(side=tk.LEFT, fill=tk.X, expand=True)
-
-        copy_mcp_latest_btn = tk.Button(
-            v_row,
-            text="📋 Copy Latest Prompt",
-            font=("Segoe UI", 9),
-            bg=BG_ELEVATED,
-            fg=TEXT_TITLE,
-            activebackground=BG_SURFACE,
-            activeforeground="#ffffff",
+            text="Copy Latest Prompt",
+            icon="📋",
+            style="secondary",
+            command=self._copy_output,
+            font=FONT_BODY,
             padx=10,
             pady=4,
-            relief=tk.FLAT,
-            cursor="hand2",
-            command=self._copy_output,
         )
         copy_mcp_latest_btn.pack(side=tk.RIGHT)
+
+        # Row 1b: Dedicated full-width voice feedback row with dynamic wrapping so it NEVER truncates
+        v_feedback_row = tk.Frame(top_card, bg=BG_CARD)
+        v_feedback_row.pack(fill=tk.X, pady=(2, 6))
+
+        self.mc_voice_feedback_lbl = tk.Label(
+            v_feedback_row,
+            text="Push-to-talk ready. Auto-stops on silence (~1.8s) or press Spacebar.",
+            font=FONT_BODY,
+            fg=TEXT_MUTED,
+            bg=BG_CARD,
+            anchor="w",
+            justify=tk.LEFT,
+            wraplength=750,
+        )
+        self.mc_voice_feedback_lbl.pack(fill=tk.X, expand=True)
+
+        def _on_top_card_resize(event: tk.Event) -> None:
+            if event.width > 150:
+                self.mc_voice_feedback_lbl.configure(wraplength=max(250, event.width - 32))
+
+        top_card.bind("<Configure>", _on_top_card_resize)
 
         # Row 2: Quick Prompt Input & DLP Scrub
         p_row = tk.Frame(top_card, bg=BG_CARD)
@@ -511,72 +532,58 @@ class PacketSentinelDesktopApp:
         tk.Label(
             p_row,
             text="Quick Prompt Scrubber:",
-            font=("Segoe UI", 9, "bold"),
-            fg=TEXT_TITLE,
+            font=FONT_BOLD,
+            fg=TEXT_MAIN,
             bg=BG_CARD,
         ).pack(side=tk.LEFT, padx=(0, 8))
 
-        self.mc_quick_prompt_entry = tk.Entry(
+        self.mc_quick_prompt_entry = create_styled_entry(
             p_row,
-            bg=BG_CANVAS,
-            fg=TEXT_TITLE,
-            insertbackground=BORDER_FOCUS,
-            font=("Segoe UI", 10),
-            relief=tk.FLAT,
-            highlightbackground=BORDER_COLOR,
-            highlightthickness=1,
+            font=FONT_BODY,
         )
         self.mc_quick_prompt_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 8), ipady=4)
         self.mc_quick_prompt_entry.bind("<Return>", lambda e: self._quick_scrub_prompt())
 
-        scrub_btn = tk.Button(
+        scrub_btn = create_styled_button(
             p_row,
-            text="🧹 Scrub & Send to MCP",
-            font=("Segoe UI", 9, "bold"),
-            bg=ACCENT_BLUE,
-            fg="#ffffff",
-            activebackground=ACCENT_HOVER,
-            activeforeground="#ffffff",
+            text="Scrub & Send to MCP",
+            icon="🧹",
+            style="primary",
+            command=self._quick_scrub_prompt,
+            font=FONT_BOLD,
             padx=12,
             pady=4,
-            relief=tk.FLAT,
-            cursor="hand2",
-            command=self._quick_scrub_prompt,
         )
-        scrub_btn.pack(side=tk.LEFT, padx=(0, 6))
+        scrub_btn.pack(side=tk.LEFT)
 
         # Bottom Split Area: Left (Process Watchdog & AI) | Right (Live Threats)
         split_frame = tk.Frame(mc_container, bg=BG_CANVAS)
         split_frame.pack(fill=tk.BOTH, expand=True)
 
         # Left Column: Process Watchdog & AI Analyzer
-        left_col = tk.Frame(split_frame, bg=BG_CARD, padx=14, pady=12, highlightbackground=BORDER_COLOR, highlightthickness=1)
+        left_col = create_card_frame(split_frame, padx=14, pady=12)
         left_col.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0, 6))
 
         l_head = tk.Frame(left_col, bg=BG_CARD)
-        l_head.pack(fill=tk.X, pady=(0, 6))
+        l_head.pack(fill=tk.X, pady=(0, 8))
 
         tk.Label(
             l_head,
             text="👁️ Process Watchdog & AI Inspector",
-            font=("Segoe UI", 10, "bold"),
-            fg=TEXT_TITLE,
+            font=FONT_SECTION,
+            fg=TEXT_MAIN,
             bg=BG_CARD,
         ).pack(side=tk.LEFT)
 
-        refresh_proc_btn = tk.Button(
+        refresh_proc_btn = create_styled_button(
             l_head,
-            text="🔄 Refresh",
-            font=("Segoe UI", 8),
-            bg=BG_ELEVATED,
-            fg=TEXT_MUTED,
-            activebackground=BG_SURFACE,
-            activeforeground=TEXT_TITLE,
-            padx=6,
-            pady=2,
-            relief=tk.FLAT,
-            cursor="hand2",
+            text="Refresh",
+            icon="🔄",
+            style="secondary",
             command=self._refresh_process_lists,
+            font=FONT_SMALL,
+            padx=8,
+            pady=2,
         )
         refresh_proc_btn.pack(side=tk.RIGHT)
 
@@ -587,16 +594,16 @@ class PacketSentinelDesktopApp:
         tk.Label(
             sel_row,
             text="Select Process:",
-            font=("Segoe UI", 9),
+            font=FONT_BODY,
             fg=TEXT_MUTED,
             bg=BG_CARD,
         ).pack(side=tk.LEFT, padx=(0, 6))
 
         self.mc_proc_combo = ttk.Combobox(
             sel_row,
-            font=("Segoe UI", 9),
+            font=FONT_BODY,
             state="normal",
-            width=20,
+            width=18,
         )
         candidates = self._get_running_process_candidates()
         self.mc_proc_combo["values"] = candidates
@@ -608,43 +615,35 @@ class PacketSentinelDesktopApp:
             self.mc_proc_combo.set("python")
         self.mc_proc_combo.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 6))
 
-        insp_btn = tk.Button(
+        insp_btn = create_styled_button(
             sel_row,
-            text="🔍 Inspect",
-            font=("Segoe UI", 9, "bold"),
-            bg=BG_ELEVATED,
-            fg=TEXT_TITLE,
-            activebackground=BG_SURFACE,
-            activeforeground="#ffffff",
+            text="Inspect",
+            icon="🔍",
+            style="secondary",
+            command=self._inspect_mc_watchdog,
+            font=FONT_BOLD,
             padx=10,
             pady=3,
-            relief=tk.FLAT,
-            cursor="hand2",
-            command=self._inspect_mc_watchdog,
         )
         insp_btn.pack(side=tk.LEFT, padx=(0, 6))
 
-        ai_btn = tk.Button(
+        ai_btn = create_styled_button(
             sel_row,
-            text="🤖 Ask AI Safety",
-            font=("Segoe UI", 9, "bold"),
-            bg="#7c3aed",
-            fg="#ffffff",
-            activebackground="#6d28d9",
-            activeforeground="#ffffff",
+            text="Ask AI Safety",
+            icon="🤖",
+            style="accent",
+            command=self._analyze_process_with_ai,
+            font=FONT_BOLD,
             padx=10,
             pady=3,
-            relief=tk.FLAT,
-            cursor="hand2",
-            command=self._analyze_process_with_ai,
         )
         ai_btn.pack(side=tk.LEFT)
 
         self.mc_watchdog_results = tk.Text(
             left_col,
             bg=BG_CANVAS,
-            fg=TEXT_BODY,
-            font=("Consolas", 9),
+            fg=TEXT_MAIN,
+            font=FONT_MONO,
             relief=tk.FLAT,
             wrap=tk.WORD,
             height=10,
@@ -656,79 +655,68 @@ class PacketSentinelDesktopApp:
         self.mc_watchdog_results.pack(fill=tk.BOTH, expand=True)
 
         # Right Column: Real-time Threat Alerts
-        right_col = tk.Frame(split_frame, bg=BG_CARD, padx=14, pady=12, highlightbackground=BORDER_COLOR, highlightthickness=1)
+        right_col = create_card_frame(split_frame, padx=14, pady=12)
         right_col.pack(side=tk.RIGHT, fill=tk.BOTH, expand=True, padx=(6, 0))
 
         r_head = tk.Frame(right_col, bg=BG_CARD)
-        r_head.pack(fill=tk.X, pady=(0, 6))
+        r_head.pack(fill=tk.X, pady=(0, 8))
 
         tk.Label(
             r_head,
             text="🚨 Live Threat Interceptor",
-            font=("Segoe UI", 10, "bold"),
-            fg=TEXT_TITLE,
+            font=FONT_SECTION,
+            fg=TEXT_MAIN,
             bg=BG_CARD,
         ).pack(side=tk.LEFT)
 
-        canary_btn = tk.Button(
+        canary_btn = create_styled_button(
             r_head,
-            text="🧪 Canary Test",
-            font=("Segoe UI", 8),
-            bg=BG_ELEVATED,
-            fg=TEXT_MUTED,
-            activebackground=BG_SURFACE,
-            activeforeground=TEXT_TITLE,
-            padx=6,
-            pady=2,
-            relief=tk.FLAT,
-            cursor="hand2",
+            text="Canary Test",
+            icon="🧪",
+            style="secondary",
             command=self._trigger_canary_alert,
+            font=FONT_SMALL,
+            padx=8,
+            pady=2,
         )
         canary_btn.pack(side=tk.RIGHT)
 
-        explain_btn = tk.Button(
+        explain_btn = create_styled_button(
             r_head,
-            text="ℹ️ Explain Threat",
-            font=("Segoe UI", 8, "bold"),
-            bg=ACCENT_BLUE,
-            fg="#ffffff",
-            activebackground=ACCENT_HOVER,
-            activeforeground="#ffffff",
+            text="Explain Threat",
+            icon="ℹ️",
+            style="primary",
+            command=lambda: self._show_threat_explanation(),
+            font=FONT_SMALL,
             padx=8,
             pady=2,
-            relief=tk.FLAT,
-            cursor="hand2",
-            command=lambda: self._show_threat_explanation(),
         )
         explain_btn.pack(side=tk.RIGHT, padx=(0, 6))
 
-        mc_tree_frame = tk.Frame(right_col, bg=BG_CANVAS, highlightthickness=1, highlightbackground=BORDER_COLOR)
-        mc_tree_frame.pack(fill=tk.BOTH, expand=True)
-
         cols = ("time", "indicator", "feed", "process", "layer")
-        self.mc_alert_tree = ttk.Treeview(
-            mc_tree_frame,
+        display_names = {
+            "time": "Time (UTC)",
+            "indicator": "Flagged Target",
+            "feed": "Source Threat Feed",
+            "process": "Attributed Process",
+            "layer": "Layer",
+        }
+        min_widths = {
+            "time": 150,
+            "indicator": 240,
+            "feed": 140,
+            "process": 110,
+            "layer": 70,
+        }
+        self.mc_alert_tree, self.mc_alert_sb, self.mc_alert_container = create_data_table(
+            right_col,
             columns=cols,
-            show="headings",
-            selectmode="browse",
+            display_names=display_names,
+            min_widths=min_widths,
             height=8,
+            horizontal_scroll=True,
         )
-        self.mc_alert_tree.heading("time", text="Time (UTC)")
-        self.mc_alert_tree.heading("indicator", text="Flagged Target")
-        self.mc_alert_tree.heading("feed", text="Source Threat Feed")
-        self.mc_alert_tree.heading("process", text="Attributed Process")
-        self.mc_alert_tree.heading("layer", text="Layer")
-
-        self.mc_alert_tree.column("time", width=80, anchor="w")
-        self.mc_alert_tree.column("indicator", width=160, anchor="w")
-        self.mc_alert_tree.column("feed", width=130, anchor="w")
-        self.mc_alert_tree.column("process", width=90, anchor="w")
-        self.mc_alert_tree.column("layer", width=60, anchor="center")
-
-        mc_sb = ttk.Scrollbar(mc_tree_frame, orient="vertical", command=self.mc_alert_tree.yview)
-        self.mc_alert_tree.configure(yscrollcommand=mc_sb.set)
-        self.mc_alert_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        mc_sb.pack(side=tk.RIGHT, fill=tk.Y)
+        self.mc_alert_container.pack(fill=tk.BOTH, expand=True)
         self.mc_alert_tree.bind("<Double-1>", lambda e: self._show_threat_explanation())
 
     def _build_airlock_tab(self) -> None:
@@ -792,56 +780,42 @@ class PacketSentinelDesktopApp:
         ctrl_row = tk.Frame(hero, bg=BG_CARD)
         ctrl_row.pack(fill=tk.X, pady=(4, 4))
 
-        self.voice_btn = tk.Button(
+        self.voice_btn = create_styled_button(
             ctrl_row,
-            text="🎙️  CLICK TO START DICTATING",
-            font=("Segoe UI", 10, "bold"),
-            bg=ACCENT_BLUE,
-            fg="#ffffff",
-            activebackground=ACCENT_HOVER,
-            activeforeground="#ffffff",
+            text="CLICK TO START DICTATING",
+            icon="🎙️",
+            style="primary",
+            command=self._toggle_voice_recording,
+            font=FONT_BOLD,
             padx=16,
             pady=6,
-            relief=tk.FLAT,
-            cursor="hand2",
-            command=self._toggle_voice_recording,
         )
         self.voice_btn.pack(side=tk.LEFT, padx=(0, 10))
 
         tk.Label(
             ctrl_row,
             text="Quick Prompt Bar:",
-            font=("Segoe UI", 9, "bold"),
-            fg=TEXT_TITLE,
+            font=FONT_BOLD,
+            fg=TEXT_MAIN,
             bg=BG_CARD,
         ).pack(side=tk.LEFT, padx=(0, 6))
 
-        self.quick_speech_entry = tk.Entry(
+        self.quick_speech_entry = create_styled_entry(
             ctrl_row,
-            bg=BG_CANVAS,
-            fg=TEXT_TITLE,
-            insertbackground=BORDER_FOCUS,
-            font=("Consolas", 10),
-            relief=tk.FLAT,
-            highlightbackground=BORDER_COLOR,
-            highlightthickness=1,
+            font=FONT_MONO,
         )
         self.quick_speech_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 8), ipady=4)
         self.quick_speech_entry.bind("<Return>", lambda e: self._process_quick_speech())
 
-        quick_btn = tk.Button(
+        quick_btn = create_styled_button(
             ctrl_row,
-            text="⚡ Scrub & Feed to MCP",
-            font=("Segoe UI", 9, "bold"),
-            bg=ACCENT_BLUE,
-            fg="#ffffff",
-            activebackground=ACCENT_HOVER,
-            activeforeground="#ffffff",
+            text="Scrub & Feed to MCP",
+            icon="⚡",
+            style="primary",
+            command=self._process_quick_speech,
+            font=FONT_BOLD,
             padx=12,
             pady=4,
-            relief=tk.FLAT,
-            cursor="hand2",
-            command=self._process_quick_speech,
         )
         quick_btn.pack(side=tk.RIGHT)
 
@@ -915,67 +889,51 @@ class PacketSentinelDesktopApp:
         act_bar = tk.Frame(self.tab_airlock, bg=BG_CANVAS)
         act_bar.pack(fill=tk.X)
 
-        scrub_btn = tk.Button(
+        scrub_btn = create_styled_button(
             act_bar,
-            text="🧹 Scrub with 5-Gate DLP",
-            font=("Segoe UI", 9, "bold"),
-            bg=ACCENT_BLUE,
-            fg="#ffffff",
-            activebackground=ACCENT_HOVER,
-            activeforeground="#ffffff",
+            text="Scrub with 5-Gate DLP",
+            icon="🧹",
+            style="primary",
+            command=self._scrub_input,
+            font=FONT_BOLD,
             padx=14,
             pady=6,
-            relief=tk.FLAT,
-            cursor="hand2",
-            command=self._scrub_input,
         )
         scrub_btn.pack(side=tk.LEFT, padx=(0, 8))
 
-        copy_btn = tk.Button(
+        copy_btn = create_styled_button(
             act_bar,
-            text="📋 Copy Sanitized Text",
-            font=("Segoe UI", 9),
-            bg=BG_ELEVATED,
-            fg=TEXT_TITLE,
-            activebackground=BG_SURFACE,
-            activeforeground=TEXT_TITLE,
+            text="Copy Sanitized Text",
+            icon="📋",
+            style="secondary",
+            command=self._copy_output,
+            font=FONT_BOLD,
             padx=12,
             pady=6,
-            relief=tk.FLAT,
-            cursor="hand2",
-            command=self._copy_output,
         )
         copy_btn.pack(side=tk.LEFT, padx=(0, 8))
 
-        canary_btn = tk.Button(
+        canary_btn = create_styled_button(
             act_bar,
-            text="🧪 Load Test Canary Sample",
-            font=("Segoe UI", 9),
-            bg=BG_ELEVATED,
-            fg=TEXT_MUTED,
-            activebackground=BG_SURFACE,
-            activeforeground=TEXT_TITLE,
+            text="Load Test Canary Sample",
+            icon="🧪",
+            style="secondary",
+            command=self._load_sample_canary,
+            font=FONT_BODY,
             padx=12,
             pady=6,
-            relief=tk.FLAT,
-            cursor="hand2",
-            command=self._load_sample_canary,
         )
         canary_btn.pack(side=tk.LEFT, padx=(0, 8))
 
-        clear_btn = tk.Button(
+        clear_btn = create_styled_button(
             act_bar,
-            text="🗑️ Clear Airlock",
-            font=("Segoe UI", 9),
-            bg=BG_ELEVATED,
-            fg=TEXT_MUTED,
-            activebackground=BG_SURFACE,
-            activeforeground=TEXT_TITLE,
+            text="Clear Airlock",
+            icon="🗑️",
+            style="secondary",
+            command=self._clear_privacy_inputs,
+            font=FONT_BODY,
             padx=12,
             pady=6,
-            relief=tk.FLAT,
-            cursor="hand2",
-            command=self._clear_privacy_inputs,
         )
         clear_btn.pack(side=tk.LEFT)
 
@@ -989,11 +947,437 @@ class PacketSentinelDesktopApp:
         self._on_voice_audio_received(txt)
         self.quick_speech_entry.delete(0, tk.END)
 
-    def _toggle_voice_recording(self) -> None:
-        if not self._is_recording:
-            self._start_persistent_recording()
+    def _refresh_voice_status(self) -> VoiceEngineStatus:
+        """Query offline voice engine health and update all UI status pills proactively."""
+        try:
+            status = check_voice_status(
+                model_dir=get_model_dir(self.config.app_dir),
+                model_name="base",
+            )
+        except Exception as exc:
+            logger.warning(f"Error checking voice status: {exc}")
+            status = VoiceEngineStatus(
+                microphone_ready=False,
+                transcriber_ready=False,
+                detail=f"Voice check error: {exc}",
+                stt_installed=False,
+                model_cached=False,
+                windows_dictation_available=is_windows_dictation_available(),
+            )
+        self._voice_status = status
+        self._apply_voice_status(status)
+        return status
+
+    def _apply_voice_status(self, status: VoiceEngineStatus) -> None:
+        """Reflect voice engine availability proactively across Mission Control and Airlock."""
+        if self._is_recording:
+            return
+
+        has_win_dictation = getattr(status, "windows_dictation_available", False) or (sys.platform == "win32")
+
+        if status.ready:
+            pill_text = "🟢 AIRLOCK READY (OFFLINE)"
+            pill_bg = "#064e3b"
+            pill_fg = ACCENT_EMERALD
+            mc_btn_text = "🎙️  Start Dictation (Spacebar)"
+            airlock_btn_text = "🎙️  CLICK TO START DICTATING"
+            mc_hint = "Push-to-talk ready. Auto-stops on silence (~1.8s) or press Spacebar."
+            airlock_hint = "Microphone listening will remain 100% offline. Zero telemetry, zero cloud streaming."
+            model_info = "Engine: Local Audio Capture • Pre-Model 5-Gate DLP • Zero Cloud Calls"
+        elif not getattr(status, "stt_installed", True):
+            pill_text = "⚠️ Offline Voice Setup Needed"
+            pill_bg = "#78350f"
+            pill_fg = "#fde047"
+            mc_btn_text = "⚠️ Setup Voice Dictation"
+            airlock_btn_text = "⚠️ SETUP OFFLINE VOICE ENGINE"
+            win_h_note = " or press Win + H for Windows dictation." if has_win_dictation else "."
+            mc_hint = f"Offline speech engine (faster-whisper) not installed. Click to setup{win_h_note}"
+            airlock_hint = f"Faster-Whisper offline model is not installed. Click to setup{win_h_note}"
+            model_info = (
+                "Engine: Offline Whisper (Not Installed) • Win + H Native Fallback Available"
+                if has_win_dictation
+                else "Engine: Offline Whisper (Not Installed)"
+            )
+        elif not getattr(status, "model_cached", True):
+            pill_text = "⚠️ Offline Model Download Needed"
+            pill_bg = "#78350f"
+            pill_fg = "#fde047"
+            mc_btn_text = "⚠️ Download Whisper Model"
+            airlock_btn_text = "⚠️ DOWNLOAD WHISPER MODEL"
+            mc_hint = "Offline speech model ('base') not downloaded yet. Click button to download."
+            airlock_hint = "Offline speech model ('base') is not downloaded yet. Click button to download."
+            model_info = "Engine: Faster-Whisper (Model Download Needed)"
         else:
+            pill_text = "⚠️ Voice Setup Needed"
+            pill_bg = "#78350f"
+            pill_fg = "#fde047"
+            mc_btn_text = "⚠️ Check Voice Input"
+            airlock_btn_text = "⚠️ CHECK VOICE INPUT"
+            mc_hint = status.detail
+            airlock_hint = status.detail
+            model_info = "Engine: Audio Hardware / PortAudio Issue"
+
+        if hasattr(self, "mc_voice_status_pill"):
+            self.mc_voice_status_pill.config(text=pill_text, bg=pill_bg, fg=pill_fg)
+        if hasattr(self, "mc_voice_btn"):
+            self.mc_voice_btn.config(text=mc_btn_text)
+        if hasattr(self, "mc_voice_feedback_lbl"):
+            self.mc_voice_feedback_lbl.config(text=mc_hint, fg=TEXT_MUTED)
+
+        if hasattr(self, "voice_status_pill"):
+            self.voice_status_pill.config(text=pill_text, bg=pill_bg, fg=pill_fg)
+        if hasattr(self, "voice_btn"):
+            self.voice_btn.config(text=airlock_btn_text)
+        if hasattr(self, "voice_feedback_lbl"):
+            self.voice_feedback_lbl.config(text=airlock_hint, fg=TEXT_MUTED)
+        if hasattr(self, "voice_model_lbl"):
+            self.voice_model_lbl.config(text=model_info)
+
+    def _toggle_voice_recording(self) -> None:
+        if self._is_recording:
             self._stop_persistent_recording()
+            return
+
+        status = self._refresh_voice_status()
+        if not status.ready:
+            self._show_voice_setup_modal(status)
+            return
+
+        self._start_persistent_recording()
+
+    def _show_voice_setup_modal(self, status: Optional[VoiceEngineStatus] = None) -> tk.Toplevel:
+        """Display a dedicated, elegant setup modal dialog when the voice engine is missing."""
+        if self._voice_setup_dialog is not None:
+            try:
+                if self._voice_setup_dialog.winfo_exists():
+                    self._voice_setup_dialog.lift()
+                    self._voice_setup_dialog.focus_force()
+                    return self._voice_setup_dialog
+            except Exception:
+                pass
+
+        current_status = status or self._refresh_voice_status()
+
+        dialog = tk.Toplevel(self.root)
+        self._voice_setup_dialog = dialog
+        dialog.title("SentinelWire — Offline Voice Engine Setup")
+        dialog.geometry("660x600")
+        dialog.minsize(600, 520)
+        dialog.configure(bg=BG_CANVAS)
+        dialog.transient(self.root)
+        dialog.grab_set()
+
+        def _on_modal_close() -> None:
+            self._voice_setup_dialog = None
+            try:
+                dialog.grab_release()
+            except Exception:
+                pass
+            dialog.destroy()
+
+        dialog.protocol("WM_DELETE_WINDOW", _on_modal_close)
+
+        card = tk.Frame(dialog, bg=BG_CARD, padx=20, pady=16, highlightbackground=BORDER_COLOR, highlightthickness=1)
+        card.pack(fill=tk.BOTH, expand=True, padx=16, pady=16)
+
+        # Header row
+        h_row = tk.Frame(card, bg=BG_CARD)
+        h_row.pack(fill=tk.X, pady=(0, 10))
+
+        tk.Label(
+            h_row,
+            text="🎙️ Offline Speech Engine Setup",
+            font=("Segoe UI", 13, "bold"),
+            fg=TEXT_TITLE,
+            bg=BG_CARD,
+        ).pack(side=tk.LEFT)
+
+        pill_text = "⚠️ Setup Needed" if not current_status.ready else "🟢 Engine Ready"
+        modal_pill = tk.Label(
+            h_row,
+            text=pill_text,
+            font=("Segoe UI", 9, "bold"),
+            fg="#fde047" if not current_status.ready else ACCENT_EMERALD,
+            bg="#78350f" if not current_status.ready else "#064e3b",
+            padx=10,
+            pady=3,
+        )
+        modal_pill.pack(side=tk.RIGHT)
+
+        desc_lbl = tk.Label(
+            card,
+            text=(
+                "SentinelWire provides 100% air-gapped, zero-outbound speech-to-text to protect your privacy.\n"
+                "Audio is transcribed entirely on your local CPU and scrubbed by the 5-Gate DLP before reaching any AI."
+            ),
+            font=("Segoe UI", 9),
+            fg=TEXT_MUTED,
+            bg=BG_CARD,
+            justify=tk.LEFT,
+        )
+        desc_lbl.pack(anchor=tk.W, pady=(0, 12))
+
+        # Status / issue banner
+        status_box = tk.Frame(card, bg=BG_SURFACE, padx=12, pady=10, highlightbackground=BORDER_COLOR, highlightthickness=1)
+        status_box.pack(fill=tk.X, pady=(0, 14))
+
+        if not current_status.stt_installed:
+            explanation_title = "⚠️ Faster-Whisper offline model engine is not yet installed."
+            explanation_detail = (
+                "The 'faster-whisper' package is required for local speech-to-text. "
+                "You can install it automatically using the 1-click solution below."
+            )
+        elif not current_status.model_cached:
+            explanation_title = "⚠️ Offline speech model ('base') is not downloaded yet."
+            explanation_detail = (
+                "Faster-Whisper is installed, but the offline model weights have not been downloaded. "
+                "Download them once while online to enable offline dictation permanently."
+            )
+        else:
+            explanation_title = "ℹ️ Offline Speech Engine Status:"
+            explanation_detail = current_status.detail
+
+        tk.Label(
+            status_box,
+            text=explanation_title,
+            font=("Segoe UI", 9, "bold"),
+            fg="#fde047",
+            bg=BG_SURFACE,
+        ).pack(anchor=tk.W)
+
+        tk.Label(
+            status_box,
+            text=explanation_detail,
+            font=("Segoe UI", 9),
+            fg=TEXT_BODY,
+            bg=BG_SURFACE,
+            justify=tk.LEFT,
+        ).pack(anchor=tk.W, pady=(2, 0))
+
+        # Option 1: 1-Click Offline Installation Box
+        opt1_frame = tk.LabelFrame(
+            card,
+            text=" Option 1: Install Faster-Whisper Offline Engine (Recommended) ",
+            font=("Segoe UI", 9, "bold"),
+            fg=TEXT_TITLE,
+            bg=BG_CARD,
+            padx=12,
+            pady=10,
+        )
+        opt1_frame.pack(fill=tk.X, pady=(0, 12))
+
+        tk.Label(
+            opt1_frame,
+            text="One-shot command to install dependencies and cache the offline Whisper model:",
+            font=("Segoe UI", 9),
+            fg=TEXT_MUTED,
+            bg=BG_CARD,
+        ).pack(anchor=tk.W)
+
+        cmd_row = tk.Frame(opt1_frame, bg=BG_CARD)
+        cmd_row.pack(fill=tk.X, pady=(6, 8))
+
+        cmd_entry = tk.Entry(
+            cmd_row,
+            font=("Consolas", 9, "bold"),
+            bg="#020617",
+            fg=BORDER_FOCUS,
+            relief=tk.FLAT,
+            highlightbackground=BORDER_COLOR,
+            highlightthickness=1,
+        )
+        cmd_entry.insert(0, "run.bat --setup-voice")
+        cmd_entry.config(state="readonly")
+        cmd_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, ipady=4, padx=(0, 8))
+
+        install_feedback = tk.Label(
+            opt1_frame,
+            text="",
+            font=("Segoe UI", 9),
+            fg=BORDER_FOCUS,
+            bg=BG_CARD,
+        )
+
+        def _copy_cmd() -> None:
+            try:
+                self.root.clipboard_clear()
+                self.root.clipboard_append("run.bat --setup-voice")
+                install_feedback.config(text="✅ Copied 'run.bat --setup-voice' to clipboard!", fg=ACCENT_EMERALD)
+            except Exception as e:
+                install_feedback.config(text=f"Failed to copy: {e}", fg=ALERT_RED)
+
+        copy_btn = tk.Button(
+            cmd_row,
+            text="📋 Copy",
+            font=("Segoe UI", 9),
+            bg=BG_ELEVATED,
+            fg=TEXT_TITLE,
+            activebackground=BG_SURFACE,
+            activeforeground="#ffffff",
+            padx=10,
+            pady=4,
+            relief=tk.FLAT,
+            cursor="hand2",
+            command=_copy_cmd,
+        )
+        copy_btn.pack(side=tk.RIGHT)
+
+        btn_row = tk.Frame(opt1_frame, bg=BG_CARD)
+        btn_row.pack(fill=tk.X, pady=(0, 4))
+
+        def _run_installer() -> None:
+            _copy_cmd()
+            install_feedback.config(text="⏳ Launching voice engine setup in console window...", fg=BORDER_FOCUS)
+            self._launch_voice_setup(dialog=dialog, status_lbl=install_feedback)
+
+        install_btn = create_styled_button(
+            btn_row,
+            text="Install Voice Engine (run.bat --setup-voice)",
+            icon="⬇️",
+            style="primary",
+            command=_run_installer,
+            font=FONT_BOLD,
+            padx=14,
+            pady=6,
+        )
+        install_btn.pack(side=tk.LEFT)
+        install_feedback.pack(anchor=tk.W, pady=(4, 0))
+
+        # Option 2: Windows Native Dictation (Zero-Install Alternative)
+        opt2_frame = tk.LabelFrame(
+            card,
+            text=" Option 2: Zero-Install Instant Alternative (Windows Native Dictation) ",
+            font=FONT_BOLD,
+            fg=TEXT_TITLE,
+            bg=BG_CARD,
+            padx=12,
+            pady=10,
+        )
+        opt2_frame.pack(fill=tk.X, pady=(0, 12))
+
+        win_dictation_note = (
+            "Windows 10/11 includes built-in OS speech recognition requiring 0 Python packages.\n"
+            "Press [ Win + H ] anywhere to dictate directly into the active prompt field."
+        )
+        tk.Label(
+            opt2_frame,
+            text=win_dictation_note,
+            font=FONT_BODY,
+            fg=TEXT_BODY,
+            bg=BG_CARD,
+            justify=tk.LEFT,
+        ).pack(anchor=tk.W, pady=(0, 6))
+
+        def _use_native_dictation() -> None:
+            _on_modal_close()
+            self._select_nav(0)
+            if hasattr(self, "mc_quick_prompt_entry"):
+                self.mc_quick_prompt_entry.focus_set()
+            if hasattr(self, "mc_voice_feedback_lbl"):
+                self.mc_voice_feedback_lbl.config(
+                    text="Ready for Windows Dictation! Press Win + H to dictate, then scrub.",
+                    fg=BORDER_FOCUS,
+                )
+
+        native_btn = create_styled_button(
+            opt2_frame,
+            text="Focus Quick Prompt & Use Win + H",
+            icon="⌨️",
+            style="secondary",
+            command=_use_native_dictation,
+            font=FONT_BOLD,
+            padx=12,
+            pady=5,
+        )
+        native_btn.pack(side=tk.LEFT)
+
+        # Footer Actions: Check Again & Close
+        f_row = tk.Frame(card, bg=BG_CARD)
+        f_row.pack(fill=tk.X, side=tk.BOTTOM)
+
+        def _check_again() -> None:
+            new_st = self._refresh_voice_status()
+            if new_st.ready:
+                modal_pill.config(text="🟢 Engine Ready", bg="#064e3b", fg=ACCENT_EMERALD)
+                install_feedback.config(text="✅ Voice engine is ready! Closing setup...", fg=ACCENT_EMERALD)
+                self.root.after(800, _on_modal_close)
+            else:
+                modal_pill.config(text="⚠️ Setup Needed", bg="#78350f", fg="#fde047")
+                install_feedback.config(text=f"Status: {new_st.detail}", fg="#fde047")
+
+        check_btn = create_styled_button(
+            f_row,
+            text="Check Status Again",
+            icon="🔄",
+            style="secondary",
+            command=_check_again,
+            font=FONT_BOLD,
+            padx=12,
+            pady=5,
+        )
+        check_btn.pack(side=tk.LEFT)
+
+        close_btn = create_styled_button(
+            f_row,
+            text="Close",
+            style="ghost",
+            command=_on_modal_close,
+            font=FONT_BODY,
+            padx=14,
+            pady=5,
+        )
+        close_btn.pack(side=tk.RIGHT)
+
+        return dialog
+
+    def _launch_voice_setup(self, dialog: Optional[tk.Toplevel] = None, status_lbl: Optional[tk.Label] = None) -> None:
+        """Launches the voice installer in a separate console window with 0 hassle."""
+        import platform
+        cmd_text = "run.bat --setup-voice"
+        try:
+            self.root.clipboard_clear()
+            self.root.clipboard_append(cmd_text)
+        except Exception:
+            pass
+
+        ws_dir = Path(__file__).resolve().parent.parent.parent.parent
+        run_bat = ws_dir / "run.bat"
+        launched = False
+
+        if platform.system() == "Windows" and run_bat.is_file():
+            try:
+                # CREATE_NEW_CONSOLE = 0x00000010
+                subprocess.Popen(
+                    ["cmd.exe", "/c", str(run_bat), "--setup-voice"],
+                    cwd=str(ws_dir),
+                    creationflags=0x00000010,
+                    shell=False,
+                )
+                launched = True
+            except Exception as exc:
+                logger.warning(f"Failed to launch run.bat in new console: {exc}")
+
+        if not launched:
+            try:
+                subprocess.Popen(
+                    [sys.executable, "-m", "packetsentinel", "--setup-voice"],
+                    shell=False,
+                )
+                launched = True
+            except Exception as exc:
+                logger.warning(f"Failed to launch packetsentinel --setup-voice: {exc}")
+
+        if status_lbl:
+            if launched:
+                status_lbl.config(
+                    text="✅ Installer launched in background console! Click 'Check Status Again' when done.",
+                    fg=ACCENT_EMERALD,
+                )
+            else:
+                status_lbl.config(
+                    text="📋 Command copied! Open terminal and run: run.bat --setup-voice",
+                    fg=BORDER_FOCUS,
+                )
 
     def _start_persistent_recording(self) -> None:
         self._is_recording = True
@@ -1259,12 +1643,11 @@ class PacketSentinelDesktopApp:
             bg=BG_CARD,
         ).pack(side=tk.LEFT)
 
-        self.monitor_status_badge = tk.Label(
+        self.monitor_status_badge = create_status_pill(
             header_row,
             text="🔴 SNIFFER STOPPED",
-            font=("Segoe UI", 9, "bold"),
-            fg="#fca5a5",
-            bg="#7f1d1d",
+            status="error",
+            font=FONT_BOLD,
             padx=10,
             pady=3,
         )
@@ -1274,91 +1657,76 @@ class PacketSentinelDesktopApp:
         ctrl_bar = tk.Frame(card, bg=BG_CARD)
         ctrl_bar.pack(fill=tk.X, pady=(0, 6))
 
-        self.btn_toggle_monitor = tk.Button(
+        self.btn_toggle_monitor = create_styled_button(
             ctrl_bar,
-            text="▶️ Start Live Sniffer",
-            font=("Segoe UI", 9, "bold"),
-            bg=ACCENT_BLUE,
-            fg="#ffffff",
-            activebackground=ACCENT_HOVER,
-            activeforeground="#ffffff",
+            text="Start Live Sniffer",
+            icon="▶️",
+            style="primary",
+            command=self._toggle_sniffer,
+            font=FONT_BOLD,
             padx=12,
             pady=4,
-            relief=tk.FLAT,
-            cursor="hand2",
-            command=self._toggle_sniffer,
         )
         self.btn_toggle_monitor.pack(side=tk.LEFT, padx=(0, 8))
 
-        canary_btn = tk.Button(
+        canary_btn = create_styled_button(
             ctrl_bar,
-            text="🧪 Trigger Safe Canary Alert",
-            font=("Segoe UI", 9),
-            bg=BG_ELEVATED,
-            fg=TEXT_TITLE,
-            activebackground=BG_SURFACE,
-            activeforeground="#ffffff",
+            text="Trigger Safe Canary Alert",
+            icon="🧪",
+            style="secondary",
+            command=self._trigger_canary_alert,
+            font=FONT_BODY,
             padx=12,
             pady=4,
-            relief=tk.FLAT,
-            cursor="hand2",
-            command=self._trigger_canary_alert,
         )
         canary_btn.pack(side=tk.LEFT, padx=(0, 8))
 
-        explain_btn = tk.Button(
+        explain_btn = create_styled_button(
             ctrl_bar,
-            text="ℹ️ Explain Threat",
-            font=("Segoe UI", 9, "bold"),
-            bg=ACCENT_BLUE,
-            fg="#ffffff",
-            activebackground=ACCENT_HOVER,
-            activeforeground="#ffffff",
+            text="Explain Threat",
+            icon="ℹ️",
+            style="primary",
+            command=lambda: self._show_threat_explanation(),
+            font=FONT_BOLD,
             padx=12,
             pady=4,
-            relief=tk.FLAT,
-            cursor="hand2",
-            command=lambda: self._show_threat_explanation(),
         )
         explain_btn.pack(side=tk.LEFT, padx=(0, 8))
 
         self.monitor_detail_lbl = tk.Label(
             ctrl_bar,
             text="Ready. Start sniffer to inspect wire DNS/TLS packets in real-time.",
-            font=("Segoe UI", 9),
+            font=FONT_BODY,
             fg=TEXT_MUTED,
             bg=BG_CARD,
         )
         self.monitor_detail_lbl.pack(side=tk.LEFT, padx=(8, 0))
 
         # Real-time Threat Alerts Treeview
-        tree_frame = tk.Frame(card, bg=BG_CANVAS, highlightthickness=1, highlightbackground=BORDER_COLOR)
-        tree_frame.pack(fill=tk.BOTH, expand=True)
-
         cols = ("time", "indicator", "feed", "process", "layer")
-        self.alert_tree = ttk.Treeview(
-            tree_frame,
+        display_names = {
+            "time": "Timestamp (UTC)",
+            "indicator": "Flagged Domain / IP",
+            "feed": "Matched Threat Feed",
+            "process": "Attributed Process",
+            "layer": "Detection Layer",
+        }
+        min_widths = {
+            "time": 150,
+            "indicator": 240,
+            "feed": 180,
+            "process": 140,
+            "layer": 110,
+        }
+        self.alert_tree, self.alert_sb, self.alert_container = create_data_table(
+            card,
             columns=cols,
-            show="headings",
-            selectmode="browse",
+            display_names=display_names,
+            min_widths=min_widths,
             height=6,
+            horizontal_scroll=True,
         )
-        self.alert_tree.heading("time", text="Timestamp (UTC)")
-        self.alert_tree.heading("indicator", text="Flagged Domain / IP")
-        self.alert_tree.heading("feed", text="Matched Threat Feed")
-        self.alert_tree.heading("process", text="Attributed Process")
-        self.alert_tree.heading("layer", text="Detection Layer")
-
-        self.alert_tree.column("time", width=140, anchor="w")
-        self.alert_tree.column("indicator", width=240, anchor="w")
-        self.alert_tree.column("feed", width=180, anchor="w")
-        self.alert_tree.column("process", width=140, anchor="w")
-        self.alert_tree.column("layer", width=110, anchor="center")
-
-        sb = ttk.Scrollbar(tree_frame, orient="vertical", command=self.alert_tree.yview)
-        self.alert_tree.configure(yscrollcommand=sb.set)
-        self.alert_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        sb.pack(side=tk.RIGHT, fill=tk.Y)
+        self.alert_container.pack(fill=tk.BOTH, expand=True)
         self.alert_tree.bind("<Double-1>", lambda e: self._show_threat_explanation())
 
         # Lower Card: Target Process Watchdog & Script Interpreter Inspector
@@ -1412,51 +1780,39 @@ class PacketSentinelDesktopApp:
         self.proc_combo.pack(side=tk.LEFT, padx=(0, 6))
         self.proc_entry = self.proc_combo
 
-        refresh_btn = tk.Button(
+        refresh_btn = create_styled_button(
             input_bar,
-            text="🔄 Refresh",
-            font=("Segoe UI", 8),
-            bg=BG_ELEVATED,
-            fg=TEXT_MUTED,
-            activebackground=BG_SURFACE,
-            activeforeground=TEXT_TITLE,
+            text="Refresh",
+            icon="🔄",
+            style="secondary",
+            command=self._refresh_process_lists,
+            font=FONT_SMALL,
             padx=6,
             pady=3,
-            relief=tk.FLAT,
-            cursor="hand2",
-            command=self._refresh_process_lists,
         )
         refresh_btn.pack(side=tk.LEFT, padx=(0, 6))
 
-        inspect_btn = tk.Button(
+        inspect_btn = create_styled_button(
             input_bar,
             text="Inspect Process Tree",
-            font=("Segoe UI", 9, "bold"),
-            bg=ACCENT_BLUE,
-            fg="#ffffff",
-            activebackground=ACCENT_HOVER,
-            activeforeground="#ffffff",
+            icon="🔍",
+            style="primary",
+            command=self._inspect_watchdog_target,
+            font=FONT_BOLD,
             padx=12,
             pady=3,
-            relief=tk.FLAT,
-            cursor="hand2",
-            command=self._inspect_watchdog_target,
         )
         inspect_btn.pack(side=tk.LEFT, padx=(0, 6))
 
-        ai_btn = tk.Button(
+        ai_btn = create_styled_button(
             input_bar,
-            text="🤖 Ask AI Safety",
-            font=("Segoe UI", 9, "bold"),
-            bg="#7c3aed",
-            fg="#ffffff",
-            activebackground="#6d28d9",
-            activeforeground="#ffffff",
+            text="Ask AI Safety",
+            icon="🤖",
+            style="accent",
+            command=self._analyze_process_with_ai,
+            font=FONT_BOLD,
             padx=12,
             pady=3,
-            relief=tk.FLAT,
-            cursor="hand2",
-            command=self._analyze_process_with_ai,
         )
         ai_btn.pack(side=tk.LEFT)
 
@@ -1886,64 +2242,48 @@ class PacketSentinelDesktopApp:
         btn_row = tk.Frame(card, bg=BG_CARD)
         btn_row.pack(fill=tk.X, pady=(4, 0))
 
-        tk.Button(
+        create_styled_button(
             btn_row,
-            text="🛑 Terminate Process",
-            font=("Segoe UI", 9, "bold"),
-            bg=ALERT_RED,
-            fg="#ffffff",
-            activebackground="#b91c1c",
-            activeforeground="#ffffff",
-            padx=10,
-            pady=5,
-            relief=tk.FLAT,
-            cursor="hand2",
+            text="Terminate Process",
+            icon="🛑",
+            style="danger",
             command=_terminate_process,
-        ).pack(side=tk.LEFT, padx=(0, 6))
-
-        tk.Button(
-            btn_row,
-            text="🛡️ Copy Firewall Block",
-            font=("Segoe UI", 9, "bold"),
-            bg=ACCENT_BLUE,
-            fg="#ffffff",
-            activebackground=ACCENT_HOVER,
-            activeforeground="#ffffff",
+            font=FONT_BOLD,
             padx=10,
             pady=5,
-            relief=tk.FLAT,
-            cursor="hand2",
+        ).pack(side=tk.LEFT, padx=(0, 6))
+
+        create_styled_button(
+            btn_row,
+            text="Copy Firewall Block",
+            icon="🛡️",
+            style="primary",
             command=_copy_firewall_rule,
-        ).pack(side=tk.LEFT, padx=(0, 6))
-
-        tk.Button(
-            btn_row,
-            text="🤖 Ask AI Remediation",
-            font=("Segoe UI", 9, "bold"),
-            bg="#7c3aed",
-            fg="#ffffff",
-            activebackground="#6d28d9",
-            activeforeground="#ffffff",
+            font=FONT_BOLD,
             padx=10,
             pady=5,
-            relief=tk.FLAT,
-            cursor="hand2",
+        ).pack(side=tk.LEFT, padx=(0, 6))
+
+        create_styled_button(
+            btn_row,
+            text="Ask AI Remediation",
+            icon="🤖",
+            style="accent",
             command=_ask_ai_remediation,
-        ).pack(side=tk.LEFT, padx=(0, 6))
-
-        tk.Button(
-            btn_row,
-            text="✕ Close",
-            font=("Segoe UI", 9),
-            bg=BG_ELEVATED,
-            fg=TEXT_MUTED,
-            activebackground=BG_SURFACE,
-            activeforeground=TEXT_TITLE,
+            font=FONT_BOLD,
             padx=10,
             pady=5,
-            relief=tk.FLAT,
-            cursor="hand2",
+        ).pack(side=tk.LEFT, padx=(0, 6))
+
+        create_styled_button(
+            btn_row,
+            text="Close",
+            icon="✕",
+            style="secondary",
             command=dialog.destroy,
+            font=FONT_BODY,
+            padx=10,
+            pady=5,
         ).pack(side=tk.RIGHT)
 
     def _build_settings_tab(self) -> None:
@@ -2095,26 +2435,22 @@ class PacketSentinelDesktopApp:
         save_btn_frame = tk.Frame(scrollable_frame, bg=BG_CANVAS)
         save_btn_frame.pack(fill=tk.X, pady=(4, 16))
 
-        save_btn = tk.Button(
+        save_btn = create_styled_button(
             save_btn_frame,
-            text="💾 Save & Encrypt to Vault",
-            font=("Segoe UI", 10, "bold"),
-            bg=ACCENT_BLUE,
-            fg="#ffffff",
-            activebackground=ACCENT_HOVER,
-            activeforeground="#ffffff",
+            text="Save & Encrypt to Vault",
+            icon="💾",
+            style="primary",
+            command=self._save_settings_vault,
+            font=FONT_SECTION,
             padx=18,
             pady=8,
-            relief=tk.FLAT,
-            cursor="hand2",
-            command=self._save_settings_vault,
         )
         save_btn.pack(side=tk.LEFT)
 
         self.vault_status_lbl = tk.Label(
             save_btn_frame,
             text=f"📁 Vault location: {self.vault_mgr.vault_path}",
-            font=("Segoe UI", 8),
+            font=FONT_SMALL,
             fg=TEXT_MUTED,
             bg=BG_CANVAS,
             padx=12,
@@ -2122,14 +2458,14 @@ class PacketSentinelDesktopApp:
         self.vault_status_lbl.pack(side=tk.LEFT, fill=tk.X, expand=True)
 
         # Section 4: User-Inspectable Diagnostic Logs & Maintenance
-        s4 = tk.Frame(scrollable_frame, bg=BG_CARD, padx=14, pady=12, highlightbackground=BORDER_COLOR, highlightthickness=1)
+        s4 = create_card_frame(scrollable_frame, padx=14, pady=12)
         s4.pack(fill=tk.X, pady=(0, 16))
 
-        tk.Label(s4, text="4. Diagnostic Logs & Maintenance", font=("Segoe UI", 10, "bold"), fg=TEXT_TITLE, bg=BG_CARD).pack(anchor=tk.W, pady=(0, 4))
+        tk.Label(s4, text="4. Diagnostic Logs & Maintenance", font=FONT_SECTION, fg=TEXT_MAIN, bg=BG_CARD).pack(anchor=tk.W, pady=(0, 4))
         tk.Label(
             s4,
             text="Logs are stored 100% locally. Export forum-safe anonymized bundles or permanently purge local caches:",
-            font=("Segoe UI", 9),
+            font=FONT_BODY,
             fg=TEXT_MUTED,
             bg=BG_CARD,
         ).pack(anchor=tk.W, pady=(0, 6))
@@ -2138,7 +2474,7 @@ class PacketSentinelDesktopApp:
             s4,
             bg=BG_CANVAS,
             fg=TEXT_BODY,
-            font=("Consolas", 9),
+            font=FONT_MONO,
             relief=tk.FLAT,
             wrap=tk.NONE,
             height=8,
@@ -2152,79 +2488,63 @@ class PacketSentinelDesktopApp:
         act_row = tk.Frame(s4, bg=BG_CARD)
         act_row.pack(fill=tk.X)
 
-        open_dir_btn = tk.Button(
+        open_dir_btn = create_styled_button(
             act_row,
-            text="📁 Open Logs Directory",
-            font=("Segoe UI", 9, "bold"),
-            bg=ACCENT_BLUE,
-            fg="#ffffff",
-            activebackground=ACCENT_HOVER,
-            activeforeground="#ffffff",
+            text="Open Logs Directory",
+            icon="📁",
+            style="primary",
+            command=self._open_logs_dir,
+            font=FONT_BOLD,
             padx=10,
             pady=5,
-            relief=tk.FLAT,
-            cursor="hand2",
-            command=self._open_logs_dir,
         )
         open_dir_btn.pack(side=tk.LEFT, padx=(0, 6))
 
-        export_bundle_btn = tk.Button(
+        export_bundle_btn = create_styled_button(
             act_row,
-            text="📦 Export Anonymized Bundle",
-            font=("Segoe UI", 9, "bold"),
-            bg=ACCENT_EMERALD,
-            fg="#ffffff",
-            activebackground="#059669",
-            activeforeground="#ffffff",
+            text="Export Anonymized Bundle",
+            icon="📦",
+            style="primary",
+            command=self._export_forum_bundle,
+            font=FONT_BOLD,
             padx=10,
             pady=5,
-            relief=tk.FLAT,
-            cursor="hand2",
-            command=self._export_forum_bundle,
         )
         export_bundle_btn.pack(side=tk.LEFT, padx=(0, 6))
 
-        refresh_logs_btn = tk.Button(
+        refresh_logs_btn = create_styled_button(
             act_row,
-            text="🔄 Refresh Logs",
-            font=("Segoe UI", 9),
-            bg=BG_ELEVATED,
-            fg=TEXT_TITLE,
+            text="Refresh Logs",
+            icon="🔄",
+            style="secondary",
+            command=self._refresh_diag_logs,
+            font=FONT_BODY,
             padx=8,
             pady=5,
-            relief=tk.FLAT,
-            cursor="hand2",
-            command=self._refresh_diag_logs,
         )
         refresh_logs_btn.pack(side=tk.LEFT, padx=(0, 6))
 
-        incidents_btn = tk.Button(
+        incidents_btn = create_styled_button(
             act_row,
-            text="🚨 Kill Incidents",
-            font=("Segoe UI", 9),
-            bg=BG_ELEVATED,
-            fg="#fca5a5",
+            text="Kill Incidents",
+            icon="🚨",
+            style="secondary",
+            command=self._view_kill_incidents,
+            font=FONT_BODY,
             padx=8,
             pady=5,
-            relief=tk.FLAT,
-            cursor="hand2",
-            command=self._view_kill_incidents,
         )
         incidents_btn.pack(side=tk.LEFT, padx=(0, 6))
 
-        nuke_btn = tk.Button(
+        nuke_btn = create_styled_button(
             act_row,
-            text="🗑️ Nuke All Local Data",
-            font=("Segoe UI", 9, "bold"),
-            bg=ALERT_RED,
-            fg="#ffffff",
-            activebackground="#b91c1c",
-            activeforeground="#ffffff",
+            text="Nuke All Local Data",
+            icon="🗑️",
+            style="danger",
+            command=self._nuke_local_data,
+            font=FONT_BOLD,
             padx=10,
             pady=5,
-            relief=tk.FLAT,
-            cursor="hand2",
-            command=self._nuke_local_data,
         )
         nuke_btn.pack(side=tk.RIGHT)
 
@@ -2314,19 +2634,15 @@ class PacketSentinelDesktopApp:
             bg=BG_CANVAS,
         ).pack(side=tk.LEFT, padx=(0, 10))
 
-        copy_mcp_btn = tk.Button(
+        copy_mcp_btn = create_styled_button(
             mcp_bar,
-            text="📋 Copy MCP Configuration JSON (Cursor / Claude / Antigravity)",
-            font=("Segoe UI", 9, "bold"),
-            bg=ACCENT_BLUE,
-            fg="#ffffff",
-            activebackground=ACCENT_HOVER,
-            activeforeground="#ffffff",
+            text="Copy MCP Configuration JSON (Cursor / Claude / Antigravity)",
+            icon="📋",
+            style="primary",
+            command=self._copy_mcp_config_json,
+            font=FONT_BOLD,
             padx=12,
             pady=4,
-            relief=tk.FLAT,
-            cursor="hand2",
-            command=self._copy_mcp_config_json,
         )
         copy_mcp_btn.pack(side=tk.LEFT)
 
@@ -2582,29 +2898,26 @@ class PacketSentinelDesktopApp:
             self.root.clipboard_append(bundle)
             messagebox.showinfo("Copied", "Diagnostic bundle copied to clipboard! Safe to post publicly.")
 
-        copy_b = tk.Button(
+        copy_b = create_styled_button(
             b_bar,
-            text="📋 Copy Diagnostic Bundle to Clipboard",
-            font=("Segoe UI", 9, "bold"),
-            bg="#0284c7",
-            fg="#ffffff",
+            text="Copy Diagnostic Bundle to Clipboard",
+            icon="📋",
+            style="primary",
+            command=_copy_bundle,
+            font=FONT_BOLD,
             padx=14,
             pady=6,
-            relief=tk.FLAT,
-            command=_copy_bundle,
         )
         copy_b.pack(side=tk.LEFT)
 
-        close_b = tk.Button(
+        close_b = create_styled_button(
             b_bar,
             text="Close",
-            font=("Segoe UI", 9),
-            bg="#1e293b",
-            fg="#94a3b8",
+            style="secondary",
+            command=diag_win.destroy,
+            font=FONT_BODY,
             padx=12,
             pady=6,
-            relief=tk.FLAT,
-            command=diag_win.destroy,
         )
         close_b.pack(side=tk.RIGHT)
 
@@ -2663,29 +2976,26 @@ class PacketSentinelDesktopApp:
             self.root.clipboard_append(content)
             messagebox.showinfo("Copied", "Incident report copied to clipboard! Safe to post publicly.")
 
-        copy_b = tk.Button(
+        copy_b = create_styled_button(
             b_bar,
-            text="📋 Copy Incident Report for GitHub / Forums",
-            font=("Segoe UI", 9, "bold"),
-            bg="#0284c7",
-            fg="#ffffff",
+            text="Copy Incident Report for GitHub / Forums",
+            icon="📋",
+            style="primary",
+            command=_copy_incidents,
+            font=FONT_BOLD,
             padx=14,
             pady=6,
-            relief=tk.FLAT,
-            command=_copy_incidents,
         )
         copy_b.pack(side=tk.LEFT)
 
-        close_b = tk.Button(
+        close_b = create_styled_button(
             b_bar,
             text="Close",
-            font=("Segoe UI", 9),
-            bg="#1e293b",
-            fg="#94a3b8",
+            style="secondary",
+            command=inc_win.destroy,
+            font=FONT_BODY,
             padx=12,
             pady=6,
-            relief=tk.FLAT,
-            command=inc_win.destroy,
         )
         close_b.pack(side=tk.RIGHT)
 
@@ -2718,17 +3028,15 @@ class PacketSentinelDesktopApp:
         )
         lbl.pack(side=tk.LEFT)
 
-        min_btn = tk.Button(
+        min_btn = create_styled_button(
             footer,
             text="Hide to Background",
-            font=("Segoe UI", 8),
-            bg="#1e293b",
-            fg="#94a3b8",
+            icon="🗕",
+            style="ghost",
+            command=self._minimize_to_tray,
+            font=FONT_SMALL,
             padx=8,
             pady=2,
-            relief=tk.FLAT,
-            cursor="hand2",
-            command=self._minimize_to_tray,
         )
         min_btn.pack(side=tk.RIGHT)
 
@@ -2873,33 +3181,26 @@ class PacketSentinelDesktopApp:
             self.root.destroy()
             os._exit(0)
 
-        kill_btn = tk.Button(
+        kill_btn = create_styled_button(
             btn_bar,
-            text="🚨 ENGAGE KILL SWITCH NOW",
-            font=("Segoe UI", 10, "bold"),
-            bg="#dc2626",
-            fg="#ffffff",
-            activebackground="#b91c1c",
-            activeforeground="#ffffff",
+            text="ENGAGE KILL SWITCH NOW",
+            icon="🚨",
+            style="danger",
+            command=_execute_kill,
+            font=FONT_SECTION,
             padx=14,
             pady=6,
-            relief=tk.FLAT,
-            cursor="hand2",
-            command=_execute_kill,
         )
         kill_btn.pack(side=tk.LEFT)
 
-        cancel_btn = tk.Button(
+        cancel_btn = create_styled_button(
             btn_bar,
             text="Cancel / Return to App",
-            font=("Segoe UI", 9),
-            bg="#1e293b",
-            fg="#94a3b8",
+            style="secondary",
+            command=dialog.destroy,
+            font=FONT_BODY,
             padx=12,
             pady=6,
-            relief=tk.FLAT,
-            cursor="hand2",
-            command=dialog.destroy,
         )
         cancel_btn.pack(side=tk.RIGHT)
 
