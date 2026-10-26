@@ -12,6 +12,9 @@ ignore = [
     { id = "RUSTSEC-2026-0369", reason = "This advisory affects ZipArchive::extract() and ZipStreamReader::extract() following symlinks. zip 8.6.0 is pulled transitively by yara-x 1.21 (the latest release), which never calls extract() on untrusted archives. rustinel itself uses zip 9.0.2 and extracts entries manually after rejecting symlinks. Drop this ignore once yara-x moves to zip 9. See https://github.com/zip-rs/zip2/security/advisories/GHSA-4684-h2q9-2vcp." },
     { id = "RUSTSEC-2026-0367", reason = "This advisory concerns SUID/SGID bit preservation in ZipArchive::extract(). zip 8.6.0 is pulled transitively by yara-x 1.21 (the latest release), which never extracts untrusted archives. rustinel itself uses zip 9.0.2 and extracts entries manually after rejecting symlinks. Drop this ignore once yara-x moves to zip 9." },
     { id = "RUSTSEC-2026-0368", reason = "This advisory concerns ZipArchive::extract() creating symlinks that point outside the destination. zip 8.6.0 is pulled transitively by yara-x 1.21 (the latest release), which never extracts untrusted archives. rustinel itself uses zip 9.0.2 and extracts entries manually after rejecting symlinks. Drop this ignore once yara-x moves to zip 9." },
+    { id = "RUSTSEC-2026-0380", reason = "This advisory affects Cranelift compiler bit-packing. yara-x uses core WebAssembly for YARA rule conditions only and never compiles untrusted WebAssembly modules. No patched 45.x release is available." },
+    { id = "RUSTSEC-2026-0379", reason = "This advisory affects Cranelift br_table on aarch64. yara-x compiles simple rule conditions and does not generate large branch tables." },
+    { id = "RUSTSEC-2026-0378", reason = "This advisory affects Wasmtime component-model streams. yara-x runs synchronous core WebAssembly only and component-model stream features are absent." },
 ]
 
 [licenses]
