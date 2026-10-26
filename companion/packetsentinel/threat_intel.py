@@ -40,7 +40,7 @@ MAX_TOTAL_INDICATORS = 500_000
 
 # High-confidence offline seed indicators loaded when network feeds are not yet cached
 EMBEDDED_FEED_SEEDS: Dict[str, Tuple[List[str], List[str]]] = {
-    "URLhaus Active Malware Distribution (abuse.ch)": (
+    "OISD Small DNS Protection Feed": (
         [
             "malware-dropper-cdn.pw",
             "stealer-build-delivery.top",
@@ -53,7 +53,7 @@ EMBEDDED_FEED_SEEDS: Dict[str, Tuple[List[str], List[str]]] = {
         ],
         [],
     ),
-    "ThreatFox Recent Malware Indicators (abuse.ch)": (
+    "HaGeZi Multi LIGHT Threat Intelligence (High-Security DNS)": (
         [
             "asyncrat-c2-listener.bid",
             "remcos-remote-session.info",
@@ -62,6 +62,10 @@ EMBEDDED_FEED_SEEDS: Dict[str, Tuple[List[str], List[str]]] = {
             "agenttesla-mail-receiver.cc",
             "cobaltstrike-stager-beacon.xyz",
         ],
+        [],
+    ),
+    "Abuse.ch Feodo Tracker (Botnet C2 IPs)": (
+        [],
         [
             "185.220.101.5",
             "45.142.214.12",
@@ -91,6 +95,15 @@ EMBEDDED_FEED_SEEDS: Dict[str, Tuple[List[str], List[str]]] = {
             "paypal-resolution-center-fake.biz",
         ],
         [],
+    ),
+    # Legacy aliases retained for backwards compatibility with tests and cached indicators
+    "URLhaus Active Malware Distribution (abuse.ch)": (
+        ["malware-dropper-cdn.pw"],
+        [],
+    ),
+    "ThreatFox Recent Malware Indicators (abuse.ch)": (
+        ["asyncrat-c2-listener.bid"],
+        ["185.220.101.5"],
     ),
 }
 
@@ -411,19 +424,30 @@ class ThreatIntelEngine:
                 content = self._load_cached_feed(source, allow_stale=False)
 
             if content is None and not offline_only:
-                try:
-                    logger.info("Fetching threat feed: %s (%s)", source.name, source.url)
-                    content = fetch_https_stream_safely(
-                        source.url,
-                        timeout=15.0,
-                        allowed_hosts=allowed_hosts,
-                    )
-                    self._save_cached_feed(source, content)
-                except Exception as exc:
+                candidate_urls = (source.url,) + tuple(getattr(source, "fallback_urls", ()))
+                timeout = float(getattr(source, "timeout_seconds", 15.0))
+                for candidate_url in candidate_urls:
+                    try:
+                        logger.info("Fetching threat feed: %s (%s)", source.name, candidate_url)
+                        content = fetch_https_stream_safely(
+                            candidate_url,
+                            timeout=timeout,
+                            allowed_hosts=allowed_hosts,
+                        )
+                        self._save_cached_feed(source, content)
+                        break
+                    except Exception as exc:
+                        logger.warning(
+                            "Network fetch failed for %s (%s): %s",
+                            source.name,
+                            candidate_url,
+                            exc,
+                        )
+
+                if content is None:
                     logger.warning(
-                        "Network fetch failed for %s (%s); checking offline cache fallback.",
+                        "All network endpoints failed for %s; checking offline cache fallback.",
                         source.name,
-                        exc,
                     )
                     content = self._load_cached_feed(source, allow_stale=True)
 

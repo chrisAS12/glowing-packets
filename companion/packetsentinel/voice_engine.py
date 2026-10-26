@@ -35,6 +35,7 @@ class VoiceEngineStatus:
     stt_installed: bool = False
     model_cached: bool = False
     windows_dictation_available: bool = False
+    model_incomplete: bool = False
 
     @property
     def ready(self) -> bool:
@@ -73,14 +74,73 @@ def _is_directory_complete_model(directory: Path) -> bool:
     """Verifies that a directory has all essential files to run offline without network."""
     if not directory.is_dir():
         return False
-    if not all((directory / f).is_file() for f in REQUIRED_MODEL_FILES):
-        return False
-    has_vocab = (
-        (directory / "vocabulary.txt").is_file()
-        or (directory / "vocabulary.json").is_file()
-        or (directory / "tokenizer.json").is_file()
-    )
+    for req_name in REQUIRED_MODEL_FILES:
+        target = directory / req_name
+        if not target.is_file():
+            return False
+        try:
+            if target.stat().st_size == 0:
+                return False
+        except Exception:
+            return False
+        if req_name == "config.json":
+            try:
+                import json
+
+                parsed = json.loads(target.read_text(encoding="utf-8"))
+                if not isinstance(parsed, dict):
+                    return False
+            except Exception:
+                return False
+
+    has_vocab = False
+    for vf in ("vocabulary.txt", "vocabulary.json", "tokenizer.json"):
+        vp = directory / vf
+        if vp.is_file():
+            try:
+                if vp.stat().st_size > 0:
+                    has_vocab = True
+                    break
+            except Exception:
+                continue
     return has_vocab
+
+
+def get_active_snapshot_dir(model_dir: Path, model_name: str = DEFAULT_MODEL_NAME) -> Optional[Path]:
+    """Resolves the active HuggingFace Hub snapshot directory for faster-whisper."""
+    repo_dir = model_dir / f"models--Systran--faster-whisper-{model_name}"
+    snapshots_dir = repo_dir / "snapshots"
+    if not snapshots_dir.is_dir():
+        return None
+    refs_main = repo_dir / "refs" / "main"
+    if refs_main.is_file():
+        try:
+            commit_hash = refs_main.read_text(encoding="utf-8").strip()
+            active_snap = snapshots_dir / commit_hash
+            if active_snap.is_dir():
+                return active_snap
+        except Exception:
+            pass
+    snaps = [s for s in snapshots_dir.iterdir() if s.is_dir()]
+    if snaps:
+        snaps.sort(key=lambda p: p.stat().st_mtime if p.exists() else 0, reverse=True)
+        return snaps[0]
+    return None
+
+
+def is_snapshot_incomplete(model_dir: Path, model_name: str = DEFAULT_MODEL_NAME) -> bool:
+    """Returns True if a model cache directory exists locally but is missing required files (e.g. config.json)."""
+    if is_model_cached(model_dir, model_name):
+        return False
+    repo_dir = model_dir / f"models--Systran--faster-whisper-{model_name}"
+    snapshots_dir = repo_dir / "snapshots"
+    if snapshots_dir.is_dir():
+        for snap in snapshots_dir.iterdir():
+            if snap.is_dir():
+                return True
+    if (model_dir / model_name).is_dir() or (model_dir / "model.bin").is_file():
+        return True
+    return False
 
 
 def is_model_cached(model_dir: Path, model_name: str = DEFAULT_MODEL_NAME) -> bool:
@@ -88,7 +148,10 @@ def is_model_cached(model_dir: Path, model_name: str = DEFAULT_MODEL_NAME) -> bo
     if not model_dir.exists():
         return False
     # 1. HuggingFace Hub snapshot directory layout:
-    # models--Systran--faster-whisper-<name>/snapshots/<rev>/
+    # First check the active snapshot pointed to by refs/main
+    active_snap = get_active_snapshot_dir(model_dir, model_name)
+    if active_snap is not None and _is_directory_complete_model(active_snap):
+        return True
     repo_dir = model_dir / f"models--Systran--faster-whisper-{model_name}"
     snapshots_dir = repo_dir / "snapshots"
     if snapshots_dir.is_dir():
@@ -107,6 +170,7 @@ def check_voice_status(model_dir: Path, model_name: str = DEFAULT_MODEL_NAME) ->
     mic_ready = _module_available("sounddevice") and _module_available("numpy")
     stt_installed = _module_available("faster_whisper")
     cached = is_model_cached(model_dir, model_name) if stt_installed else False
+    incomplete = is_snapshot_incomplete(model_dir, model_name) if stt_installed else False
     model_ready = stt_installed and cached
     win_dictation = is_windows_dictation_available()
 
@@ -115,7 +179,13 @@ def check_voice_status(model_dir: Path, model_name: str = DEFAULT_MODEL_NAME) ->
     elif not stt_installed:
         detail = "Offline speech engine (faster-whisper) is not installed. " + VOICE_INSTALL_HINT
     elif not model_ready:
-        detail = f"Offline speech model '{model_name}' is not downloaded yet. " + VOICE_INSTALL_HINT
+        if incomplete:
+            detail = (
+                f"Offline speech model '{model_name}' snapshot is incomplete (missing config.json). "
+                "Press Win + H to dictate, or click 'Repair Voice Engine' to fix."
+            )
+        else:
+            detail = f"Offline speech model '{model_name}' is not downloaded yet. " + VOICE_INSTALL_HINT
     else:
         detail = f"Offline engine ready: faster-whisper '{model_name}' on CPU (int8)."
     return VoiceEngineStatus(
@@ -125,6 +195,7 @@ def check_voice_status(model_dir: Path, model_name: str = DEFAULT_MODEL_NAME) ->
         stt_installed=stt_installed,
         model_cached=cached,
         windows_dictation_available=win_dictation,
+        model_incomplete=incomplete,
     )
 
 
@@ -283,6 +354,12 @@ class OfflineTranscriber:
                     local_files_only=True,
                 )
             except Exception as exc:
+                err_text = str(exc)
+                if "incomplete" in err_text.lower() or "config.json" in err_text.lower():
+                    raise VoiceEngineError(
+                        f"Offline speech model '{self._model_name}' snapshot is incomplete (missing config.json). "
+                        "Click 'Repair Voice Engine' to fix in 1-click or press Win + H to dictate."
+                    ) from exc
                 raise VoiceEngineError(
                     f"Failed to load offline Whisper model '{self._model_name}': {exc}. " + VOICE_INSTALL_HINT
                 ) from exc
@@ -305,14 +382,132 @@ class OfflineTranscriber:
         return text
 
 
-def download_voice_model(model_dir: Path, model_name: str = DEFAULT_MODEL_NAME) -> Path:
-    """One-time, explicit, online setup step. Never called while monitoring."""
+def _download_file_direct(url: str, destination: Path) -> bool:
+    """Safely and atomically downloads a single file over HTTPS using TLS 1.2+."""
+    import ssl
+    import urllib.request
+
+    temp_dest = destination.with_suffix(destination.suffix + ".ps_tmp")
+    try:
+        ctx = ssl.create_default_context()
+        ctx.minimum_version = ssl.TLSVersion.TLSv1_2
+        req = urllib.request.Request(
+            url,
+            headers={"User-Agent": "PacketSentinel-VoiceEngine/1.0"},
+        )
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        with urllib.request.urlopen(req, context=ctx, timeout=20.0) as resp:
+            content = resp.read()
+            if not content:
+                return False
+            temp_dest.write_bytes(content)
+        temp_dest.replace(destination)
+        return True
+    except Exception:
+        if temp_dest.exists():
+            try:
+                temp_dest.unlink()
+            except Exception:
+                pass
+        return False
+
+
+def _ensure_snapshot_files_complete(model_dir: Path, model_name: str = DEFAULT_MODEL_NAME) -> None:
+    """
+    Ensures that config.json and other essential model files exist and are valid.
+    Specifically repairs missing config.json in existing snapshots.
+    """
+    if is_model_cached(model_dir, model_name):
+        return
+
+    repo_id = f"Systran/faster-whisper-{model_name}"
+
+    try:
+        from huggingface_hub import hf_hub_download
+
+        for fname in ("config.json", "vocabulary.txt", "tokenizer.json"):
+            try:
+                hf_hub_download(repo_id=repo_id, filename=fname, cache_dir=str(model_dir))
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+    active_snap = get_active_snapshot_dir(model_dir, model_name)
+    targets = [active_snap] if active_snap is not None else []
+    repo_dir = model_dir / f"models--Systran--faster-whisper-{model_name}"
+    snapshots_dir = repo_dir / "snapshots"
+    if snapshots_dir.is_dir():
+        for s in snapshots_dir.iterdir():
+            if s.is_dir() and s not in targets:
+                targets.append(s)
+
+    if not targets:
+        direct_target = model_dir / model_name
+        direct_target.mkdir(parents=True, exist_ok=True)
+        targets.append(direct_target)
+
+    for target_dir in targets:
+        cfg_file = target_dir / "config.json"
+        is_cfg_ok = False
+        if cfg_file.is_file() and cfg_file.stat().st_size > 0:
+            try:
+                import json
+
+                parsed = json.loads(cfg_file.read_text(encoding="utf-8"))
+                if isinstance(parsed, dict):
+                    is_cfg_ok = True
+            except Exception:
+                is_cfg_ok = False
+
+        if not is_cfg_ok:
+            _download_file_direct(
+                url=f"https://huggingface.co/{repo_id}/raw/main/config.json",
+                destination=cfg_file,
+            )
+
+
+def download_offline_model(model_dir: Path, model_name: str = DEFAULT_MODEL_NAME) -> Path:
+    """
+    One-time, explicit, online setup step. Downloads and atomically validates
+    the offline faster-whisper model. Never called while monitoring.
+    """
     if not _module_available("faster_whisper"):
         raise VoiceEngineError("faster-whisper is not installed. Install it with: pip install -r requirements-voice.txt")
     from faster_whisper import WhisperModel
 
     model_dir.mkdir(parents=True, exist_ok=True)
-    WhisperModel(model_name, device="cpu", compute_type="int8", download_root=str(model_dir))
+    try:
+        WhisperModel(model_name, device="cpu", compute_type="int8", download_root=str(model_dir))
+    except Exception as exc:
+        _ensure_snapshot_files_complete(model_dir, model_name)
+        if not is_model_cached(model_dir, model_name):
+            raise VoiceEngineError(f"Model download failed for '{model_name}': {exc}") from exc
+
+    _ensure_snapshot_files_complete(model_dir, model_name)
+
     if not is_model_cached(model_dir, model_name):
-        raise VoiceEngineError(f"Model download finished but '{model_name}' was not found in {model_dir}.")
+        raise VoiceEngineError(
+            f"Model download finished but '{model_name}' was not valid in {model_dir}. "
+            "Essential files (config.json, model.bin, vocabulary) are incomplete."
+        )
     return model_dir
+
+
+# Backward-compatible alias
+download_voice_model = download_offline_model
+
+
+def repair_offline_model(model_dir: Path, model_name: str = DEFAULT_MODEL_NAME) -> bool:
+    """
+    1-click self-healing repair: Fixes missing or incomplete snapshot files (e.g. config.json).
+    Returns True if model is cached and valid after repair.
+    """
+    try:
+        _ensure_snapshot_files_complete(model_dir, model_name)
+        if is_model_cached(model_dir, model_name):
+            return True
+        download_offline_model(model_dir, model_name)
+        return is_model_cached(model_dir, model_name)
+    except Exception:
+        return is_model_cached(model_dir, model_name)

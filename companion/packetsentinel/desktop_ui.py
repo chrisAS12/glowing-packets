@@ -34,12 +34,14 @@ from .diagnostic_logger import (
     list_kill_switch_incidents,
     purge_all_local_data,
     record_kill_switch_incident,
+    sanitize_log_text,
     setup_diagnostic_logging,
 )
 from .egress_guard import engage_runtime_network_lockdown
 from .live_monitor_service import AlertRow, LiveMonitorService, MonitorSnapshot
 from .mcp_privacy import PrivacySanitizer
 from .process_watchdog import inspect_child_lineage
+from .security import is_public_routable_ip
 from .vault import EncryptedVaultManager, VaultSettings
 from .voice_engine import (
     MicrophoneRecorder,
@@ -47,8 +49,12 @@ from .voice_engine import (
     VoiceEngineError,
     VoiceEngineStatus,
     check_voice_status,
+    download_offline_model,
     get_model_dir,
+    is_model_cached,
+    is_snapshot_incomplete,
     is_windows_dictation_available,
+    repair_offline_model,
 )
 from .ui_components import (
     ACCENT_BLUE,
@@ -603,7 +609,7 @@ class PacketSentinelDesktopApp:
 
         tk.Label(
             sel_row,
-            text="Select Process:",
+            text="Select Target:",
             font=FONT_BODY,
             fg=TEXT_MUTED,
             bg=BG_CARD,
@@ -613,16 +619,14 @@ class PacketSentinelDesktopApp:
             sel_row,
             font=FONT_BODY,
             state="normal",
-            width=18,
+            width=22,
         )
         candidates = self._get_running_process_candidates()
         self.mc_proc_combo["values"] = candidates
-        if "python.exe" in candidates:
-            self.mc_proc_combo.set("python.exe")
-        elif candidates:
+        if candidates:
             self.mc_proc_combo.set(candidates[0])
         else:
-            self.mc_proc_combo.set("python")
+            self.mc_proc_combo.set("python.exe")
         self.mc_proc_combo.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 6))
 
         insp_btn = create_styled_button(
@@ -632,10 +636,22 @@ class PacketSentinelDesktopApp:
             style="secondary",
             command=self._inspect_mc_watchdog,
             font=FONT_BOLD,
-            padx=10,
+            padx=8,
             pady=3,
         )
-        insp_btn.pack(side=tk.LEFT, padx=(0, 6))
+        insp_btn.pack(side=tk.LEFT, padx=(0, 4))
+
+        mc_copy_btn = create_styled_button(
+            sel_row,
+            text="Copy",
+            icon="📋",
+            style="secondary",
+            command=lambda: self._copy_process_summary(self.mc_watchdog_results),
+            font=FONT_SMALL,
+            padx=8,
+            pady=3,
+        )
+        mc_copy_btn.pack(side=tk.LEFT, padx=(0, 4))
 
         ai_btn = create_styled_button(
             sel_row,
@@ -644,7 +660,7 @@ class PacketSentinelDesktopApp:
             style="accent",
             command=self._analyze_process_with_ai,
             font=FONT_BOLD,
-            padx=10,
+            padx=8,
             pady=3,
         )
         ai_btn.pack(side=tk.LEFT)
@@ -703,6 +719,18 @@ class PacketSentinelDesktopApp:
         )
         explain_btn.pack(side=tk.RIGHT, padx=(0, 6))
 
+        mc_inspect_alert_btn = create_styled_button(
+            r_head,
+            text="Inspect Alert",
+            icon="🎯",
+            style="secondary",
+            command=self._inspect_selected_alert_in_mc,
+            font=FONT_SMALL,
+            padx=8,
+            pady=2,
+        )
+        mc_inspect_alert_btn.pack(side=tk.RIGHT, padx=(0, 6))
+
         cols = ("time", "indicator", "feed", "process", "layer")
         display_names = {
             "time": "Time (UTC)",
@@ -728,6 +756,7 @@ class PacketSentinelDesktopApp:
         )
         self.mc_alert_container.pack(fill=tk.BOTH, expand=True)
         self.mc_alert_tree.bind("<Double-1>", lambda e: self._show_threat_explanation())
+        self.mc_alert_tree.bind("<<TreeviewSelect>>", self._on_mc_alert_tree_select)
 
     def _build_airlock_tab(self) -> None:
         banner = tk.Label(
@@ -1017,14 +1046,26 @@ class PacketSentinelDesktopApp:
                 else "Engine: Offline Whisper (Not Installed)"
             )
         elif not getattr(status, "model_cached", True):
-            pill_text = "⚠️ Offline Model Download Needed"
-            pill_bg = "#78350f"
-            pill_fg = "#fde047"
-            mc_btn_text = "⚠️ Download Whisper Model"
-            airlock_btn_text = "⚠️ DOWNLOAD WHISPER MODEL"
-            mc_hint = "Offline speech model ('base') not downloaded yet. Click button to download."
-            airlock_hint = "Offline speech model ('base') is not downloaded yet. Click button to download."
-            model_info = "Engine: Faster-Whisper (Model Download Needed)"
+            if getattr(status, "model_incomplete", False):
+                pill_text = "⚠️ Voice Repair Needed"
+                pill_bg = "#78350f"
+                pill_fg = "#fde047"
+                mc_btn_text = "🔧 Repair Voice Engine"
+                airlock_btn_text = "🔧 REPAIR VOICE ENGINE"
+                win_h_note = " Press Win + H to dictate, or click to repair." if has_win_dictation else " Click to repair."
+                mc_hint = f"Offline speech model snapshot is incomplete (missing config.json).{win_h_note}"
+                airlock_hint = f"Offline speech model snapshot is incomplete (missing config.json).{win_h_note}"
+                model_info = "Engine: Faster-Whisper (Snapshot Incomplete • 1-Click Repair Available)"
+            else:
+                pill_text = "⚠️ Offline Model Download Needed"
+                pill_bg = "#78350f"
+                pill_fg = "#fde047"
+                mc_btn_text = "⚠️ Download Whisper Model"
+                airlock_btn_text = "⚠️ DOWNLOAD WHISPER MODEL"
+                win_h_note = " or press Win + H for Windows dictation." if has_win_dictation else "."
+                mc_hint = f"Offline speech model ('base') not downloaded yet.{win_h_note}"
+                airlock_hint = f"Offline speech model ('base') is not downloaded yet.{win_h_note}"
+                model_info = "Engine: Faster-Whisper (Model Download Needed)"
         else:
             pill_text = "⚠️ Voice Setup Needed"
             pill_bg = "#78350f"
@@ -1058,10 +1099,92 @@ class PacketSentinelDesktopApp:
 
         status = self._refresh_voice_status()
         if not status.ready:
+            self._handle_voice_not_ready(status)
             self._show_voice_setup_modal(status)
             return
 
         self._start_persistent_recording()
+
+    def _handle_voice_not_ready(self, status: VoiceEngineStatus) -> None:
+        """Shows clean non-blocking notification and focuses prompt box for seamless Win + H dictation."""
+        has_win_dictation = getattr(status, "windows_dictation_available", False) or (sys.platform == "win32")
+        if getattr(status, "model_incomplete", False):
+            msg = (
+                "⚠️ Voice snapshot is missing config.json. "
+                + ("Press [ Win + H ] to dictate into prompt box, or click 'Repair Voice Engine'." if has_win_dictation else "Click 'Repair Voice Engine' to fix.")
+            )
+        elif not getattr(status, "model_cached", True):
+            msg = (
+                "⚠️ Offline Whisper model not downloaded yet. "
+                + ("Press [ Win + H ] to dictate into prompt box, or click 'Repair Voice Engine'." if has_win_dictation else "Click 'Setup Voice Dictation' to download.")
+            )
+        elif not getattr(status, "stt_installed", True):
+            msg = (
+                "⚠️ Faster-Whisper is not installed. "
+                + ("Press [ Win + H ] to dictate directly into this prompt box." if has_win_dictation else status.detail)
+            )
+        else:
+            msg = f"⚠️ {status.detail}"
+
+        if hasattr(self, "mc_voice_feedback_lbl"):
+            self.mc_voice_feedback_lbl.config(text=msg, fg=BORDER_FOCUS)
+        if hasattr(self, "voice_feedback_lbl"):
+            self.voice_feedback_lbl.config(text=msg, fg=BORDER_FOCUS)
+
+        # Seamless fallback: focus the prompt box so Win + H immediately writes into it
+        if hasattr(self, "mc_quick_prompt_entry"):
+            try:
+                self.mc_quick_prompt_entry.focus_set()
+            except Exception:
+                pass
+
+    def _repair_voice_engine(self, dialog: Optional[tk.Toplevel] = None, status_lbl: Optional[tk.Label] = None) -> None:
+        """1-click background self-healing repair for missing model files / config.json."""
+        if status_lbl and status_lbl.winfo_exists():
+            status_lbl.config(text="⏳ Repairing voice engine: downloading config.json and validating...", fg=BORDER_FOCUS)
+        if hasattr(self, "mc_voice_feedback_lbl"):
+            self.mc_voice_feedback_lbl.config(text="⏳ Repairing voice engine: downloading config.json...", fg=BORDER_FOCUS)
+        if hasattr(self, "voice_feedback_lbl"):
+            self.voice_feedback_lbl.config(text="⏳ Repairing voice engine: downloading config.json...", fg=BORDER_FOCUS)
+
+        def _bg_repair() -> None:
+            try:
+                m_dir = get_model_dir(self.config.app_dir)
+                ok = repair_offline_model(m_dir, model_name="base")
+
+                def _on_done(repaired: bool) -> None:
+                    new_status = self._refresh_voice_status()
+                    if repaired or new_status.ready:
+                        success_msg = "✅ Voice engine repaired successfully! Offline dictation is ready."
+                        if status_lbl and status_lbl.winfo_exists():
+                            status_lbl.config(text=success_msg, fg=ACCENT_EMERALD)
+                        if hasattr(self, "mc_voice_feedback_lbl"):
+                            self.mc_voice_feedback_lbl.config(text=success_msg, fg=ACCENT_EMERALD)
+                        if hasattr(self, "voice_feedback_lbl"):
+                            self.voice_feedback_lbl.config(text=success_msg, fg=ACCENT_EMERALD)
+                        if dialog and dialog.winfo_exists():
+                            self.root.after(1200, lambda: dialog.destroy() if dialog.winfo_exists() else None)
+                    else:
+                        fail_msg = "❌ Could not repair model completely. Run 'run.bat --setup-voice' while online."
+                        if status_lbl and status_lbl.winfo_exists():
+                            status_lbl.config(text=fail_msg, fg=ALERT_RED)
+                        if hasattr(self, "mc_voice_feedback_lbl"):
+                            self.mc_voice_feedback_lbl.config(text=fail_msg, fg=ALERT_RED)
+
+                self.root.after(0, lambda: _on_done(ok))
+            except Exception as exc:
+                logger.error(f"Voice engine repair error: {exc}")
+                err_text = f"❌ Repair error: {exc}"
+
+                def _on_err(err_m: str) -> None:
+                    if status_lbl and status_lbl.winfo_exists():
+                        status_lbl.config(text=err_m, fg=ALERT_RED)
+                    if hasattr(self, "mc_voice_feedback_lbl"):
+                        self.mc_voice_feedback_lbl.config(text=err_m, fg=ALERT_RED)
+
+                self.root.after(0, lambda: _on_err(err_text))
+
+        threading.Thread(target=_bg_repair, daemon=True).start()
 
     def _show_voice_setup_modal(self, status: Optional[VoiceEngineStatus] = None) -> tk.Toplevel:
         """Display a dedicated, elegant setup modal dialog when the voice engine is missing."""
@@ -1083,7 +1206,6 @@ class PacketSentinelDesktopApp:
         dialog.minsize(600, 520)
         dialog.configure(bg=BG_CANVAS)
         dialog.transient(self.root)
-        dialog.grab_set()
 
         def _on_modal_close() -> None:
             self._voice_setup_dialog = None
@@ -1144,6 +1266,12 @@ class PacketSentinelDesktopApp:
             explanation_detail = (
                 "The 'faster-whisper' package is required for local speech-to-text. "
                 "You can install it automatically using the 1-click solution below."
+            )
+        elif getattr(current_status, "model_incomplete", False):
+            explanation_title = "⚠️ Offline speech model snapshot is incomplete (missing config.json)."
+            explanation_detail = (
+                "Faster-Whisper model cache exists but 'config.json' is missing or incomplete. "
+                "Click 'Repair Voice Engine' below to download config.json and validate in 1 click."
             )
         elif not current_status.model_cached:
             explanation_title = "⚠️ Offline speech model ('base') is not downloaded yet."
@@ -1248,11 +1376,23 @@ class PacketSentinelDesktopApp:
             install_feedback.config(text="⏳ Launching voice engine setup in console window...", fg=BORDER_FOCUS)
             self._launch_voice_setup(dialog=dialog, status_lbl=install_feedback)
 
+        repair_btn = create_styled_button(
+            btn_row,
+            text="Repair Voice Engine (Download config.json)",
+            icon="🔧",
+            style="primary",
+            command=lambda: self._repair_voice_engine(dialog=dialog, status_lbl=install_feedback),
+            font=FONT_BOLD,
+            padx=14,
+            pady=6,
+        )
+        repair_btn.pack(side=tk.LEFT, padx=(0, 8))
+
         install_btn = create_styled_button(
             btn_row,
             text="Install Voice Engine (run.bat --setup-voice)",
             icon="⬇️",
-            style="primary",
+            style="secondary",
             command=_run_installer,
             font=FONT_BOLD,
             padx=14,
@@ -1515,14 +1655,36 @@ class PacketSentinelDesktopApp:
                 bg=ACCENT_BLUE,
                 activebackground=ACCENT_HOVER,
             )
-            self.voice_status_pill.config(text="⚠️ VOICE AIRLOCK NOTICE", bg="#78350f", fg="#fde047")
-            self.voice_feedback_lbl.config(text=f"❌ {message}", fg=ALERT_RED)
-            if hasattr(self, "mc_voice_btn"):
-                self.mc_voice_btn.config(text="🎙️  Start Dictation (Spacebar)", bg=ACCENT_BLUE, activebackground=ACCENT_HOVER)
-            if hasattr(self, "mc_voice_status_pill"):
-                self.mc_voice_status_pill.config(text="⚠️ VOICE NOTICE", bg="#78350f", fg="#fde047")
-            if hasattr(self, "mc_voice_feedback_lbl"):
-                self.mc_voice_feedback_lbl.config(text=f"❌ {message}", fg=ALERT_RED)
+            has_win = is_windows_dictation_available()
+            if "config.json" in message.lower() or "incomplete" in message.lower():
+                self.voice_status_pill.config(text="⚠️ VOICE REPAIR NEEDED", bg="#78350f", fg="#fde047")
+                clean_msg = (
+                    "⚠️ Offline speech model snapshot is incomplete (missing config.json). "
+                    + ("Press [ Win + H ] to dictate into prompt box, or click 'Repair Voice Engine'." if has_win else "Click 'Repair Voice Engine' to fix.")
+                )
+                self.voice_feedback_lbl.config(text=clean_msg, fg=BORDER_FOCUS)
+                if hasattr(self, "mc_voice_status_pill"):
+                    self.mc_voice_status_pill.config(text="⚠️ REPAIR NEEDED", bg="#78350f", fg="#fde047")
+                if hasattr(self, "mc_voice_feedback_lbl"):
+                    self.mc_voice_feedback_lbl.config(text=clean_msg, fg=BORDER_FOCUS)
+                if hasattr(self, "mc_voice_btn"):
+                    self.mc_voice_btn.config(text="🔧 Repair Voice Engine")
+                if hasattr(self, "voice_btn"):
+                    self.voice_btn.config(text="🔧 REPAIR VOICE ENGINE")
+                if hasattr(self, "mc_quick_prompt_entry"):
+                    try:
+                        self.mc_quick_prompt_entry.focus_set()
+                    except Exception:
+                        pass
+            else:
+                self.voice_status_pill.config(text="⚠️ VOICE AIRLOCK NOTICE", bg="#78350f", fg="#fde047")
+                self.voice_feedback_lbl.config(text=f"❌ {message}", fg=ALERT_RED)
+                if hasattr(self, "mc_voice_btn"):
+                    self.mc_voice_btn.config(text="🎙️  Start Dictation (Spacebar)", bg=ACCENT_BLUE, activebackground=ACCENT_HOVER)
+                if hasattr(self, "mc_voice_status_pill"):
+                    self.mc_voice_status_pill.config(text="⚠️ VOICE NOTICE", bg="#78350f", fg="#fde047")
+                if hasattr(self, "mc_voice_feedback_lbl"):
+                    self.mc_voice_feedback_lbl.config(text=f"❌ {message}", fg=ALERT_RED)
         except Exception as exc:
             logger.error(f"Error displaying voice engine error: {exc}")
 
@@ -1711,6 +1873,18 @@ class PacketSentinelDesktopApp:
         )
         explain_btn.pack(side=tk.LEFT, padx=(0, 8))
 
+        inspect_alert_btn = create_styled_button(
+            ctrl_bar,
+            text="Inspect Alert Target",
+            icon="🎯",
+            style="secondary",
+            command=self._inspect_selected_alert_in_monitor,
+            font=FONT_BOLD,
+            padx=10,
+            pady=4,
+        )
+        inspect_alert_btn.pack(side=tk.LEFT, padx=(0, 8))
+
         self.monitor_detail_lbl = tk.Label(
             ctrl_bar,
             text="Ready. Start sniffer to inspect wire DNS/TLS packets in real-time.",
@@ -1746,17 +1920,18 @@ class PacketSentinelDesktopApp:
         )
         self.alert_container.pack(fill=tk.BOTH, expand=True)
         self.alert_tree.bind("<Double-1>", lambda e: self._show_threat_explanation())
+        self.alert_tree.bind("<<TreeviewSelect>>", self._on_alert_tree_select)
 
         # Lower Card: Target Process Watchdog & Script Interpreter Inspector
         w_card = tk.Frame(self.tab_monitor, bg=BG_CARD, padx=14, pady=10, highlightbackground=BORDER_COLOR, highlightthickness=1)
-        w_card.pack(fill=tk.X, pady=(0, 0))
+        w_card.pack(fill=tk.BOTH, expand=True, pady=(0, 0))
 
         w_head = tk.Frame(w_card, bg=BG_CARD)
         w_head.pack(fill=tk.X, pady=(0, 4))
 
         tk.Label(
             w_head,
-            text="👁️ Target Process Watchdog & Script Lineage Inspector",
+            text="👁️ Target Process Watchdog & Socket Inspector",
             font=("Segoe UI", 10, "bold"),
             fg=TEXT_TITLE,
             bg=BG_CARD,
@@ -1764,7 +1939,7 @@ class PacketSentinelDesktopApp:
 
         tk.Label(
             w_head,
-            text="Traces child process trees & flags LOLBINs (powershell, node, curl, cmd)",
+            text="Traces child process trees, open socket ports, and flags LOLBINs",
             font=("Segoe UI", 8),
             fg=TEXT_MUTED,
             bg=BG_CARD,
@@ -1775,7 +1950,7 @@ class PacketSentinelDesktopApp:
 
         tk.Label(
             input_bar,
-            text="Select Process:",
+            text="Select Target / Connection:",
             font=("Segoe UI", 9),
             fg=TEXT_MUTED,
             bg=BG_CARD,
@@ -1785,17 +1960,15 @@ class PacketSentinelDesktopApp:
             input_bar,
             font=("Segoe UI", 9),
             state="normal",
-            width=22,
+            width=28,
         )
         candidates = self._get_running_process_candidates()
         self.proc_combo["values"] = candidates
-        if "python.exe" in candidates:
-            self.proc_combo.set("python.exe")
-        elif candidates:
+        if candidates:
             self.proc_combo.set(candidates[0])
         else:
-            self.proc_combo.set("python")
-        self.proc_combo.pack(side=tk.LEFT, padx=(0, 6))
+            self.proc_combo.set("python.exe")
+        self.proc_combo.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 6))
         self.proc_entry = self.proc_combo
 
         refresh_btn = create_styled_button(
@@ -1808,19 +1981,31 @@ class PacketSentinelDesktopApp:
             padx=6,
             pady=3,
         )
-        refresh_btn.pack(side=tk.LEFT, padx=(0, 6))
+        refresh_btn.pack(side=tk.LEFT, padx=(0, 4))
 
         inspect_btn = create_styled_button(
             input_bar,
-            text="Inspect Process Tree",
+            text="Inspect Target",
             icon="🔍",
             style="primary",
             command=self._inspect_watchdog_target,
             font=FONT_BOLD,
-            padx=12,
+            padx=10,
             pady=3,
         )
-        inspect_btn.pack(side=tk.LEFT, padx=(0, 6))
+        inspect_btn.pack(side=tk.LEFT, padx=(0, 4))
+
+        copy_summary_btn = create_styled_button(
+            input_bar,
+            text="Copy Report",
+            icon="📋",
+            style="secondary",
+            command=lambda: self._copy_process_summary(self.watchdog_results),
+            font=FONT_SMALL,
+            padx=6,
+            pady=3,
+        )
+        copy_summary_btn.pack(side=tk.LEFT, padx=(0, 4))
 
         ai_btn = create_styled_button(
             input_bar,
@@ -1829,7 +2014,7 @@ class PacketSentinelDesktopApp:
             style="accent",
             command=self._analyze_process_with_ai,
             font=FONT_BOLD,
-            padx=12,
+            padx=10,
             pady=3,
         )
         ai_btn.pack(side=tk.LEFT)
@@ -1841,7 +2026,7 @@ class PacketSentinelDesktopApp:
             font=("Consolas", 9),
             relief=tk.FLAT,
             wrap=tk.WORD,
-            height=4,
+            height=8,
             highlightbackground=BORDER_COLOR,
             highlightthickness=1,
             padx=8,
@@ -2044,6 +2229,238 @@ class PacketSentinelDesktopApp:
         logger.warning(f"Async worker error: {message}")
 
 
+    def _resolve_target_process_and_pid(self, raw_target: str) -> Tuple[Optional[int], str]:
+        """
+        Extract (PID, ProcessName) from any combobox string, PID string, or process name.
+        Handles entries like:
+        - "🚨 [SUSPICIOUS] curl.exe (PID 9120) -> sketchy-canary.example.com"
+        - "🌐 python.exe (PID 1234) - TCP :8000 -> 127.0.0.1:8000"
+        - "⚡ powershell.exe (PID 4312)"
+        - "1234"
+        - "python.exe"
+        """
+        raw = raw_target.strip()
+        if not raw:
+            return None, ""
+
+        import re
+        pid_match = re.search(r"\(?PID[:\s]*(\d+)\)?", raw, re.IGNORECASE)
+        target_pid = int(pid_match.group(1)) if pid_match else None
+
+        if target_pid is None and raw.isdigit():
+            target_pid = int(raw)
+
+        clean = raw
+        clean = re.sub(r"^.*?\[(?:SUSPICIOUS|ALERT)\]\s*", "", clean, flags=re.IGNORECASE)
+        clean = re.sub(r"^[^\w]+", "", clean)
+        clean = re.split(r"\s+-\s+|\s+->\s+", clean)[0].strip()
+        clean = re.sub(r"\s*\(?PID[:\s]*\d+\)?\s*", "", clean, flags=re.IGNORECASE).strip()
+
+        if target_pid is not None and not clean:
+            try:
+                import psutil
+                clean = psutil.Process(target_pid).name()
+            except Exception:
+                clean = f"PID-{target_pid}"
+
+        return target_pid, clean
+
+    def _generate_process_telemetry_summary(self, target_pid: Optional[int], target_name: str) -> str:
+        """
+        Produce a comprehensive, sanitized summary of the process:
+        - Execution status, CPU, RAM RSS
+        - Executable path & command-line
+        - Open sockets and ports (protocol, local vs remote IP, port, socket state)
+        - Wire packet telemetry & threat alert matches
+        - Child process tree lineage & LOLBIN checks
+        Scrubbed via 5-Gate DLP to guarantee zero machine-binding leaks.
+        """
+        import psutil
+        from .process_watchdog import find_processes_by_name
+
+        proc: Optional[psutil.Process] = None
+        resolved_pid = target_pid
+        resolved_name = target_name
+
+        if resolved_pid is not None:
+            try:
+                p = psutil.Process(resolved_pid)
+                proc = p
+                resolved_name = p.name()
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                proc = None
+
+        if proc is None and resolved_name:
+            matches = find_processes_by_name(resolved_name)
+            if matches:
+                resolved_pid = matches[0][0]
+                try:
+                    proc = psutil.Process(resolved_pid)
+                    resolved_name = proc.name()
+                except (psutil.NoSuchProcess, psutil.AccessDenied):
+                    proc = None
+
+        display_name = resolved_name or (f"PID {resolved_pid}" if resolved_pid else "Unknown")
+        lines: List[str] = [
+            "=" * 68,
+            "  PROCESS & NETWORK SOCKET TELEMETRY INSPECTION REPORT",
+            "=" * 68,
+        ]
+
+        if proc is not None and resolved_pid is not None:
+            try:
+                status_str = proc.status().upper()
+            except Exception:
+                status_str = "ACTIVE"
+            try:
+                cpu_str = f"{proc.cpu_percent(interval=None):.1f}%"
+            except Exception:
+                cpu_str = "N/A"
+            try:
+                mem_str = f"{proc.memory_info().rss / (1024 * 1024):.1f} MB"
+            except Exception:
+                mem_str = "N/A"
+            try:
+                raw_exe = proc.exe() or "N/A"
+            except Exception:
+                raw_exe = "N/A"
+            try:
+                raw_cmd = " ".join(proc.cmdline() or []) or "(No command-line arguments recorded)"
+            except Exception:
+                raw_cmd = "N/A"
+
+            lines.append(f"  * Process:      {display_name} (PID {resolved_pid})")
+            lines.append(f"  * Status:       {status_str} (CPU: {cpu_str}, Memory: {mem_str})")
+            lines.append(f"  * Executable:   {raw_exe}")
+            lines.append(f"  * Command Line: {raw_cmd}")
+        else:
+            lines.append(f"  * Process:      {display_name} (PID: {resolved_pid or 'N/A'})")
+            lines.append("  * Status:       TERMINATED / INACTIVE (Process has exited memory)")
+            lines.append("  * Executable:   (Historic network event attribution)")
+            lines.append("  * Command Line: (Process terminated; socket logged during execution)")
+
+        lines.append("")
+        lines.append("[1] Active Network Sockets & Port Bindings:")
+        sockets_found = False
+        if proc is not None and resolved_pid is not None:
+            raw_conns = []
+            try:
+                import warnings
+                with warnings.catch_warnings():
+                    warnings.simplefilter("ignore", DeprecationWarning)
+                    if hasattr(proc, "net_connections"):
+                        raw_conns = proc.net_connections(kind="inet")
+                    else:
+                        raw_conns = proc.connections(kind="inet")
+            except (psutil.AccessDenied, OSError, Exception):
+                try:
+                    raw_conns = [c for c in psutil.net_connections(kind="inet") if c.pid == resolved_pid]
+                except Exception:
+                    raw_conns = []
+
+            for conn in raw_conns:
+                sockets_found = True
+                proto = "TCP" if getattr(conn, "type", 1) == 1 else "UDP"
+                laddr_str = f":{conn.laddr.port}" if hasattr(conn, "laddr") and conn.laddr else ":0"
+                if hasattr(conn, "laddr") and conn.laddr and conn.laddr.ip:
+                    laddr_str = f"{conn.laddr.ip}:{conn.laddr.port}"
+
+                if hasattr(conn, "raddr") and conn.raddr and len(conn.raddr) >= 2:
+                    rip = str(conn.raddr[0])
+                    rport = conn.raddr[1]
+                    if rip in ("127.0.0.1", "::1", "0.0.0.0"):
+                        scope = "Local Loopback"
+                    elif is_public_routable_ip(rip):
+                        scope = "Public WAN"
+                    else:
+                        scope = "Private LAN"
+                    raddr_str = f"{rip}:{rport} [{scope}]"
+                else:
+                    raddr_str = "Listening (No remote endpoint)"
+
+                state_str = getattr(conn, "status", "OPEN")
+                lines.append(f"  - {proto:<4} Local {laddr_str:<21} --> Remote {raddr_str} ({state_str})")
+
+        if not sockets_found:
+            lines.append("  - No active open socket connections detected for this process.")
+
+        lines.append("")
+        lines.append("[2] Telemetry & Threat Feeds:")
+        event_count = 0
+        if hasattr(self, "_monitor_service"):
+            event_count = self._monitor_service.get_process_event_count(display_name, resolved_pid)
+        lines.append(f"  * Wire Packets Attributed: {event_count:,} events inspected")
+
+        matched_alerts = []
+        if hasattr(self, "_monitor_service"):
+            for alert in self._monitor_service.recent_alerts(limit=50):
+                p_alert = alert.process_name.lower()
+                d_name = display_name.lower()
+                if (d_name in p_alert) or (resolved_pid and str(resolved_pid) in p_alert):
+                    matched_alerts.append(alert)
+
+        if matched_alerts:
+            lines.append(f"  * Threat Alerts Triggered: {len(matched_alerts)} alert(s) in audit log:")
+            for a in matched_alerts[:5]:
+                lines.append(f"    - 🚨 Flagged Target: {a.indicator} [Feed: {a.source_feed}, Layer: {a.detection_layer}]")
+        else:
+            lines.append("  * Threat Alerts Triggered: 0 active threat matches in recent log.")
+
+        lines.append("")
+        lines.append("[3] Child Process Lineage & LOLBIN Analysis:")
+        children = []
+        if resolved_pid is not None:
+            children = inspect_child_lineage(resolved_pid)
+
+        lines.append(f"  * Active Child Processes: {len(children)}")
+        for c in children:
+            tag = "[SCRIPT INTERPRETER - HIGH RISK]" if c.is_script_interpreter else "[NORMAL CHILD]"
+            lines.append(f"    - Child PID {c.child_pid}: {c.child_name} {tag}")
+            if c.cmdline:
+                lines.append(f"      Cmdline: {c.cmdline}")
+        if not children:
+            lines.append("    - No spawned child script interpreters detected.")
+
+        lines.append("")
+        lines.append("=" * 68)
+        lines.append("[PRIVACY GUARANTEE] Local usernames, home paths, and MAC addresses")
+        lines.append("are sanitized via 5-Gate DLP before display and export.")
+        lines.append("=" * 68)
+
+        full_raw_report = "\n".join(lines)
+        return sanitize_log_text(full_raw_report, sanitizer=self.sanitizer)
+
+    def _inspect_process_target(self, target: str, result_widget: tk.Text) -> None:
+        """Unified runner for process and socket inspection across all views."""
+        if not target.strip():
+            return
+        result_widget.delete("1.0", tk.END)
+        result_widget.insert(tk.END, f"[*] Querying active sockets & telemetry for '{target}'...\n\n")
+        self.root.update_idletasks()
+
+        pid, name = self._resolve_target_process_and_pid(target)
+        summary = self._generate_process_telemetry_summary(pid, name)
+        result_widget.delete("1.0", tk.END)
+        result_widget.insert(tk.END, summary)
+        result_widget.see("1.0")
+
+    def _copy_process_summary(self, result_widget: tk.Text) -> None:
+        """Copy the sanitized process inspection report to the system clipboard."""
+        text = result_widget.get("1.0", tk.END).strip()
+        if not text:
+            return
+        safe_text = sanitize_log_text(text, sanitizer=self.sanitizer)
+        try:
+            self.root.clipboard_clear()
+            self.root.clipboard_append(safe_text)
+            messagebox.showinfo(
+                "Report Copied",
+                "Sanitized process telemetry report copied to clipboard!\n"
+                "Safe to paste in GitHub Issues, Discord, or internal incident tickets.",
+            )
+        except Exception as exc:
+            logger.debug(f"Clipboard copy error: {exc}")
+
     def _inspect_watchdog_target(self) -> None:
         target = ""
         if hasattr(self, "proc_entry"):
@@ -2051,31 +2468,76 @@ class PacketSentinelDesktopApp:
         if not target and hasattr(self, "proc_combo"):
             target = self.proc_combo.get().strip()
         if not target:
+            target = "python.exe"
+        if hasattr(self, "watchdog_results"):
+            self._inspect_process_target(target, self.watchdog_results)
+
+    def _inspect_mc_watchdog(self) -> None:
+        target = self.mc_proc_combo.get().strip() if hasattr(self, "mc_proc_combo") else "python.exe"
+        if not target:
+            target = "python.exe"
+        if hasattr(self, "mc_watchdog_results"):
+            self._inspect_process_target(target, self.mc_watchdog_results)
+
+    def _on_alert_tree_select(self, event: Optional[tk.Event] = None) -> None:
+        """Handle row selection in the Live Monitor alerts table."""
+        if not hasattr(self, "alert_tree"):
             return
-        from .process_watchdog import find_processes_by_name
+        selected = self.alert_tree.selection()
+        if not selected:
+            return
+        item_vals = self.alert_tree.item(selected[0], "values")
+        if len(item_vals) >= 4:
+            ind = item_vals[1]
+            pname = item_vals[3] or "Unknown"
+            combo_val = f"🚨 [SUSPICIOUS] {pname} -> {ind}"
+            if hasattr(self, "proc_combo"):
+                vals = list(self.proc_combo["values"])
+                if combo_val not in vals:
+                    vals.insert(0, combo_val)
+                    self.proc_combo["values"] = vals
+                self.proc_combo.set(combo_val)
+                self._inspect_watchdog_target()
 
-        self.watchdog_results.delete("1.0", tk.END)
-        self.watchdog_results.insert(tk.END, f"[*] Querying active processes matching '{target}'...\n\n")
+    def _on_mc_alert_tree_select(self, event: Optional[tk.Event] = None) -> None:
+        """Handle row selection in the Mission Control alerts table."""
+        if not hasattr(self, "mc_alert_tree"):
+            return
+        selected = self.mc_alert_tree.selection()
+        if not selected:
+            return
+        item_vals = self.mc_alert_tree.item(selected[0], "values")
+        if len(item_vals) >= 4:
+            ind = item_vals[1]
+            pname = item_vals[3] or "Unknown"
+            combo_val = f"🚨 [SUSPICIOUS] {pname} -> {ind}"
+            if hasattr(self, "mc_proc_combo"):
+                vals = list(self.mc_proc_combo["values"])
+                if combo_val not in vals:
+                    vals.insert(0, combo_val)
+                    self.mc_proc_combo["values"] = vals
+                self.mc_proc_combo.set(combo_val)
+                self._inspect_mc_watchdog()
 
-        target_pid = int(target) if target.isdigit() else None
-        matches = []
-        if target_pid is None:
-            matches = find_processes_by_name(target)
-            if not matches:
-                self.watchdog_results.insert(tk.END, f"[!] No active processes found matching '{target}'.\n")
-                return
-            target_pid = matches[0][0]
+    def _inspect_selected_alert_in_monitor(self) -> None:
+        """Explicit button action to inspect selected alert in Live Threat Monitor."""
+        if hasattr(self, "alert_tree"):
+            sel = self.alert_tree.selection()
+            if not sel:
+                children = self.alert_tree.get_children()
+                if children:
+                    self.alert_tree.selection_set(children[0])
+            self._on_alert_tree_select()
 
-        children = inspect_child_lineage(target_pid)
-        self.watchdog_results.insert(tk.END, f"[+] Target PID: {target_pid} | Active Children: {len(children)}\n")
-        for c in children:
-            tag = "[SCRIPT INTERPRETER - HIGH RISK]" if c.is_script_interpreter else "[NORMAL CHILD]"
-            self.watchdog_results.insert(
-                tk.END,
-                f"    - Child PID {c.child_pid}: {c.child_name} {tag}\n      Cmdline: {c.cmdline}\n",
-            )
-        if not children:
-            self.watchdog_results.insert(tk.END, "    - No spawned child script interpreters detected.\n")
+    def _inspect_selected_alert_in_mc(self) -> None:
+        """Explicit button action to inspect selected alert in Mission Control."""
+        if hasattr(self, "mc_alert_tree"):
+            sel = self.mc_alert_tree.selection()
+            if not sel:
+                children = self.mc_alert_tree.get_children()
+                if children:
+                    self.mc_alert_tree.selection_set(children[0])
+            self._on_mc_alert_tree_select()
 
     def _on_space_pressed(self, event: tk.Event) -> None:
         if isinstance(event.widget, (tk.Entry, tk.Text, ttk.Entry, ttk.Combobox)):
@@ -2083,21 +2545,64 @@ class PacketSentinelDesktopApp:
         self._toggle_voice_recording()
 
     def _get_running_process_candidates(self) -> List[str]:
-        candidates: Set[str] = set()
+        candidates: List[str] = []
+        seen_keys: Set[str] = set()
+
+        # 1. Suspicious indicators from recent alerts
+        if hasattr(self, "_monitor_service"):
+            try:
+                alerts = self._monitor_service.recent_alerts(limit=15)
+                for alert in alerts:
+                    p_raw = alert.process_name or "Unknown"
+                    ind = alert.indicator or "Unknown"
+                    item = f"🚨 [SUSPICIOUS] {p_raw} -> {ind}"
+                    if item not in seen_keys:
+                        seen_keys.add(item)
+                        candidates.append(item)
+            except Exception:
+                pass
+
+        # 2. Active outbound socket connections
+        if hasattr(self, "_monitor_service"):
+            try:
+                active_conns = self._monitor_service._monitor._process_mapper.get_active_outbound_connections()
+                for proto, lport, rip, rport, pinfo in active_conns[:15]:
+                    item = f"🌐 {pinfo.name} (PID {pinfo.pid}) - {proto.upper()} :{lport} -> {rip}:{rport}"
+                    if item not in seen_keys:
+                        seen_keys.add(item)
+                        candidates.append(item)
+            except Exception:
+                pass
+
+        # 3. Active running processes with PID
+        running_names: Set[str] = set()
         try:
             import psutil
-            for p in psutil.process_iter(["name"]):
+            for p in psutil.process_iter(["pid", "name"]):
                 try:
                     name = p.info.get("name")
-                    if name and not name.startswith("System") and name != "Registry":
-                        candidates.add(name)
+                    pid = p.info.get("pid")
+                    if name and pid and not name.startswith("System") and name != "Registry":
+                        running_names.add(name)
+                        name_lower = name.lower()
+                        if any(k in name_lower for k in ("python", "node", "powershell", "cmd", "code", "curl", "git", "bash")):
+                            item = f"⚡ {name} (PID {pid})"
+                            if item not in seen_keys:
+                                seen_keys.add(item)
+                                candidates.append(item)
                 except (psutil.NoSuchProcess, psutil.AccessDenied):
                     continue
         except Exception as exc:
             logger.debug(f"Error enumerating running processes: {exc}")
-        if not candidates:
-            candidates.update(["python.exe", "node.exe", "powershell.exe", "cmd.exe", "code.exe", "curl.exe"])
-        return sorted(candidates, key=lambda s: s.lower())
+
+        # 4. Alphabetical process names as simple typing fallback
+        fallback_names = sorted(running_names) if running_names else ["python.exe", "node.exe", "powershell.exe", "cmd.exe", "code.exe", "curl.exe"]
+        for fn in fallback_names:
+            if fn not in seen_keys:
+                seen_keys.add(fn)
+                candidates.append(fn)
+
+        return candidates
 
     def _refresh_process_lists(self) -> None:
         candidates = self._get_running_process_candidates()
@@ -2106,42 +2611,19 @@ class PacketSentinelDesktopApp:
             self.mc_proc_combo["values"] = candidates
             if current in candidates:
                 self.mc_proc_combo.set(current)
-            elif "python.exe" in candidates:
-                self.mc_proc_combo.set("python.exe")
             elif candidates:
                 self.mc_proc_combo.set(candidates[0])
+            else:
+                self.mc_proc_combo.set("python.exe")
         if hasattr(self, "proc_combo"):
             current = self.proc_combo.get()
             self.proc_combo["values"] = candidates
             if current in candidates:
                 self.proc_combo.set(current)
-            elif "python.exe" in candidates:
-                self.proc_combo.set("python.exe")
             elif candidates:
                 self.proc_combo.set(candidates[0])
-
-    def _inspect_mc_watchdog(self) -> None:
-        target = self.mc_proc_combo.get().strip() if hasattr(self, "mc_proc_combo") else "python"
-        if not target:
-            return
-        from .process_watchdog import find_processes_by_name
-        self.mc_watchdog_results.delete("1.0", tk.END)
-        self.mc_watchdog_results.insert(tk.END, f"[*] Querying processes matching '{target}'...\n")
-        target_pid = int(target) if target.isdigit() else None
-        matches = []
-        if target_pid is None:
-            matches = find_processes_by_name(target)
-            if not matches:
-                self.mc_watchdog_results.insert(tk.END, f"[!] No active processes found matching '{target}'.\n")
-                return
-            target_pid = matches[0][0]
-        children = inspect_child_lineage(target_pid)
-        self.mc_watchdog_results.insert(tk.END, f"[+] Target PID: {target_pid} | Active Children: {len(children)}\n")
-        for c in children:
-            tag = "[SCRIPT INTERPRETER - HIGH RISK]" if c.is_script_interpreter else "[CHILD]"
-            self.mc_watchdog_results.insert(tk.END, f"  - PID {c.child_pid}: {c.child_name} {tag}\n")
-        if not children:
-            self.mc_watchdog_results.insert(tk.END, "  - No spawned child script interpreters detected.\n")
+            else:
+                self.proc_combo.set("python.exe")
 
     def _quick_scrub_prompt(self) -> None:
         text = self.mc_quick_prompt_entry.get().strip() if hasattr(self, "mc_quick_prompt_entry") else ""
@@ -2169,13 +2651,30 @@ class PacketSentinelDesktopApp:
         if not target:
             target = "python"
 
-        from .process_watchdog import find_processes_by_name, check_lots_risk
-        matches = find_processes_by_name(target)
-        if not matches:
+        pid, name = self._resolve_target_process_and_pid(target)
+        from .process_watchdog import check_lots_risk, find_processes_by_name
+
+        exe = ""
+        if pid is not None:
+            try:
+                import psutil
+                p = psutil.Process(pid)
+                name = p.name()
+                try:
+                    exe = p.exe()
+                except Exception:
+                    exe = name
+            except Exception:
+                pass
+        if not exe and name:
+            matches = find_processes_by_name(name)
+            if matches:
+                pid, name, exe = matches[0]
+
+        if pid is None:
             messagebox.showinfo("Process Not Found", f"No running processes matching '{target}' were found.")
             return
 
-        pid, name, exe = matches[0]
         children = inspect_child_lineage(pid)
         lots_res = check_lots_risk(name, [c.cmdline for c in children if c.cmdline])
 
@@ -2224,6 +2723,12 @@ class PacketSentinelDesktopApp:
             f"Copied to clipboard. You can ask your AI: 'Review the latest process safety report'.",
         )
 
+    def _inspect_selected_alert_in_mc(self) -> None:
+        self._show_threat_explanation()
+
+    def _inspect_selected_alert_in_monitor(self) -> None:
+        self._show_threat_explanation()
+
     def _show_threat_explanation(self, alert_values: Optional[Tuple] = None) -> None:
         if not alert_values:
             if hasattr(self, "mc_alert_tree"):
@@ -2245,9 +2750,11 @@ class PacketSentinelDesktopApp:
         ts, indicator, feed, proc, layer = alert_values[:5]
 
         feed_explanations = {
+            "OISD": "OISD DNS protection blocklist filtering known telemetry, malicious domains, and compromised redirect hosts.",
             "URLhaus": "Active malware distribution URL tracked by abuse.ch. Known to distribute Trojans, Infostealers, or Ransomware payloads.",
             "ThreatFox": "Indicator of Compromise (IoC) linked to active malware campaigns, botnets, or Command-and-Control (C2) operations.",
             "Feodo Tracker": "Botnet Command-and-Control (C2) server used to coordinate compromised botnet drones and exfiltrate credentials.",
+            "HaGeZi Multi": "High-security DNS threat protection filter blocking malicious tracking, telemetry, spyware, and suspicious domains.",
             "HaGeZi Multi PRO": "High-security DNS threat protection filter blocking malicious tracking, telemetry, spyware, and suspicious domains.",
             "Phishing Army": "Active phishing domain targeting credential harvesting and identity fraud.",
             "StevenBlack": "Consolidated hosts threat intelligence blocking malicious domains, trackers, and telemetry.",
@@ -2873,7 +3380,7 @@ class PacketSentinelDesktopApp:
                 ("h1", "Living-off-the-Land (LOTS / LOLBIN) Defense:"),
                 ("body", "Attackers and rogue scripts often use legitimate Windows utilities (powershell.exe, curl.exe, bitsadmin.exe, certutil.exe) to silently exfiltrate stolen credentials. SentinelWire traces every outbound network connection back to its originating process and warns when an interpreter makes unexpected connections."),
                 ("h1", "Multi-Feed Offline Threat Intel:"),
-                ("body", "Evaluates IP and domain destinations against built-in ThreatFox, URLhaus, and custom threat feeds stored completely locally."),
+                ("body", "Evaluates IP and domain destinations against built-in OISD, HaGeZi, Feodo Tracker, and custom threat feeds stored completely locally."),
             ],
             "mcp": [
                 ("title", "🤖 AI MCP TOOLS REFERENCE (MODEL CONTEXT PROTOCOL)"),

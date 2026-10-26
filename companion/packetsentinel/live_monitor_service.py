@@ -121,6 +121,10 @@ class LiveMonitorService:
     def recent_alerts(self, limit: int = 50) -> List[AlertRow]:
         return read_recent_alerts(self.alerts_file, limit)
 
+    def get_process_event_count(self, process_name: str, pid: Optional[int] = None) -> int:
+        """Return total wire events inspected and attributed to this process/PID."""
+        return self._monitor.get_process_event_count(process_name, pid)
+
 
 def read_recent_alerts(alerts_file: Path, limit: int = 50) -> List[AlertRow]:
     """Return the newest alerts first, reading at most ALERT_TAIL_BYTES from disk."""

@@ -19,54 +19,74 @@ class ThreatFeedSource:
     name: str
     url: str
     category: str
+    fallback_urls: tuple[str, ...] = ()
+    timeout_seconds: float = 15.0
     enabled_by_default: bool = True
 
 
 DEFAULT_THREAT_FEEDS: tuple[ThreatFeedSource, ...] = (
     ThreatFeedSource(
-        name="URLhaus Active Malware Distribution (abuse.ch)",
-        url="https://urlhaus.abuse.ch/downloads/hostfile/",
+        name="OISD Small DNS Protection Feed",
+        url="https://small.oisd.nl",
         category="malware_domain",
+        fallback_urls=("https://raw.githubusercontent.com/sjhgvr/oisd/main/hosts_small.txt",),
+        timeout_seconds=12.0,
     ),
     ThreatFeedSource(
-        name="ThreatFox Recent Malware Indicators (abuse.ch)",
-        url="https://threatfox.abuse.ch/downloads/hostfile/",
+        name="HaGeZi Multi LIGHT Threat Intelligence (High-Security DNS)",
+        url="https://raw.githubusercontent.com/hagezi/dns-blocklists/main/hosts/light.txt",
         category="malware_domain",
+        fallback_urls=("https://raw.githubusercontent.com/hagezi/dns-blocklists/main/hosts/pro.txt",),
+        timeout_seconds=15.0,
     ),
     ThreatFeedSource(
         name="Abuse.ch Feodo Tracker (Botnet C2 IPs)",
         url="https://feodotracker.abuse.ch/downloads/ipblocklist_recommended.txt",
         category="botnet_c2_ip",
+        fallback_urls=("https://feodotracker.abuse.ch/downloads/ipblocklist.txt",),
+        timeout_seconds=15.0,
     ),
     ThreatFeedSource(
         name="HaGeZi Multi PRO Threat Intelligence (High-Security DNS)",
         url="https://raw.githubusercontent.com/hagezi/dns-blocklists/main/hosts/pro.txt",
         category="malware_domain",
+        fallback_urls=("https://raw.githubusercontent.com/hagezi/dns-blocklists/main/hosts/light.txt",),
+        timeout_seconds=20.0,
     ),
     ThreatFeedSource(
         name="StevenBlack Unified Hosts (Sketchy/Malware/Trackers)",
         url="https://raw.githubusercontent.com/StevenBlack/hosts/master/hosts",
         category="sketchy_dns",
+        fallback_urls=(),
+        timeout_seconds=20.0,
     ),
     ThreatFeedSource(
         name="Phishing Army Extended Community Feed",
         url="https://phishing.army/download/phishing_army_blocklist_extended.txt",
         category="phishing_domain",
+        fallback_urls=("https://phishing.army/download/phishing_army_blocklist.txt",),
+        timeout_seconds=15.0,
     ),
     ThreatFeedSource(
         name="DandelionSprout Anti-Malware Hosts (GitHub)",
         url="https://raw.githubusercontent.com/DandelionSprout/adfilt/master/Alternate%20versions%20Anti-Malware%20List/AntiMalwareHosts.txt",
         category="malware_domain",
+        fallback_urls=(),
+        timeout_seconds=15.0,
     ),
     ThreatFeedSource(
         name="Prigent Malware & Cryptojacking Domains",
         url="https://v.firebog.net/hosts/Prigent-Crypto.txt",
         category="malware_domain",
+        fallback_urls=(),
+        timeout_seconds=15.0,
     ),
     ThreatFeedSource(
-        name="OpenPhish GitHub Community Feed (Phishing Domains)",
+        name="OpenPhish Community Feed (Phishing Domains)",
         url="https://raw.githubusercontent.com/openphish/public_feed/refs/heads/main/feed.txt",
         category="phishing_domain",
+        fallback_urls=("https://openphish.com/feed.txt",),
+        timeout_seconds=15.0,
     ),
 )
 
@@ -107,6 +127,8 @@ SAFE_ALLOWLIST_DOMAINS: frozenset[str] = frozenset(
         "feodotracker.abuse.ch",
         "abuse.ch",
         "phishing.army",
+        "oisd.nl",
+        "small.oisd.nl",
         "microsoft.com",
         "windows.com",
         "windowsupdate.com",
