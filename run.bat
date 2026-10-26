@@ -1,7 +1,7 @@
 @echo off
 @chcp 65001 >nul
 setlocal enabledelayedexpansion
-title PacketSentinel Desktop Launcher
+title SentinelWire Desktop Launcher
 
 :: -----------------------------------------------------------------------------
 :: Python Auto-Detection (Finds conda, venv, or standard Windows Python)
@@ -72,49 +72,30 @@ if not "%~1"=="" (
 :menu
 cls
 echo ======================================================================
-echo   PacketSentinel - Offline Micro-EDR ^& Pre-Model Privacy Airlock
+echo   SentinelWire - Zero-Outbound Micro-EDR ^& Privacy Airlock
 echo ======================================================================
 echo.
-echo   [1] Launch Native Desktop App (--ui)
-echo   [2] Start Live Packet Monitor (CLI)
-echo   [3] Target Process Watchdog (--watch-process)
-echo   [4] Run Security Audit ^& Verification (54 Tests)
-echo   [5] EMERGENCY KILL SWITCH (Stop All Background Listeners)
-echo   [6] Exit
+echo   [1] Launch SentinelWire Desktop App (Recommended)
+echo       - Includes Offline Voice AI, 5-Gate DLP Scrubber ^& Live Wire Guard
+echo.
+echo   [2] Emergency Kill Switch (Stop All Background Listeners)
+echo   [3] Run Security ^& Dependency Audit (53 Tests)
+echo   [4] Exit
 echo.
 echo   [Python detected: %PYTHON_EXE%]
 echo ======================================================================
-set /p choice="Select an option (1-6) [default: 1]: "
-
-if "%choice%"=="" set choice=1
-if "%choice%"=="1" goto launch_ui
-if "%choice%"=="2" goto launch_monitor
-if "%choice%"=="3" goto launch_watchdog
-if "%choice%"=="4" goto run_audit
-if "%choice%"=="5" goto kill_switch
-if "%choice%"=="6" goto :eof
+choice /c 1234 /t 3 /d 1 /m "Select option (1-4) [Auto-launching Option 1 in 3s]"
+if errorlevel 4 goto :eof
+if errorlevel 3 goto run_audit
+if errorlevel 2 goto kill_switch
+if errorlevel 1 goto launch_ui
 goto menu
 
 :launch_ui
 echo.
-echo [*] Launching Native Desktop Security ^& Privacy Airlock...
+echo [*] Launching SentinelWire Desktop Security ^& Privacy Airlock...
 "%PYTHON_EXE%" "%~dp0companion\run_packetsentinel.py" --ui
-pause
-goto menu
-
-:launch_monitor
-echo.
-echo [*] Starting live packet capture...
-"%PYTHON_EXE%" "%~dp0companion\run_packetsentinel.py"
-pause
-goto menu
-
-:launch_watchdog
-echo.
-set /p proc="Enter process name or PID to watch (e.g. python or 1234): "
-"%PYTHON_EXE%" "%~dp0companion\run_packetsentinel.py" --watch-process "%proc%"
-pause
-goto menu
+goto :eof
 
 :run_audit
 echo.

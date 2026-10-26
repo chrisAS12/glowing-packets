@@ -23,13 +23,13 @@ class ThreatFeedSource:
 
 DEFAULT_THREAT_FEEDS: tuple[ThreatFeedSource, ...] = (
     ThreatFeedSource(
-        name="DandelionSprout Anti-Malware Hosts (GitHub)",
-        url="https://raw.githubusercontent.com/DandelionSprout/adfilt/master/Alternate%20versions%20Anti-Malware%20List/AntiMalwareHosts.txt",
+        name="URLhaus Active Malware Distribution (abuse.ch)",
+        url="https://urlhaus.abuse.ch/downloads/hostfile/",
         category="malware_domain",
     ),
     ThreatFeedSource(
-        name="Prigent Malware & Cryptojacking Domains",
-        url="https://v.firebog.net/hosts/Prigent-Crypto.txt",
+        name="ThreatFox Recent Malware Indicators (abuse.ch)",
+        url="https://threatfox.abuse.ch/downloads/hostfile/",
         category="malware_domain",
     ),
     ThreatFeedSource(
@@ -38,9 +38,29 @@ DEFAULT_THREAT_FEEDS: tuple[ThreatFeedSource, ...] = (
         category="botnet_c2_ip",
     ),
     ThreatFeedSource(
+        name="HaGeZi Multi PRO Threat Intelligence (High-Security DNS)",
+        url="https://raw.githubusercontent.com/hagezi/dns-blocklists/main/hosts/pro.txt",
+        category="malware_domain",
+    ),
+    ThreatFeedSource(
         name="StevenBlack Unified Hosts (Sketchy/Malware/Trackers)",
         url="https://raw.githubusercontent.com/StevenBlack/hosts/master/hosts",
         category="sketchy_dns",
+    ),
+    ThreatFeedSource(
+        name="Phishing Army Extended Community Feed",
+        url="https://phishing.army/download/phishing_army_blocklist_extended.txt",
+        category="phishing_domain",
+    ),
+    ThreatFeedSource(
+        name="DandelionSprout Anti-Malware Hosts (GitHub)",
+        url="https://raw.githubusercontent.com/DandelionSprout/adfilt/master/Alternate%20versions%20Anti-Malware%20List/AntiMalwareHosts.txt",
+        category="malware_domain",
+    ),
+    ThreatFeedSource(
+        name="Prigent Malware & Cryptojacking Domains",
+        url="https://v.firebog.net/hosts/Prigent-Crypto.txt",
+        category="malware_domain",
     ),
     ThreatFeedSource(
         name="OpenPhish GitHub Community Feed (Phishing Domains)",
@@ -55,11 +75,14 @@ DEFAULT_TRUSTED_FEED_HOSTS: Set[str] = {
     "raw.githubusercontent.com",
     "gist.githubusercontent.com",
     "urlhaus.abuse.ch",
+    "threatfox.abuse.ch",
     "feodotracker.abuse.ch",
     "sslbl.abuse.ch",
     "openphish.com",
     "phishing.army",
     "v.firebog.net",
+    "small.oisd.nl",
+    "oisd.nl",
 }
 
 # Core OS, DNS, and repo hosts are pinned here so a poisoned upstream community feed
@@ -79,8 +102,10 @@ SAFE_ALLOWLIST_DOMAINS: frozenset[str] = frozenset(
         "gist.githubusercontent.com",
         "objects.githubusercontent.com",
         "urlhaus.abuse.ch",
+        "threatfox.abuse.ch",
         "feodotracker.abuse.ch",
         "abuse.ch",
+        "phishing.army",
         "microsoft.com",
         "windows.com",
         "windowsupdate.com",
