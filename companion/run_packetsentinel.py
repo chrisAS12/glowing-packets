@@ -5,8 +5,12 @@ Standalone launcher for PacketSentinel (used both directly from Python and as Py
 
 from __future__ import annotations
 
+import os
 import sys
 from pathlib import Path
+
+# Prevent fatal OpenMP runtime collision on Windows (Anaconda + CTranslate2/faster-whisper)
+os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
 
 # Ensure companion/ directory is always on sys.path regardless of CWD
 COMPANION_DIR = Path(__file__).resolve().parent

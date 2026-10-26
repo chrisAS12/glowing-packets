@@ -10,9 +10,13 @@ downloading or falling back to a cloud recognizer.
 from __future__ import annotations
 
 import importlib.util
+import os
 import sys
 import threading
 import time
+
+# Prevent fatal OpenMP runtime collision on Windows (Anaconda + CTranslate2/faster-whisper)
+os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, List, Optional

@@ -18,6 +18,9 @@ import json
 import logging
 import os
 import platform
+
+# Prevent fatal OpenMP runtime collision on Windows (Anaconda + CTranslate2/faster-whisper)
+os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
 import subprocess
 import threading
 import time
