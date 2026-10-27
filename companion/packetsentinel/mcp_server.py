@@ -24,6 +24,8 @@ from .lots_guard import check_ai_package_safety
 from .mcp_privacy import PrivacySanitizer, audit_code_secrets, sanitize_prompt_injection
 from .security_auditor import audit_environment_security, audit_listening_ports, audit_network_hygiene
 from .threat_intel import ThreatIntelEngine
+from .vault import EncryptedVaultManager
+from .web_gateway import safe_fetch_web_content
 
 
 MCP_PROTOCOL_VERSION = "2024-11-05"
@@ -299,6 +301,33 @@ MCP_TOOLS_SCHEMA: List[Dict[str, Any]] = [
                     "maximum": 50,
                 },
             },
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "safe_fetch_web_content",
+        "description": (
+            "Safely fetch and inspect external web documentation or resources through SentinelWire's "
+            "Secure Web Gateway. Enforces SSRF defense (blocking private/loopback/cloud metadata), "
+            "95,000+ threat feed checks, outbound credential leak detection, binary executable "
+            "blocking, and Gate 6 indirect prompt injection neutralizer."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "url": {
+                    "type": "string",
+                    "description": "Target HTTPS URL to safely fetch and inspect.",
+                },
+                "max_bytes": {
+                    "type": "integer",
+                    "description": "Maximum payload size to retrieve in bytes (default 1,000,000).",
+                    "default": 1000000,
+                    "minimum": 1024,
+                    "maximum": 5000000,
+                },
+            },
+            "required": ["url"],
             "additionalProperties": False,
         },
     },
@@ -634,6 +663,26 @@ class PacketSentinelMCPServer:
         except Exception as exc:
             return {"status": "error", "reason": self._sanitizer.sanitize_text(str(exc))}
 
+    def tool_safe_fetch_web_content(self, url: str, max_bytes: int = 1_000_000) -> Dict[str, Any]:
+        """Safely fetch and inspect external web content through the Secure Web Gateway."""
+        t0 = time.perf_counter()
+        vault_settings = EncryptedVaultManager().load_settings()
+        res = safe_fetch_web_content(
+            url=url,
+            max_bytes=max_bytes,
+            threat_intel=self._threat_engine,
+            allow_gateway=vault_settings.enable_web_gateway,
+        )
+        duration_ms = (time.perf_counter() - t0) * 1000.0
+        self._log_mcp_audit(
+            tool_name="safe_fetch_web_content",
+            is_error=not res.success,
+            duration_ms=duration_ms,
+            dlp_blocked=res.threat_blocked,
+            details=f"status={res.status_code} bytes={res.content_length} threat_blocked={res.threat_blocked}",
+        )
+        return res.to_dict()
+
     def _log_mcp_audit(
         self,
         tool_name: str,
@@ -764,6 +813,11 @@ class PacketSentinelMCPServer:
                 elif tool_name == "get_mcp_audit_log":
                     payload = self.tool_get_mcp_audit_log(
                         limit=int(tool_args.get("limit", 20))
+                    )
+                elif tool_name == "safe_fetch_web_content":
+                    payload = self.tool_safe_fetch_web_content(
+                        url=str(tool_args.get("url", "")),
+                        max_bytes=int(tool_args.get("max_bytes", 1_000_000)),
                     )
                 else:
                     return {

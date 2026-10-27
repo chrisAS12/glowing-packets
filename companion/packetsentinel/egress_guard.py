@@ -15,8 +15,9 @@ import os
 import subprocess
 import sys
 import threading
+from contextlib import contextmanager
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import Iterator, List, Optional, Tuple
 
 
 _LOCKDOWN_LOCK = threading.Lock()
@@ -112,6 +113,23 @@ def engage_runtime_network_lockdown() -> None:
 
 def is_runtime_network_lockdown_active() -> bool:
     return _LOCKDOWN_ACTIVE
+
+
+@contextmanager
+def permit_inspected_gateway_egress() -> Iterator[None]:
+    """
+    Temporarily permit an inspected outbound HTTPS request from the Safe Web Gateway.
+    All other operations outside this guarded context remain blocked by PEP 578.
+    """
+    global _LOCKDOWN_ACTIVE
+    with _LOCKDOWN_LOCK:
+        was_active = _LOCKDOWN_ACTIVE
+        _LOCKDOWN_ACTIVE = False
+    try:
+        yield
+    finally:
+        with _LOCKDOWN_LOCK:
+            _LOCKDOWN_ACTIVE = was_active
 
 
 def find_verified_netsh() -> Optional[str]:

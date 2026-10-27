@@ -3664,6 +3664,27 @@ class PacketSentinelDesktopApp:
                 activeforeground=TEXT_TITLE,
             ).pack(anchor=tk.W, pady=2)
 
+        # Secure Web Gateway Toggle (Optional AI Web Pulls)
+        self.var_web_gateway = tk.BooleanVar(value=self.vault_settings.enable_web_gateway)
+        tk.Checkbutton(
+            s2,
+            text="🌐 Enable Secure Web Gateway MCP (safe_fetch_web_content for AI agents)",
+            variable=self.var_web_gateway,
+            font=("Segoe UI", 9, "bold"),
+            fg=BORDER_FOCUS if self.vault_settings.enable_web_gateway else TEXT_TITLE,
+            bg=BG_CARD,
+            selectcolor=BG_CANVAS,
+            activebackground=BG_CARD,
+            activeforeground=TEXT_TITLE,
+        ).pack(anchor=tk.W, pady=(8, 2))
+        tk.Label(
+            s2,
+            text="   Enforces SSRF defense, 95k threat feed checks, binary blocker, and prompt-injection stripping.",
+            font=("Segoe UI", 8),
+            fg=TEXT_MUTED,
+            bg=BG_CARD,
+        ).pack(anchor=tk.W, pady=(0, 2))
+
         # Section 3: Notification & Audio Alerts
         s3 = tk.Frame(scrollable_frame, bg=BG_CARD, padx=14, pady=12, highlightbackground=BORDER_COLOR, highlightthickness=1)
         s3.pack(fill=tk.X, pady=(0, 12))
@@ -3883,6 +3904,7 @@ class PacketSentinelDesktopApp:
             dlp_gate_usernames=self.var_gate_users.get(),
             dlp_gate_national_ids=self.var_gate_ids.get(),
             dlp_gate_ips=self.var_gate_ips.get(),
+            enable_web_gateway=self.var_web_gateway.get(),
         )
 
         ok = self.vault_mgr.save_settings(self.vault_settings)
