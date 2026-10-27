@@ -144,8 +144,14 @@ BLOCKED_PATH_SEGMENTS: frozenset[str] = frozenset(
         ".azure",
         ".gcloud",
         ".config/gcloud",
+        ".config/gh",
+        ".git",
         ".mozilla",
         ".thunderbird",
+        "google/chrome/user data",
+        "bravesoftware/brave-browser/user data",
+        "microsoft/edge/user data",
+        "psreadline",
     }
 )
 
@@ -156,6 +162,14 @@ BLOCKED_EXACT_FILENAMES: frozenset[str] = frozenset(
         ".pypirc",
         ".netrc",
         ".git-credentials",
+        ".bash_history",
+        ".zsh_history",
+        "consolehost_history.txt",
+        "hosts.yml",
+        "gh-hosts.yml",
+        "cookies.sqlite",
+        "login data",
+        "web data",
         "id_rsa",
         "id_ed25519",
         "id_ecdsa",
@@ -454,6 +468,180 @@ class SanitizedAlertSummary:
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
+
+
+# Gate 6: Indirect Prompt-Injection & Steganography Detection
+_ZERO_WIDTH_STEGANOGRAPHY_RE = re.compile(
+    r"[\u200B-\u200D\u200E\u200F\u202A-\u202E\u2060-\u2064\uFEFF]"
+)
+
+_PROMPT_INJECTION_OVERRIDE_RE = re.compile(
+    r"(?i)\b(?:ignore\s+(?:all\s+)?(?:previous|prior)\s+instructions"
+    r"|disregard\s+(?:all\s+)?(?:previous|prior)\s+(?:rules|guidelines|directives)"
+    r"|system\s+prompt\s+override"
+    r"|new\s+system\s+directive\s*:"
+    r"|you\s+are\s+now\s+(?:in\s+developer\s+mode|unrestricted|DAN)"
+    r"|bypass\s+(?:content|safety)\s+filters"
+    r")\b"
+)
+
+_CHAT_FRAME_OVERRIDE_RE = re.compile(
+    r"(?:\[/?(?:INST|SYS)\]|<\|im_start\|>|<\|im_end\|>|<!--\s*(?:system|instruction|prompt)\s*:.*?-->)"
+)
+
+
+@dataclass(frozen=True)
+class PromptInjectionScanResult:
+    """Represents Gate 6 prompt injection analysis result."""
+
+    is_injection_detected: bool
+    sanitized_text: str
+    reasons: List[str]
+    has_zero_width_steganography: bool
+
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
+
+
+def sanitize_prompt_injection(text: str) -> PromptInjectionScanResult:
+    """
+    Gate 6: Scan and sanitize indirect prompt injection, zero-width steganography,
+    and chat template framing overrides from text.
+    """
+    if not text or not isinstance(text, str):
+        return PromptInjectionScanResult(
+            is_injection_detected=False,
+            sanitized_text="",
+            reasons=[],
+            has_zero_width_steganography=False,
+        )
+
+    reasons: List[str] = []
+    has_bidi = bool(_ZERO_WIDTH_STEGANOGRAPHY_RE.search(text))
+    if has_bidi:
+        reasons.append("Hidden zero-width steganography / Unicode override characters detected and stripped.")
+
+    # 1. Strip zero-width and bidi override characters (invisible payload carriers)
+    cleaned = _ZERO_WIDTH_STEGANOGRAPHY_RE.sub("", text)
+
+    # 2. Check for direct prompt override directives
+    matches = _PROMPT_INJECTION_OVERRIDE_RE.findall(cleaned)
+    if matches:
+        reasons.append(f"Prompt injection directive detected: {', '.join(matches[:3])}")
+        cleaned = _PROMPT_INJECTION_OVERRIDE_RE.sub("[NEUTRALIZED_PROMPT_INJECTION_ATTEMPT]", cleaned)
+
+    # 3. Check for chat template frame hijacking
+    frame_matches = _CHAT_FRAME_OVERRIDE_RE.findall(cleaned)
+    if frame_matches:
+        reasons.append("Deceptive chat template framing / system tag smuggling detected.")
+        cleaned = _CHAT_FRAME_OVERRIDE_RE.sub("[NEUTRALIZED_CHAT_FRAME_OVERRIDE]", cleaned)
+
+    is_threat = len(reasons) > 0
+    return PromptInjectionScanResult(
+        is_injection_detected=is_threat,
+        sanitized_text=cleaned,
+        reasons=reasons,
+        has_zero_width_steganography=has_bidi,
+    )
+
+
+def audit_code_secrets(content: str) -> Dict[str, Any]:
+    """
+    Scan code diff or text for accidental secret leaks, uncommitted API keys,
+    private tokens, and private identifiers before git commit or AI ingestion.
+    Returns structured list of findings with line numbers and masked snippets.
+    """
+    if not content or not isinstance(content, str):
+        return {"has_secrets": False, "findings_count": 0, "findings": []}
+
+    findings: List[Dict[str, Any]] = []
+    lines = content.splitlines()
+
+    for line_idx, line in enumerate(lines, start=1):
+        # 1. API Keys
+        for m in _API_KEY_RE.finditer(line):
+            token = m.group(0)
+            masked = token[:4] + "..." + token[-4:] if len(token) > 8 else "***"
+            findings.append({
+                "line": line_idx,
+                "category": "API_KEY",
+                "severity": "HIGH",
+                "description": f"Exposed API key detected ({masked})",
+            })
+
+        # 2. GitHub Tokens
+        for m in _GITHUB_TOKEN_RE.finditer(line):
+            token = m.group(0)
+            masked = token[:4] + "..." + token[-4:] if len(token) > 8 else "***"
+            findings.append({
+                "line": line_idx,
+                "category": "GITHUB_TOKEN",
+                "severity": "CRITICAL",
+                "description": f"Exposed GitHub Personal Access Token detected ({masked})",
+            })
+
+        # 3. JWTs
+        for m in _JWT_RE.finditer(line):
+            findings.append({
+                "line": line_idx,
+                "category": "JWT_TOKEN",
+                "severity": "HIGH",
+                "description": "Exposed JSON Web Token (JWT) detected",
+            })
+
+        # 4. Bearer / Basic Auth headers
+        for m in _BEARER_HEADER_RE.finditer(line):
+            findings.append({
+                "line": line_idx,
+                "category": "BEARER_TOKEN",
+                "severity": "HIGH",
+                "description": "Hardcoded Authorization Bearer/Basic credential detected",
+            })
+
+        # 5. Secret assignments (e.g. password = "...")
+        for m in _SECRET_ASSIGNMENT_RE.finditer(line):
+            findings.append({
+                "line": line_idx,
+                "category": "HARDCODED_SECRET",
+                "severity": "MEDIUM",
+                "description": f"Hardcoded credential assignment: {m.group(1)}",
+            })
+
+        # 6. Payment cards
+        for m in _CARD_CANDIDATE_RE.finditer(line):
+            digits = "".join(ch for ch in m.group(0) if ch.isdigit())
+            if is_valid_luhn(digits):
+                findings.append({
+                    "line": line_idx,
+                    "category": "PAYMENT_CARD",
+                    "severity": "CRITICAL",
+                    "description": "Live Luhn-validated payment card number detected",
+                })
+
+        # 7. IBANs
+        for m in _IBAN_CANDIDATE_RE.finditer(line):
+            if is_valid_iban(m.group(0)):
+                findings.append({
+                    "line": line_idx,
+                    "category": "IBAN",
+                    "severity": "HIGH",
+                    "description": "Live ISO-7064 IBAN bank account detected",
+                })
+
+    # Multi-line check: PEM private keys
+    if _PEM_PRIVATE_KEY_RE.search(content):
+        findings.append({
+            "line": 1,
+            "category": "PRIVATE_KEY",
+            "severity": "CRITICAL",
+            "description": "Unencrypted PEM private key detected in code content",
+        })
+
+    return {
+        "has_secrets": len(findings) > 0,
+        "findings_count": len(findings),
+        "findings": findings,
+    }
 
 
 def _strip_embedded_media(out: str) -> str:
@@ -821,6 +1009,15 @@ class PrivacySanitizer:
         selected_raw = "\n".join(lines[s_line - 1 : e_line])
         sanitized_content = self.sanitize_text(selected_raw, redact_private_ips=True)
 
+        # Gate 6: Indirect prompt-injection and steganography neutralization
+        injection_res = sanitize_prompt_injection(sanitized_content)
+        sanitized_content = injection_res.sanitized_text
+
+        framed_content = (
+            f'<untrusted_project_file path="{str(rel_path).replace(chr(92), "/")}">'
+            f"\n{sanitized_content}\n</untrusted_project_file>"
+        )
+
         return {
             "relative_path": str(rel_path).replace("\\", "/"),
             "start_line": s_line,
@@ -828,7 +1025,9 @@ class PrivacySanitizer:
             "total_lines": total_lines,
             "truncated_by_byte_cap": truncated_by_bytes,
             "dlp_sanitized": True,
-            "content": sanitized_content,
+            "injection_detected": injection_res.is_injection_detected,
+            "injection_reasons": injection_res.reasons,
+            "content": framed_content,
         }
 
     def sanitize_for_ai(self, target: Any) -> Any:

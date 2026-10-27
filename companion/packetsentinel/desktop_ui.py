@@ -18,6 +18,9 @@ import json
 import logging
 import os
 import platform
+
+# Prevent fatal OpenMP runtime collision on Windows (Anaconda + CTranslate2/faster-whisper)
+os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
 import subprocess
 import threading
 import time
@@ -38,10 +41,28 @@ from .diagnostic_logger import (
     setup_diagnostic_logging,
 )
 from .egress_guard import engage_runtime_network_lockdown
+from .forensic_triage import (
+    AuthenticodeResult,
+    PersistenceFinding,
+    ProcessForensicContext,
+    RogueDllFinding,
+    ThreatExplanation,
+    apply_firewall_block_rule,
+    check_authenticode,
+    check_persistence_entries,
+    explain_threat,
+    generate_sanitized_incident_dossier,
+    get_firewall_block_commands,
+    inspect_running_process,
+    quarantine_file,
+    scan_directory_for_unsigned_dlls,
+    terminate_process_tree,
+)
 from .live_monitor_service import AlertRow, LiveMonitorService, MonitorSnapshot
 from .mcp_privacy import PrivacySanitizer
 from .process_watchdog import inspect_child_lineage
 from .security import is_public_routable_ip
+from .security_auditor import audit_environment_security, audit_listening_ports
 from .vault import EncryptedVaultManager, VaultSettings
 from .voice_engine import (
     MicrophoneRecorder,
@@ -122,6 +143,15 @@ class PacketSentinelDesktopApp:
         self._monitor_service = LiveMonitorService(self.config, lock_network_on_start=False)
         self._telemetry_timer_id: Optional[str] = None
         self._threat_rows_seen: Set[str] = set()
+        self._all_alerts_cache: List[Tuple[str, str, str, str, str]] = []
+        self._sort_col: str = "time"
+        self._sort_reverse: bool = True
+
+        # High-performance defaults: focus on AI tools & mute background streaming noise
+        self._monitor_service.set_ai_only_mode(True)
+        self._monitor_service.set_ignored_processes(
+            ["steam.exe", "steamservice.exe", "steamwebhelper.exe", "epicgameslauncher.exe", "onedrive.exe", "dropbox.exe", "spotify.exe"]
+        )
 
         self._packet_count = 0
         self._threat_count = 0
@@ -251,6 +281,18 @@ class PacketSentinelDesktopApp:
         action_frame = tk.Frame(header, bg=BG_SURFACE)
         action_frame.pack(side=tk.RIGHT)
 
+        copy_logs_btn = create_styled_button(
+            action_frame,
+            text="Copy Logs for AI",
+            icon="📋",
+            style="secondary",
+            command=self._copy_ai_diagnostic_summary,
+            font=FONT_BOLD,
+            padx=10,
+            pady=5,
+        )
+        copy_logs_btn.pack(side=tk.LEFT, padx=(0, 10))
+
         badge = create_status_pill(
             action_frame,
             text="🟢 AIRLOCK ACTIVE (0 OUTBOUND)",
@@ -273,14 +315,74 @@ class PacketSentinelDesktopApp:
         )
         kill_btn.pack(side=tk.LEFT)
 
+        # Real-time alert / notification toast strip (hidden until an alert or notice is dispatched)
+        self.notification_bar = tk.Frame(self.root, bg="#064e3b", padx=16, pady=6)
+        self.notification_lbl = tk.Label(
+            self.notification_bar,
+            text="",
+            font=FONT_BOLD,
+            fg="#22c55e",
+            bg="#064e3b",
+        )
+        self.notification_lbl.pack(side=tk.LEFT)
+        self.notification_action_btn = create_styled_button(
+            self.notification_bar,
+            text="View in Traffic Guard",
+            style="secondary",
+            font=FONT_SMALL,
+            padx=10,
+            pady=2,
+            command=lambda: (self._select_nav(1), self._dismiss_notification()),
+        )
+        self.notification_dismiss_btn = create_styled_button(
+            self.notification_bar,
+            text="✕",
+            style="ghost",
+            font=FONT_SMALL,
+            padx=6,
+            pady=2,
+            command=self._dismiss_notification,
+        )
+        self.notification_dismiss_btn.pack(side=tk.RIGHT, padx=(6, 0))
+
+    def show_notification(
+        self,
+        message: str,
+        level: str = "info",
+        action_text: str = "",
+        action_cmd: Any = None,
+    ) -> None:
+        """Surfaces a top-level alert toast so the developer immediately spots intercepted threats or errors."""
+        if not hasattr(self, "notification_bar"):
+            return
+        bg_col = "#7f1d1d" if level == "error" else ("#78350f" if level == "warning" else "#064e3b")
+        fg_col = "#fca5a5" if level == "error" else ("#fde047" if level == "warning" else "#22c55e")
+        self.notification_bar.config(bg=bg_col)
+        self.notification_lbl.config(text=message, bg=bg_col, fg=fg_col)
+        if action_text and action_cmd:
+            self.notification_action_btn.config(text=action_text, command=action_cmd)
+            self.notification_action_btn.pack(side=tk.RIGHT, padx=(0, 6))
+        else:
+            self.notification_action_btn.pack_forget()
+        target_before = getattr(self, "strip_frame", None)
+        if target_before and target_before.winfo_exists():
+            self.notification_bar.pack(fill=tk.X, padx=16, pady=(2, 0), before=target_before)
+        else:
+            self.notification_bar.pack(fill=tk.X, padx=16, pady=(2, 0))
+
+    def _dismiss_notification(self) -> None:
+        if hasattr(self, "notification_bar") and self.notification_bar.winfo_exists():
+            self.notification_bar.pack_forget()
+
     def _build_metrics_strip(self) -> None:
         strip = tk.Frame(self.root, bg=BG_CANVAS, padx=16, pady=8)
         strip.pack(fill=tk.X)
+        self.strip_frame = strip
 
         cards_data = [
-            ("PACKETS MONITORED", "0", BORDER_FOCUS, "Live Wire Sniffer", 2),
-            ("THREATS DETECTED", "0", ACCENT_EMERALD, "Click to View Details", 2),
-            ("PRE-MODEL DLP", "5-Gate Active", "#c084fc", "PII, IDs, Tokens Scrubbed", 1),
+            ("PACKETS MONITORED", "0", BORDER_FOCUS, "Live Wire Sniffer", 1),
+            ("THREATS DETECTED", "0", ACCENT_EMERALD, "Click to View Details", 1),
+            ("PRE-MODEL DLP", "5-Gate Active", "#c084fc", "PII, IDs, Tokens Scrubbed", 0),
             ("ENCRYPTED VAULT", "DPAPI Protected", ACCENT_EMERALD, "Hardware Encrypted", 3),
         ]
 
@@ -332,11 +434,11 @@ class PacketSentinelDesktopApp:
         ).pack(anchor=tk.W)
 
         nav_items = [
-            ("🏠  Mission Control", 0),
-            ("🛡️  Deep Privacy Airlock", 1),
-            ("📡  Wire & Process Inspector", 2),
-            ("⚙️  Settings & Security Vault", 3),
-            ("📖  Documentation & AI Guides", 4),
+            ("🛡️  Privacy Airlock", 0),
+            ("📡  Traffic & Process Guard", 1),
+            ("💻  IDE Integrations", 2),
+            ("⚙️  Settings & Vault", 3),
+            ("📖  Guides & Reference", 4),
         ]
 
         for text, idx in nav_items:
@@ -358,9 +460,21 @@ class PacketSentinelDesktopApp:
             btn.pack(fill=tk.X, padx=6, pady=2)
             self._nav_buttons.append(btn)
 
-        # Bottom of sidebar: AppData quick link
+        # Bottom of sidebar: Security audit & AppData quick links
         side_footer = tk.Frame(sidebar, bg=BG_SURFACE)
         side_footer.pack(side=tk.BOTTOM, fill=tk.X, padx=6, pady=8)
+
+        sec_audit_btn = create_styled_button(
+            side_footer,
+            text="Host Security Audit",
+            icon="🛡️",
+            style="ghost",
+            command=self._quick_run_security_audit,
+            font=FONT_SMALL,
+            padx=8,
+            pady=4,
+        )
+        sec_audit_btn.pack(fill=tk.X, pady=2)
 
         appdata_btn = create_styled_button(
             side_footer,
@@ -378,23 +492,24 @@ class PacketSentinelDesktopApp:
         self.notebook = ttk.Notebook(container)
         self.notebook.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
 
-        # Tab 0: Mission Control (Cockpit Dashboard covering primary developer actions)
-        self.tab_mission_control = tk.Frame(self.notebook, bg=BG_CANVAS)
-        self.notebook.add(self.tab_mission_control, text="Mission Control")
-        self._build_mission_control_tab()
-
-        # Tab 1: AI Privacy Airlock (Unified Speech & Text DLP)
+        # Tab 0: AI Privacy Airlock & Dictation (Primary Developer View)
         self.tab_airlock = tk.Frame(self.notebook, bg=BG_CANVAS)
         self.notebook.add(self.tab_airlock, text="AI Privacy Airlock")
+        self.tab_mission_control = self.tab_airlock
         self.tab_voice = self.tab_airlock
         self.tab_privacy = self.tab_airlock
         self._build_airlock_tab()
 
-        # Tab 2: Live Threat Monitor (Wire Sniffer, Alerts, and Process Watchdog)
+        # Tab 1: Live Wire & Process Guard (Packet Sniffer, Process Inspector, Threat Alerts)
         self.tab_monitor = tk.Frame(self.notebook, bg=BG_CANVAS)
         self.notebook.add(self.tab_monitor, text="Live Threat Monitor")
         self.tab_watchdog = self.tab_monitor
         self._build_monitor_tab()
+
+        # Tab 2: Popular IDE Integrations (Cursor, VS Code / Copilot, Kiro, Windsurf, Claude)
+        self.tab_ide_integrations = tk.Frame(self.notebook, bg=BG_CANVAS)
+        self.notebook.add(self.tab_ide_integrations, text="IDE Integrations")
+        self._build_ide_integrations_tab()
 
         # Tab 3: Settings & Security Vault (DPAPI Vault, 5-Gate Toggles, Alerts, Logs)
         self.tab_settings = tk.Frame(self.notebook, bg=BG_CANVAS)
@@ -416,347 +531,8 @@ class PacketSentinelDesktopApp:
                 btn.config(bg=BG_SURFACE, fg=TEXT_MUTED, font=("Segoe UI", 10, "normal"))
 
     def _build_mission_control_tab(self) -> None:
-        mc_container = tk.Frame(self.tab_mission_control, bg=BG_CANVAS, padx=14, pady=12)
-        mc_container.pack(fill=tk.BOTH, expand=True)
-
-        # Cockpit Banner
-        cockpit_header = create_card_frame(mc_container, padx=16, pady=10, bg=BG_SURFACE)
-        cockpit_header.pack(fill=tk.X, pady=(0, 10))
-
-        h_left = tk.Frame(cockpit_header, bg=BG_SURFACE)
-        h_left.pack(side=tk.LEFT)
-
-        tk.Label(
-            h_left,
-            text="🏠 Mission Control Cockpit",
-            font=FONT_HEADER,
-            fg=TEXT_MAIN,
-            bg=BG_SURFACE,
-        ).pack(anchor=tk.W)
-
-        self.cockpit_sub_lbl = tk.Label(
-            h_left,
-            text="Unified developer privacy airlock, voice dictation, live packet sniffer, and process watchdog.",
-            font=FONT_BODY,
-            fg=TEXT_MUTED,
-            bg=BG_SURFACE,
-            wraplength=700,
-        )
-        self.cockpit_sub_lbl.pack(anchor=tk.W, pady=(2, 0))
-
-        def _on_cockpit_resize(event: tk.Event) -> None:
-            if event.width > 150:
-                self.cockpit_sub_lbl.configure(wraplength=max(250, event.width - 150))
-
-        cockpit_header.bind("<Configure>", _on_cockpit_resize)
-        self.cockpit_banner = cockpit_header
-        self.banner = cockpit_header
-
-        h_right = tk.Frame(cockpit_header, bg=BG_SURFACE)
-        h_right.pack(side=tk.RIGHT)
-
-        self.mc_sniffer_badge = create_status_pill(
-            h_right,
-            text="🔴 SNIFFER STOPPED",
-            status="error",
-            font=FONT_BOLD,
-            padx=10,
-            pady=4,
-        )
-        self.mc_sniffer_badge.pack(side=tk.LEFT, padx=(0, 8))
-
-        self.mc_sniffer_btn = create_styled_button(
-            h_right,
-            text="Start Sniffer",
-            icon="▶️",
-            style="primary",
-            command=self._toggle_sniffer,
-            font=FONT_BOLD,
-            padx=12,
-            pady=4,
-        )
-        self.mc_sniffer_btn.pack(side=tk.LEFT)
-
-        # Top Card: Quick Voice & Prompt Scrubber Card
-        top_card = create_card_frame(mc_container, padx=16, pady=12)
-        top_card.pack(fill=tk.X, pady=(0, 10))
-
-        # Row 1: Voice Dictation & Status
-        v_row = tk.Frame(top_card, bg=BG_CARD)
-        v_row.pack(fill=tk.X, pady=(0, 4))
-
-        self.mc_voice_btn = create_styled_button(
-            v_row,
-            text="Start Dictation (Spacebar)",
-            icon="🎙️",
-            style="primary",
-            command=self._toggle_voice_recording,
-            font=FONT_BOLD,
-            padx=14,
-            pady=5,
-        )
-        self.mc_voice_btn.pack(side=tk.LEFT, padx=(0, 10))
-
-        self.mc_voice_status_pill = create_status_pill(
-            v_row,
-            text="🟢 AIRLOCK READY (OFFLINE)",
-            status="ok",
-            font=FONT_BOLD,
-            padx=10,
-            pady=4,
-        )
-        self.mc_voice_status_pill.pack(side=tk.LEFT, padx=(0, 10))
-
-        copy_mcp_latest_btn = create_styled_button(
-            v_row,
-            text="Copy Latest Prompt",
-            icon="📋",
-            style="secondary",
-            command=self._copy_output,
-            font=FONT_BODY,
-            padx=10,
-            pady=4,
-        )
-        copy_mcp_latest_btn.pack(side=tk.RIGHT)
-
-        # Row 1b: Dedicated full-width voice feedback row with dynamic wrapping so it NEVER truncates
-        v_feedback_row = tk.Frame(top_card, bg=BG_CARD)
-        v_feedback_row.pack(fill=tk.X, pady=(2, 6))
-
-        self.mc_voice_feedback_lbl = tk.Label(
-            v_feedback_row,
-            text="Push-to-talk ready. Auto-stops on silence (~1.8s) or press Spacebar.",
-            font=FONT_BODY,
-            fg=TEXT_MUTED,
-            bg=BG_CARD,
-            anchor="w",
-            justify=tk.LEFT,
-            wraplength=750,
-        )
-        self.mc_voice_feedback_lbl.pack(fill=tk.X, expand=True)
-
-        def _on_top_card_resize(event: tk.Event) -> None:
-            if event.width > 150:
-                self.mc_voice_feedback_lbl.configure(wraplength=max(250, event.width - 32))
-
-        top_card.bind("<Configure>", _on_top_card_resize)
-
-        # Row 2: Quick Prompt Input & DLP Scrub
-        p_row = tk.Frame(top_card, bg=BG_CARD)
-        p_row.pack(fill=tk.X, pady=(4, 0))
-
-        tk.Label(
-            p_row,
-            text="Quick Prompt Scrubber:",
-            font=FONT_BOLD,
-            fg=TEXT_MAIN,
-            bg=BG_CARD,
-        ).pack(side=tk.LEFT, padx=(0, 8))
-
-        self.mc_quick_prompt_entry = create_styled_entry(
-            p_row,
-            font=FONT_BODY,
-        )
-        self.mc_quick_prompt_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 8), ipady=4)
-        self.mc_quick_prompt_entry.bind("<Return>", lambda e: self._quick_scrub_prompt())
-
-        scrub_btn = create_styled_button(
-            p_row,
-            text="Scrub & Send to MCP",
-            icon="🧹",
-            style="primary",
-            command=self._quick_scrub_prompt,
-            font=FONT_BOLD,
-            padx=12,
-            pady=4,
-        )
-        scrub_btn.pack(side=tk.LEFT)
-
-        # Bottom Split Area: Left (Process Watchdog & AI) | Right (Live Threats)
-        split_frame = tk.Frame(mc_container, bg=BG_CANVAS)
-        split_frame.pack(fill=tk.BOTH, expand=True)
-
-        # Left Column: Process Watchdog & AI Analyzer
-        left_col = create_card_frame(split_frame, padx=14, pady=12)
-        left_col.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0, 6))
-
-        l_head = tk.Frame(left_col, bg=BG_CARD)
-        l_head.pack(fill=tk.X, pady=(0, 8))
-
-        tk.Label(
-            l_head,
-            text="👁️ Process Watchdog & AI Inspector",
-            font=FONT_SECTION,
-            fg=TEXT_MAIN,
-            bg=BG_CARD,
-        ).pack(side=tk.LEFT)
-
-        refresh_proc_btn = create_styled_button(
-            l_head,
-            text="Refresh",
-            icon="🔄",
-            style="secondary",
-            command=self._refresh_process_lists,
-            font=FONT_SMALL,
-            padx=8,
-            pady=2,
-        )
-        refresh_proc_btn.pack(side=tk.RIGHT)
-
-        # Dropdown process selector row
-        sel_row = tk.Frame(left_col, bg=BG_CARD)
-        sel_row.pack(fill=tk.X, pady=(0, 8))
-
-        tk.Label(
-            sel_row,
-            text="Select Target:",
-            font=FONT_BODY,
-            fg=TEXT_MUTED,
-            bg=BG_CARD,
-        ).pack(side=tk.LEFT, padx=(0, 6))
-
-        self.mc_proc_combo = ttk.Combobox(
-            sel_row,
-            font=FONT_BODY,
-            state="normal",
-            width=22,
-        )
-        candidates = self._get_running_process_candidates()
-        self.mc_proc_combo["values"] = candidates
-        if candidates:
-            self.mc_proc_combo.set(candidates[0])
-        else:
-            self.mc_proc_combo.set("python.exe")
-        self.mc_proc_combo.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 6))
-
-        insp_btn = create_styled_button(
-            sel_row,
-            text="Inspect",
-            icon="🔍",
-            style="secondary",
-            command=self._inspect_mc_watchdog,
-            font=FONT_BOLD,
-            padx=8,
-            pady=3,
-        )
-        insp_btn.pack(side=tk.LEFT, padx=(0, 4))
-
-        mc_copy_btn = create_styled_button(
-            sel_row,
-            text="Copy",
-            icon="📋",
-            style="secondary",
-            command=lambda: self._copy_process_summary(self.mc_watchdog_results),
-            font=FONT_SMALL,
-            padx=8,
-            pady=3,
-        )
-        mc_copy_btn.pack(side=tk.LEFT, padx=(0, 4))
-
-        ai_btn = create_styled_button(
-            sel_row,
-            text="Ask AI Safety",
-            icon="🤖",
-            style="accent",
-            command=self._analyze_process_with_ai,
-            font=FONT_BOLD,
-            padx=8,
-            pady=3,
-        )
-        ai_btn.pack(side=tk.LEFT)
-
-        self.mc_watchdog_results = tk.Text(
-            left_col,
-            bg=BG_CANVAS,
-            fg=TEXT_MAIN,
-            font=FONT_MONO,
-            relief=tk.FLAT,
-            wrap=tk.WORD,
-            height=10,
-            highlightbackground=BORDER_COLOR,
-            highlightthickness=1,
-            padx=8,
-            pady=6,
-        )
-        self.mc_watchdog_results.pack(fill=tk.BOTH, expand=True)
-
-        # Right Column: Real-time Threat Alerts
-        right_col = create_card_frame(split_frame, padx=14, pady=12)
-        right_col.pack(side=tk.RIGHT, fill=tk.BOTH, expand=True, padx=(6, 0))
-
-        r_head = tk.Frame(right_col, bg=BG_CARD)
-        r_head.pack(fill=tk.X, pady=(0, 8))
-
-        tk.Label(
-            r_head,
-            text="🚨 Live Threat Interceptor",
-            font=FONT_SECTION,
-            fg=TEXT_MAIN,
-            bg=BG_CARD,
-        ).pack(side=tk.LEFT)
-
-        canary_btn = create_styled_button(
-            r_head,
-            text="Canary Test",
-            icon="🧪",
-            style="secondary",
-            command=self._trigger_canary_alert,
-            font=FONT_SMALL,
-            padx=8,
-            pady=2,
-        )
-        canary_btn.pack(side=tk.RIGHT)
-
-        explain_btn = create_styled_button(
-            r_head,
-            text="Explain Threat",
-            icon="ℹ️",
-            style="primary",
-            command=lambda: self._show_threat_explanation(),
-            font=FONT_SMALL,
-            padx=8,
-            pady=2,
-        )
-        explain_btn.pack(side=tk.RIGHT, padx=(0, 6))
-
-        mc_inspect_alert_btn = create_styled_button(
-            r_head,
-            text="Inspect Alert",
-            icon="🎯",
-            style="secondary",
-            command=self._inspect_selected_alert_in_mc,
-            font=FONT_SMALL,
-            padx=8,
-            pady=2,
-        )
-        mc_inspect_alert_btn.pack(side=tk.RIGHT, padx=(0, 6))
-
-        cols = ("time", "indicator", "feed", "process", "layer")
-        display_names = {
-            "time": "Time (UTC)",
-            "indicator": "Flagged Target",
-            "feed": "Source Threat Feed",
-            "process": "Attributed Process",
-            "layer": "Layer",
-        }
-        min_widths = {
-            "time": 150,
-            "indicator": 240,
-            "feed": 140,
-            "process": 110,
-            "layer": 100,
-        }
-        self.mc_alert_tree, self.mc_alert_sb, self.mc_alert_container = create_data_table(
-            right_col,
-            columns=cols,
-            display_names=display_names,
-            min_widths=min_widths,
-            height=8,
-            horizontal_scroll=True,
-        )
-        self.mc_alert_container.pack(fill=tk.BOTH, expand=True)
-        self.mc_alert_tree.bind("<Double-1>", lambda e: self._show_threat_explanation())
-        self.mc_alert_tree.bind("<<TreeviewSelect>>", self._on_mc_alert_tree_select)
+        """Compatibility wrapper; functionality now cleanly merged into _build_airlock_tab and _build_monitor_tab."""
+        pass
 
     def _build_airlock_tab(self) -> None:
         banner = tk.Label(
@@ -783,6 +559,8 @@ class PacketSentinelDesktopApp:
 
         banner.bind("<Configure>", _on_airlock_banner_resize)
         self.airlock_banner = banner
+        self.cockpit_banner = banner
+        self.banner = banner
 
         # Hero Card for Voice Dictation & MCP Sync
         hero = tk.Frame(self.tab_airlock, bg=BG_CARD, padx=16, pady=10, highlightbackground=BORDER_COLOR, highlightthickness=1)
@@ -874,6 +652,12 @@ class PacketSentinelDesktopApp:
             bg=BG_CARD,
         )
         self.voice_feedback_lbl.pack(anchor=tk.W, pady=(4, 0))
+
+        # Compatibility aliases
+        self.mc_voice_status_pill = tk.Label(status_row, text="🟢 AIRLOCK READY (OFFLINE)")
+        self.mc_voice_btn = self.voice_btn
+        self.mc_voice_feedback_lbl = self.voice_feedback_lbl
+        self.mc_quick_prompt_entry = self.quick_speech_entry
 
         # Central Split Panes
         panes = tk.Frame(self.tab_airlock, bg=BG_CANVAS)
@@ -1894,6 +1678,69 @@ class PacketSentinelDesktopApp:
         )
         self.monitor_detail_lbl.pack(side=tk.LEFT, padx=(8, 0))
 
+        # Filter, Sorting & Overload Protection Toolbar
+        filter_bar = tk.Frame(card, bg=BG_CARD)
+        filter_bar.pack(fill=tk.X, pady=(0, 6))
+
+        tk.Label(filter_bar, text="🔍 Filter:", font=FONT_BOLD, fg=TEXT_MUTED, bg=BG_CARD).pack(side=tk.LEFT, padx=(0, 4))
+        self.alert_filter_var = tk.StringVar()
+        self.alert_filter_entry = ttk.Entry(filter_bar, textvariable=self.alert_filter_var, width=16)
+        self.alert_filter_entry.pack(side=tk.LEFT, padx=(0, 8))
+        self.alert_filter_var.trace_add("write", lambda *_: self._apply_alert_filters())
+
+        tk.Label(filter_bar, text="Feed:", font=FONT_BOLD, fg=TEXT_MUTED, bg=BG_CARD).pack(side=tk.LEFT, padx=(0, 4))
+        self.alert_feed_filter_var = tk.StringVar(value="All Feeds")
+        self.alert_feed_combo = ttk.Combobox(
+            filter_bar,
+            textvariable=self.alert_feed_filter_var,
+            values=["All Feeds", "LOTS", "Shadow AI", "Supply Chain", "Botnet / C2", "URLhaus", "OISD", "Canary"],
+            width=13,
+            state="readonly",
+        )
+        self.alert_feed_combo.pack(side=tk.LEFT, padx=(0, 10))
+        self.alert_feed_combo.bind("<<ComboboxSelected>>", lambda *_: self._apply_alert_filters())
+
+        # Overload Protection / Packet Rule Toggles
+        self.ai_only_mode_var = tk.BooleanVar(value=True)
+        ai_cb = tk.Checkbutton(
+            filter_bar,
+            text="⚡ AI Tools Only",
+            variable=self.ai_only_mode_var,
+            bg=BG_CARD,
+            fg=TEXT_MAIN,
+            selectcolor=BG_CARD,
+            activebackground=BG_CARD,
+            font=("Segoe UI", 9, "bold"),
+            command=self._on_toggle_ai_only_mode,
+        )
+        ai_cb.pack(side=tk.LEFT, padx=(0, 6))
+
+        self.mute_heavy_apps_var = tk.BooleanVar(value=True)
+        mute_cb = tk.Checkbutton(
+            filter_bar,
+            text="🔇 Mute Heavy Apps",
+            variable=self.mute_heavy_apps_var,
+            bg=BG_CARD,
+            fg=TEXT_MAIN,
+            selectcolor=BG_CARD,
+            activebackground=BG_CARD,
+            font=("Segoe UI", 9),
+            command=self._on_toggle_mute_heavy_apps,
+        )
+        mute_cb.pack(side=tk.LEFT, padx=(0, 8))
+
+        clear_btn = create_styled_button(
+            filter_bar,
+            text="Clear Feed",
+            icon="🧹",
+            style="secondary",
+            command=self._clear_alert_feed,
+            font=FONT_SMALL,
+            padx=8,
+            pady=2,
+        )
+        clear_btn.pack(side=tk.RIGHT)
+
         # Real-time Threat Alerts Treeview
         cols = ("time", "indicator", "feed", "process", "layer")
         display_names = {
@@ -1919,8 +1766,17 @@ class PacketSentinelDesktopApp:
             horizontal_scroll=True,
         )
         self.alert_container.pack(fill=tk.BOTH, expand=True)
+
+        for c in cols:
+            self.alert_tree.heading(
+                c,
+                text=f"{display_names[c]} ⇅",
+                command=lambda col=c: self._sort_alert_tree_by_column(col),
+            )
         self.alert_tree.bind("<Double-1>", lambda e: self._show_threat_explanation())
         self.alert_tree.bind("<<TreeviewSelect>>", self._on_alert_tree_select)
+        self.alert_tree.bind("<Button-3>", self._on_alert_tree_context_menu)
+        self.alert_tree.bind("<Button-2>", self._on_alert_tree_context_menu)
 
         # Lower Card: Target Process Watchdog & Script Interpreter Inspector
         w_card = tk.Frame(self.tab_monitor, bg=BG_CARD, padx=14, pady=10, highlightbackground=BORDER_COLOR, highlightthickness=1)
@@ -2034,9 +1890,401 @@ class PacketSentinelDesktopApp:
         )
         self.watchdog_results.pack(fill=tk.BOTH, expand=True)
 
+        # Compatibility aliases for Mission Control testing
+        self.mc_alert_tree = self.alert_tree
+        self.mc_proc_combo = self.proc_combo
+        self.mc_watchdog_results = self.watchdog_results
+        self.mc_sniffer_btn = self.btn_toggle_monitor
+        self.mc_sniffer_badge = self.monitor_status_badge
+
     def _build_watchdog_tab(self) -> None:
         """Compatibility wrapper; functionality now merged into _build_monitor_tab."""
         pass
+
+    def _build_ide_integrations_tab(self) -> None:
+        """1-Click popular IDE integration cards for Cursor, VS Code, Kiro, Windsurf, and Claude."""
+        container = tk.Frame(self.tab_ide_integrations, bg=BG_CANVAS, padx=14, pady=10)
+        container.pack(fill=tk.BOTH, expand=True)
+
+        h_card = create_card_frame(container, padx=16, pady=10, bg=BG_SURFACE)
+        h_card.pack(fill=tk.X, pady=(0, 10))
+        tk.Label(
+            h_card,
+            text="💻 Popular IDE Integrations & Zero-Outbound Steering",
+            font=FONT_HEADER,
+            fg=TEXT_TITLE,
+            bg=BG_SURFACE,
+        ).pack(anchor=tk.W)
+        tk.Label(
+            h_card,
+            text="1-Click configuration cards for the AI editors you use daily. Automatically injects privacy rules, "
+            "MCP bridges, and zero-leak guardrails into your active project workspace.",
+            font=FONT_BODY,
+            fg=TEXT_MUTED,
+            bg=BG_SURFACE,
+            wraplength=750,
+        ).pack(anchor=tk.W, pady=(2, 0))
+
+        cards_frame = tk.Frame(container, bg=BG_CANVAS)
+        cards_frame.pack(fill=tk.BOTH, expand=True)
+
+        ide_list = [
+            (
+                "Cursor IDE",
+                "🎯",
+                "Configures .cursorrules and SentinelWire MCP server for pre-model prompt scrubbing and zero-leak boundaries.",
+                self._copy_cursor_config,
+                self._inject_cursor_config,
+                "Inject .cursorrules",
+            ),
+            (
+                "VS Code & GitHub Copilot",
+                "🐙",
+                "Configures .github/copilot-instructions.md with DPAPI encryption boundaries, 5-Gate DLP, and 0-outbound rules.",
+                self._copy_copilot_config,
+                self._inject_copilot_config,
+                "Inject Copilot Rules",
+            ),
+            (
+                "Google Antigravity (AGY)",
+                "🪐",
+                "Configures .agents/rules/ and .gemini/ settings with SentinelWire zero-leak MCP boundaries and 0-outbound rules.",
+                self._copy_antigravity_config,
+                self._inject_antigravity_config,
+                "Inject AGY Rules",
+            ),
+            (
+                "Kiro IDE",
+                "⚡",
+                "Generates .kiro/steering/ spec-driven templates for product & tech boundaries, token minimization, and zero-outbound.",
+                self._copy_kiro_config,
+                self._inject_kiro_config,
+                "Inject Kiro Steering",
+            ),
+            (
+                "Windsurf (Codeium)",
+                "🏄",
+                "Configures .windsurfrules with Cascade AI privacy guardrails, local file protection, and credential leak prevention.",
+                self._copy_windsurf_config,
+                self._inject_windsurf_config,
+                "Inject .windsurfrules",
+            ),
+            (
+                "Claude Desktop & Claude Code",
+                "🤖",
+                "Configures claude_desktop_config.json with SentinelWire MCP server to sanitize prompts before sending to Claude.",
+                self._copy_mcp_config_json,
+                None,
+                None,
+            ),
+        ]
+
+        for title, icon, desc, copy_fn, inject_fn, inject_lbl in ide_list:
+            card = create_card_frame(cards_frame, padx=14, pady=10)
+            card.pack(fill=tk.X, pady=(0, 8))
+
+            top_row = tk.Frame(card, bg=BG_CARD)
+            top_row.pack(fill=tk.X)
+
+            tk.Label(
+                top_row,
+                text=f"{icon}  {title}",
+                font=FONT_SECTION,
+                fg=TEXT_MAIN,
+                bg=BG_CARD,
+            ).pack(side=tk.LEFT)
+
+            btn_box = tk.Frame(top_row, bg=BG_CARD)
+            btn_box.pack(side=tk.RIGHT)
+
+            if inject_fn and inject_lbl:
+                inj_b = create_styled_button(
+                    btn_box,
+                    text=inject_lbl,
+                    icon="⚡",
+                    style="primary",
+                    command=inject_fn,
+                    font=FONT_SMALL,
+                    padx=10,
+                    pady=3,
+                )
+                inj_b.pack(side=tk.LEFT, padx=(0, 6))
+
+            copy_b = create_styled_button(
+                btn_box,
+                text="Copy Config",
+                icon="📋",
+                style="secondary",
+                command=copy_fn,
+                font=FONT_SMALL,
+                padx=10,
+                pady=3,
+            )
+            copy_b.pack(side=tk.LEFT)
+
+            tk.Label(
+                card,
+                text=desc,
+                font=FONT_BODY,
+                fg=TEXT_MUTED,
+                bg=BG_CARD,
+                anchor="w",
+                justify=tk.LEFT,
+            ).pack(anchor=tk.W, pady=(4, 0))
+
+    def _copy_cursor_config(self) -> None:
+        cfg = (
+            "# Cursor AI Privacy Airlock & Security Guidelines\n\n"
+            "- Strictly 0 outbound network requests allowed during tests or monitoring.\n"
+            "- Pre-Model 5-Gate DLP: Always mask credit card numbers, national IDs, usernames, and private tokens.\n"
+            "- Hardware-encrypted secrets: Store credentials via Windows DPAPI or chmod 600 only.\n"
+            "- Use SentinelWire MCP server tools (sanitize_prompt_text, inspect_process_safety) for untrusted inputs.\n"
+        )
+        self.root.clipboard_clear()
+        self.root.clipboard_append(cfg)
+        messagebox.showinfo("Cursor Config Copied", ".cursorrules privacy configuration copied to clipboard!")
+
+    def _inject_cursor_config(self) -> None:
+        target = Path.cwd() / ".cursorrules"
+        cfg = (
+            "# Cursor AI Privacy Airlock & Security Guidelines\n\n"
+            "- Strictly 0 outbound network requests allowed during tests or monitoring.\n"
+            "- Pre-Model 5-Gate DLP: Always mask credit card numbers, national IDs, usernames, and private tokens.\n"
+            "- Hardware-encrypted secrets: Store credentials via Windows DPAPI or chmod 600 only.\n"
+            "- Use SentinelWire MCP server tools (sanitize_prompt_text, inspect_process_safety) for untrusted inputs.\n"
+        )
+        try:
+            target.write_text(cfg, encoding="utf-8")
+            messagebox.showinfo("Injected Successfully", f"Created .cursorrules in {target.parent}!")
+        except Exception as e:
+            messagebox.showerror("Injection Error", f"Could not write file: {e}")
+
+    def _copy_antigravity_config(self) -> None:
+        cfg = (
+            "{\n"
+            '  "mcpServers": {\n'
+            '    "packetsentinel-mcp": {\n'
+            '      "command": "python",\n'
+            '      "args": ["-m", "packetsentinel", "--mcp"]\n'
+            "    }\n"
+            "  }\n"
+            "}"
+        )
+        self.root.clipboard_clear()
+        self.root.clipboard_append(cfg)
+        messagebox.showinfo("Antigravity Config Copied", "Antigravity MCP configuration copied to clipboard!")
+
+    def _inject_antigravity_config(self) -> None:
+        target_dir = Path.cwd() / ".agents" / "rules"
+        target_dir.mkdir(parents=True, exist_ok=True)
+        target = target_dir / "sentinelwire-steering.md"
+        cfg = (
+            "# SentinelWire / PacketSentinel — Zero-Outbound & AI Privacy Rule\n\n"
+            "1. STRICT ZERO-OUTBOUND BOUNDARY:\n"
+            "   All models, packet monitors, and diagnostic tools run 100% locally. Zero telemetry is transmitted to cloud servers.\n"
+            "2. 5-GATE PRE-MODEL DLP:\n"
+            "   All prompt inputs, logs, and process telemetry must pass 5-Gate DLP scrubbers (Luhn payment cards, national IDs, credentials, and usernames).\n"
+            "3. SECRETS BOUNDARY:\n"
+            "   Never commit or display local API keys, tokens, or environment files (.env).\n"
+            "4. READ-ONLY MCP AIRLOCK:\n"
+            "   SentinelWire exposes a read-only MCP server (packetsentinel-mcp) providing safe security audit tools.\n"
+        )
+        try:
+            target.write_text(cfg, encoding="utf-8")
+            messagebox.showinfo("Injected Successfully", f"Created {target}!")
+        except Exception as e:
+            messagebox.showerror("Injection Error", f"Could not write file: {e}")
+
+    def _copy_copilot_config(self) -> None:
+        cfg = (
+            "# GitHub Copilot Steering & Privacy Rules\n\n"
+            "## Architectural Invariants\n"
+            "1. Zero outbound network traffic: all monitoring and prompt processing is strictly local.\n"
+            "2. 5-Gate DLP: Mask payment cards (Luhn-checked), national IDs, credentials, and real names.\n"
+            "3. Secrets Boundary: Never hardcode tokens or commit environment variable files.\n"
+        )
+        self.root.clipboard_clear()
+        self.root.clipboard_append(cfg)
+        messagebox.showinfo("Copilot Config Copied", ".github/copilot-instructions.md rules copied to clipboard!")
+
+    def _inject_copilot_config(self) -> None:
+        target_dir = Path.cwd() / ".github"
+        target_dir.mkdir(parents=True, exist_ok=True)
+        target = target_dir / "copilot-instructions.md"
+        cfg = (
+            "# GitHub Copilot Steering & Privacy Rules\n\n"
+            "## Architectural Invariants\n"
+            "1. Zero outbound network traffic: all monitoring and prompt processing is strictly local.\n"
+            "2. 5-Gate DLP: Mask payment cards (Luhn-checked), national IDs, credentials, and real names.\n"
+            "3. Secrets Boundary: Never hardcode tokens or commit environment variable files.\n"
+        )
+        try:
+            target.write_text(cfg, encoding="utf-8")
+            messagebox.showinfo("Injected Successfully", "Created .github/copilot-instructions.md!")
+        except Exception as e:
+            messagebox.showerror("Injection Error", f"Could not write file: {e}")
+
+    def _copy_antigravity_config(self) -> None:
+        cfg = (
+            "{\n"
+            '  "mcpServers": {\n'
+            '    "packetsentinel-mcp": {\n'
+            '      "command": "python",\n'
+            '      "args": ["-m", "packetsentinel", "--mcp"]\n'
+            "    }\n"
+            "  }\n"
+            "}"
+        )
+        self.root.clipboard_clear()
+        self.root.clipboard_append(cfg)
+        messagebox.showinfo("Antigravity Config Copied", "Antigravity MCP configuration copied to clipboard!")
+
+    def _inject_antigravity_config(self) -> None:
+        target_dir = Path.cwd() / ".agents" / "rules"
+        target_dir.mkdir(parents=True, exist_ok=True)
+        target = target_dir / "sentinelwire-steering.md"
+        cfg = (
+            "# SentinelWire / PacketSentinel — Zero-Outbound & AI Privacy Rule\n\n"
+            "1. STRICT ZERO-OUTBOUND BOUNDARY:\n"
+            "   All models, packet monitors, and diagnostic tools run 100% locally. Zero telemetry is transmitted to cloud servers.\n"
+            "2. 5-GATE PRE-MODEL DLP:\n"
+            "   All prompt inputs, logs, and process telemetry must pass 5-Gate DLP scrubbers (Luhn payment cards, national IDs, credentials, and usernames).\n"
+            "3. SECRETS BOUNDARY:\n"
+            "   Never commit or display local API keys, tokens, or environment files (.env).\n"
+            "4. READ-ONLY MCP AIRLOCK:\n"
+            "   SentinelWire exposes a read-only MCP server (packetsentinel-mcp) providing safe security audit tools.\n"
+        )
+        try:
+            target.write_text(cfg, encoding="utf-8")
+            messagebox.showinfo("Injected Successfully", f"Created {target}!")
+        except Exception as e:
+            messagebox.showerror("Injection Error", f"Could not write file: {e}")
+
+    def _copy_kiro_config(self) -> None:
+        cfg = (
+            "# Kiro Spec & Steering Boundaries\n\n"
+            "## Product Invariant\n"
+            "- Local offline first: all models, audio transcription, and packet monitoring remain on localhost.\n"
+            "- Token minimization: Keep context lean, summarize multi-file diffs, and use compact steering files.\n"
+            "- Zero machine-binding identifiers in output or code.\n"
+        )
+        self.root.clipboard_clear()
+        self.root.clipboard_append(cfg)
+        messagebox.showinfo("Kiro Steering Copied", ".kiro/steering guidelines copied to clipboard!")
+
+    def _inject_kiro_config(self) -> None:
+        target_dir = Path.cwd() / ".kiro" / "steering"
+        target_dir.mkdir(parents=True, exist_ok=True)
+        target = target_dir / "product.md"
+        cfg = (
+            "# Kiro Spec & Steering Boundaries\n\n"
+            "## Product Invariant\n"
+            "- Local offline first: all models, audio transcription, and packet monitoring remain on localhost.\n"
+            "- Token minimization: Keep context lean, summarize multi-file diffs, and use compact steering files.\n"
+            "- Zero machine-binding identifiers in output or code.\n"
+        )
+        try:
+            target.write_text(cfg, encoding="utf-8")
+            messagebox.showinfo("Injected Successfully", "Created .kiro/steering/product.md!")
+        except Exception as e:
+            messagebox.showerror("Injection Error", f"Could not write file: {e}")
+
+    def _copy_antigravity_config(self) -> None:
+        cfg = (
+            "{\n"
+            '  "mcpServers": {\n'
+            '    "packetsentinel-mcp": {\n'
+            '      "command": "python",\n'
+            '      "args": ["-m", "packetsentinel", "--mcp"]\n'
+            "    }\n"
+            "  }\n"
+            "}"
+        )
+        self.root.clipboard_clear()
+        self.root.clipboard_append(cfg)
+        messagebox.showinfo("Antigravity Config Copied", "Antigravity MCP configuration copied to clipboard!")
+
+    def _inject_antigravity_config(self) -> None:
+        target_dir = Path.cwd() / ".agents" / "rules"
+        target_dir.mkdir(parents=True, exist_ok=True)
+        target = target_dir / "sentinelwire-steering.md"
+        cfg = (
+            "# SentinelWire / PacketSentinel — Zero-Outbound & AI Privacy Rule\n\n"
+            "1. STRICT ZERO-OUTBOUND BOUNDARY:\n"
+            "   All models, packet monitors, and diagnostic tools run 100% locally. Zero telemetry is transmitted to cloud servers.\n"
+            "2. 5-GATE PRE-MODEL DLP:\n"
+            "   All prompt inputs, logs, and process telemetry must pass 5-Gate DLP scrubbers (Luhn payment cards, national IDs, credentials, and usernames).\n"
+            "3. SECRETS BOUNDARY:\n"
+            "   Never commit or display local API keys, tokens, or environment files (.env).\n"
+            "4. READ-ONLY MCP AIRLOCK:\n"
+            "   SentinelWire exposes a read-only MCP server (packetsentinel-mcp) providing safe security audit tools.\n"
+        )
+        try:
+            target.write_text(cfg, encoding="utf-8")
+            messagebox.showinfo("Injected Successfully", f"Created {target}!")
+        except Exception as e:
+            messagebox.showerror("Injection Error", f"Could not write file: {e}")
+
+    def _copy_windsurf_config(self) -> None:
+        cfg = (
+            "# Windsurf Cascade AI Privacy Guidelines\n\n"
+            "- Enforce zero-leak boundary: never expose local usernames, machine paths, or API tokens.\n"
+            "- All code inspections and prompt sanitizations must run offline locally.\n"
+            "- Pre-Model 5-Gate DLP active before sending questions to Cascade.\n"
+        )
+        self.root.clipboard_clear()
+        self.root.clipboard_append(cfg)
+        messagebox.showinfo("Windsurf Rules Copied", ".windsurfrules copied to clipboard!")
+
+    def _inject_windsurf_config(self) -> None:
+        target = Path.cwd() / ".windsurfrules"
+        cfg = (
+            "# Windsurf Cascade AI Privacy Guidelines\n\n"
+            "- Enforce zero-leak boundary: never expose local usernames, machine paths, or API tokens.\n"
+            "- All code inspections and prompt sanitizations must run offline locally.\n"
+            "- Pre-Model 5-Gate DLP active before sending questions to Cascade.\n"
+        )
+        try:
+            target.write_text(cfg, encoding="utf-8")
+            messagebox.showinfo("Injected Successfully", f"Created .windsurfrules in {target.parent}!")
+        except Exception as e:
+            messagebox.showerror("Injection Error", f"Could not write file: {e}")
+
+    def _copy_antigravity_config(self) -> None:
+        cfg = (
+            "{\n"
+            '  "mcpServers": {\n'
+            '    "packetsentinel-mcp": {\n'
+            '      "command": "python",\n'
+            '      "args": ["-m", "packetsentinel", "--mcp"]\n'
+            "    }\n"
+            "  }\n"
+            "}"
+        )
+        self.root.clipboard_clear()
+        self.root.clipboard_append(cfg)
+        messagebox.showinfo("Antigravity Config Copied", "Antigravity MCP configuration copied to clipboard!")
+
+    def _inject_antigravity_config(self) -> None:
+        target_dir = Path.cwd() / ".agents" / "rules"
+        target_dir.mkdir(parents=True, exist_ok=True)
+        target = target_dir / "sentinelwire-steering.md"
+        cfg = (
+            "# SentinelWire / PacketSentinel — Zero-Outbound & AI Privacy Rule\n\n"
+            "1. STRICT ZERO-OUTBOUND BOUNDARY:\n"
+            "   All models, packet monitors, and diagnostic tools run 100% locally. Zero telemetry is transmitted to cloud servers.\n"
+            "2. 5-GATE PRE-MODEL DLP:\n"
+            "   All prompt inputs, logs, and process telemetry must pass 5-Gate DLP scrubbers (Luhn payment cards, national IDs, credentials, and usernames).\n"
+            "3. SECRETS BOUNDARY:\n"
+            "   Never commit or display local API keys, tokens, or environment files (.env).\n"
+            "4. READ-ONLY MCP AIRLOCK:\n"
+            "   SentinelWire exposes a read-only MCP server (packetsentinel-mcp) providing safe security audit tools.\n"
+        )
+        try:
+            target.write_text(cfg, encoding="utf-8")
+            messagebox.showinfo("Injected Successfully", f"Created {target}!")
+        except Exception as e:
+            messagebox.showerror("Injection Error", f"Could not write file: {e}")
 
     def _toggle_sniffer(self) -> None:
         snap = self._monitor_service.snapshot()
@@ -2085,8 +2333,14 @@ class PacketSentinelDesktopApp:
         self._refresh_telemetry_ui()
 
     def _schedule_telemetry_poll(self) -> None:
-        self._refresh_telemetry_ui()
-        self._telemetry_timer_id = self.root.after(1500, self._schedule_telemetry_poll)
+        try:
+            if not hasattr(self, "root") or not self.root.winfo_exists():
+                return
+            self._refresh_telemetry_ui()
+            if hasattr(self, "root") and self.root.winfo_exists():
+                self._telemetry_timer_id = self.root.after(1500, self._schedule_telemetry_poll)
+        except Exception:
+            pass
 
     def _refresh_telemetry_ui(self) -> None:
         snap = self._monitor_service.snapshot()
@@ -2112,14 +2366,14 @@ class PacketSentinelDesktopApp:
             self.metric_value_labels[3].config(text="DPAPI Protected" if platform.system().lower() == "windows" else "Local (chmod 600)")
 
         if hasattr(self, "alert_tree"):
+            new_alerts_added = False
             for alert in self._monitor_service.recent_alerts(limit=50):
                 row_key = f"{alert.timestamp_utc}|{alert.indicator}|{alert.process_name}"
                 if row_key not in self._threat_rows_seen:
                     self._threat_rows_seen.add(row_key)
-                    self.alert_tree.insert(
-                        "",
+                    self._all_alerts_cache.insert(
                         0,
-                        values=(
+                        (
                             alert.timestamp_utc,
                             alert.indicator,
                             alert.source_feed,
@@ -2127,18 +2381,111 @@ class PacketSentinelDesktopApp:
                             alert.detection_layer,
                         ),
                     )
-                    if hasattr(self, "mc_alert_tree"):
-                        self.mc_alert_tree.insert(
-                            "",
-                            0,
-                            values=(
-                                alert.timestamp_utc,
-                                alert.indicator,
-                                alert.source_feed,
-                                alert.process_name,
-                                alert.detection_layer,
-                            ),
-                        )
+                    new_alerts_added = True
+
+            if new_alerts_added:
+                if len(self._all_alerts_cache) > 200:
+                    self._all_alerts_cache = self._all_alerts_cache[:200]
+                self._apply_alert_filters()
+
+    def _apply_alert_filters(self) -> None:
+        """Filter and render alert table based on search query, feed category, and column sort."""
+        if not hasattr(self, "alert_tree"):
+            return
+
+        query = self.alert_filter_var.get().strip().lower() if hasattr(self, "alert_filter_var") else ""
+        selected_feed = self.alert_feed_filter_var.get().strip() if hasattr(self, "alert_feed_filter_var") else "All Feeds"
+
+        for item in self.alert_tree.get_children():
+            self.alert_tree.delete(item)
+
+        matched_rows: List[Tuple[str, str, str, str, str]] = []
+        for row in self._all_alerts_cache:
+            ts, ind, feed, proc, layer = row
+            if query and not any(query in str(field).lower() for field in (ts, ind, feed, proc, layer)):
+                continue
+            if selected_feed != "All Feeds":
+                feed_lower = feed.lower()
+                sel_lower = selected_feed.lower()
+                if sel_lower == "lots" and "lots" not in feed_lower:
+                    continue
+                elif sel_lower in ("botnet / c2", "c2") and not any(k in feed_lower for k in ("feodo", "threatfox", "botnet", "c2")):
+                    continue
+                elif sel_lower == "urlhaus" and "urlhaus" not in feed_lower:
+                    continue
+                elif sel_lower == "shadow ai" and "shadow" not in feed_lower and "model" not in feed_lower:
+                    continue
+                elif sel_lower == "supply chain" and "supply" not in feed_lower:
+                    continue
+                elif sel_lower == "oisd" and "oisd" not in feed_lower:
+                    continue
+                elif sel_lower == "canary" and "canary" not in feed_lower:
+                    continue
+            matched_rows.append(row)
+
+        col_idx_map = {"time": 0, "indicator": 1, "feed": 2, "process": 3, "layer": 4}
+        idx = col_idx_map.get(self._sort_col, 0)
+        matched_rows.sort(key=lambda r: str(r[idx]).lower(), reverse=self._sort_reverse)
+
+        for r in matched_rows[:150]:
+            self.alert_tree.insert("", tk.END, values=r)
+
+    def _sort_alert_tree_by_column(self, col: str) -> None:
+        """Sort alert table by selected column header and toggle direction."""
+        if self._sort_col == col:
+            self._sort_reverse = not self._sort_reverse
+        else:
+            self._sort_col = col
+            self._sort_reverse = False
+
+        cols = ("time", "indicator", "feed", "process", "layer")
+        display_names = {
+            "time": "Timestamp (UTC)",
+            "indicator": "Flagged Domain / IP",
+            "feed": "Matched Threat Feed",
+            "process": "Attributed Process",
+            "layer": "Detection Layer",
+        }
+        for c in cols:
+            arrow = " ▼" if (c == self._sort_col and self._sort_reverse) else (" ▲" if c == self._sort_col else " ⇅")
+            self.alert_tree.heading(c, text=f"{display_names[c]}{arrow}")
+
+        self._apply_alert_filters()
+
+    def _clear_alert_feed(self) -> None:
+        """Clear alerts from memory and offer to purge local alerts file."""
+        if messagebox.askyesno(
+            "Clear Threat Feed",
+            "Clear all alerts from the view?\n\nClick 'Yes' to also wipe the local alerts.jsonl file on disk.",
+        ):
+            self._all_alerts_cache.clear()
+            self._threat_rows_seen.clear()
+            self._monitor_service.clear_alerts(wipe_disk=True)
+            self._apply_alert_filters()
+            self.show_notification("Threat alert feed cleared & alerts.jsonl reset.", level="success")
+        else:
+            self._all_alerts_cache.clear()
+            self._threat_rows_seen.clear()
+            self._monitor_service.clear_alerts(wipe_disk=False)
+            self._apply_alert_filters()
+
+    def _on_toggle_ai_only_mode(self) -> None:
+        """Toggle AI-only wire filtering mode to save CPU overhead."""
+        enabled = self.ai_only_mode_var.get()
+        self._monitor_service.set_ai_only_mode(enabled)
+        msg = "⚡ AI-Only Wire Filter Mode ENABLED (Low CPU / 60 FPS)" if enabled else "AI-Only Wire Filter Mode DISABLED (Inspecting all system traffic)"
+        self.show_notification(msg, level="info" if enabled else "warning")
+
+    def _on_toggle_mute_heavy_apps(self) -> None:
+        """Toggle ignoring heavy background apps to eliminate packet overload."""
+        enabled = self.mute_heavy_apps_var.get()
+        if enabled:
+            procs = ["steam.exe", "steamservice.exe", "steamwebhelper.exe", "epicgameslauncher.exe", "onedrive.exe", "dropbox.exe", "spotify.exe"]
+            self._monitor_service.set_ignored_processes(procs)
+            self.show_notification("🔇 Background heavy apps muted (Steam, Media, Cloud).", level="info")
+        else:
+            self._monitor_service.set_ignored_processes([])
+            self.show_notification("All background applications unmuted.", level="info")
 
     @property
     def threats_detected(self) -> int:
@@ -2153,7 +2500,7 @@ class PacketSentinelDesktopApp:
     def _on_alert_received(self, alert: Any) -> None:
         """
         Handle a live security alert emitted by the packet monitoring pipeline.
-        Updates counters and inserts a row into both alert tables.
+        Updates counters and inserts a row into the alert table with 5-Gate DLP safety.
         """
         ts = (
             getattr(alert, "timestamp_utc", None)
@@ -2186,10 +2533,17 @@ class PacketSentinelDesktopApp:
         if row_key not in self._threat_rows_seen:
             self._threat_rows_seen.add(row_key)
             row_values = (ts, ind, feed, proc, layer)
-            if hasattr(self, "alert_tree"):
-                self.alert_tree.insert("", 0, values=row_values)
-            if hasattr(self, "mc_alert_tree"):
-                self.mc_alert_tree.insert("", 0, values=row_values)
+            self._all_alerts_cache.insert(0, row_values)
+            if len(self._all_alerts_cache) > 200:
+                self._all_alerts_cache = self._all_alerts_cache[:200]
+            self._apply_alert_filters()
+
+        self.show_notification(
+            f"🚨 Threat Intercepted: {ind} ({proc or 'Unknown Process'})",
+            level="error",
+            action_text="View in Traffic Guard",
+            action_cmd=lambda: (self._select_nav(1), self._dismiss_notification()),
+        )
 
         self._threat_count += 1
         if hasattr(self, "metric_value_labels") and len(self.metric_value_labels) >= 2:
@@ -2519,6 +2873,90 @@ class PacketSentinelDesktopApp:
                 self.mc_proc_combo.set(combo_val)
                 self._inspect_mc_watchdog()
 
+    def _on_alert_tree_context_menu(self, event: tk.Event) -> None:
+        """Show context menu for selected alert row in the live threats table."""
+        row_id = self.alert_tree.identify_row(event.y)
+        if row_id:
+            self.alert_tree.selection_set(row_id)
+        selected = self.alert_tree.selection()
+        if not selected:
+            return
+
+        values = self.alert_tree.item(selected[0], "values")
+        if not values or len(values) < 2:
+            return
+
+        indicator = str(values[1]).strip()
+
+        menu = tk.Menu(self.root, tearoff=0, bg=BG_CARD, fg=TEXT_MAIN, activebackground=PRIMARY_COLOR, activeforeground="#ffffff")
+        menu.add_command(
+            label="🔍 Explain Threat & Forensic Scan",
+            command=self._show_threat_explanation,
+        )
+        menu.add_command(
+            label=f"🛡️ Trust Indicator ({indicator})",
+            command=lambda: self._trust_and_allowlist_domain(indicator),
+        )
+        menu.add_separator()
+        menu.add_command(
+            label="📋 Copy Indicator",
+            command=lambda: self._copy_to_clipboard(indicator),
+        )
+        try:
+            menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            menu.grab_release()
+
+    def _copy_to_clipboard(self, text: str) -> None:
+        """Safely copy string to clipboard."""
+        if not text:
+            return
+        try:
+            self.root.clipboard_clear()
+            self.root.clipboard_append(text)
+        except Exception as exc:
+            logger.warning("Failed to copy to clipboard: %s", exc)
+
+    def _trust_and_allowlist_domain(self, domain_or_ip: str) -> bool:
+        """Add domain or IP to the persistent user allowlist and purge benign alerts from memory."""
+        cleaned = domain_or_ip.strip().lower()
+        if not cleaned:
+            return False
+
+        if cleaned in self.config.user_allowlist_domains:
+            messagebox.showinfo("Already Trusted", f"'{cleaned}' is already in your trusted allowlist.")
+            return False
+
+        confirm = messagebox.askyesno(
+            "Trust & Allow Indicator",
+            f"Are you sure you want to trust and allow '{cleaned}'?\n\n"
+            "This will permanently add the indicator to your allowlist, silence future alerts, "
+            "and remove matching records from the active display.",
+        )
+        if not confirm:
+            return False
+
+        self.config.user_allowlist_domains.append(cleaned)
+        try:
+            self.config.save()
+        except Exception as exc:
+            logger.error("Failed saving allowlist to config: %s", exc)
+
+        # Hot-reload allowlist in running engine
+        if hasattr(self, "_monitor_service") and self._monitor_service and hasattr(self._monitor_service, "_threat_engine") and self._monitor_service._threat_engine:
+            self._monitor_service._threat_engine.sync_allowlist()
+
+        # Remove existing alerts matching this indicator from live cache
+        with self._alerts_lock:
+            self._all_alerts_cache = [
+                row for row in self._all_alerts_cache
+                if row[1].strip().lower() != cleaned
+            ]
+
+        self._apply_alert_filters()
+        messagebox.showinfo("Indicator Trusted", f"Indicator '{cleaned}' was successfully added to your trusted allowlist.")
+        return True
+
     def _inspect_selected_alert_in_monitor(self) -> None:
         """Explicit button action to inspect selected alert in Live Threat Monitor."""
         if hasattr(self, "alert_tree"):
@@ -2545,6 +2983,10 @@ class PacketSentinelDesktopApp:
         self._toggle_voice_recording()
 
     def _get_running_process_candidates(self) -> List[str]:
+        now = time.monotonic()
+        if hasattr(self, "_cached_candidates") and (now - getattr(self, "_last_candidates_ts", 0.0)) < 3.0:
+            return list(self._cached_candidates)
+
         candidates: List[str] = []
         seen_keys: Set[str] = set()
 
@@ -2602,6 +3044,8 @@ class PacketSentinelDesktopApp:
                 seen_keys.add(fn)
                 candidates.append(fn)
 
+        self._cached_candidates = candidates
+        self._last_candidates_ts = now
         return candidates
 
     def _refresh_process_lists(self) -> None:
@@ -2749,119 +3193,296 @@ class PacketSentinelDesktopApp:
 
         ts, indicator, feed, proc, layer = alert_values[:5]
 
-        feed_explanations = {
-            "OISD": "OISD DNS protection blocklist filtering known telemetry, malicious domains, and compromised redirect hosts.",
-            "URLhaus": "Active malware distribution URL tracked by abuse.ch. Known to distribute Trojans, Infostealers, or Ransomware payloads.",
-            "ThreatFox": "Indicator of Compromise (IoC) linked to active malware campaigns, botnets, or Command-and-Control (C2) operations.",
-            "Feodo Tracker": "Botnet Command-and-Control (C2) server used to coordinate compromised botnet drones and exfiltrate credentials.",
-            "HaGeZi Multi": "High-security DNS threat protection filter blocking malicious tracking, telemetry, spyware, and suspicious domains.",
-            "HaGeZi Multi PRO": "High-security DNS threat protection filter blocking malicious tracking, telemetry, spyware, and suspicious domains.",
-            "Phishing Army": "Active phishing domain targeting credential harvesting and identity fraud.",
-            "StevenBlack": "Consolidated hosts threat intelligence blocking malicious domains, trackers, and telemetry.",
-            "Canary": "Safe internal self-test indicator generated by SentinelWire to verify detection pipelines with zero real-world risk.",
-        }
+        # Inspect process context if running
+        forensic_ctx = inspect_running_process(proc)
 
-        explanation = "Flagged by threat intelligence feed as high-risk or malicious traffic."
-        for k, v in feed_explanations.items():
-            if k.lower() in str(feed).lower():
-                explanation = v
-                break
+        # Generate deep plain-English threat breakdown
+        threat_exp = explain_threat(indicator, feed, proc, layer, forensic_ctx)
 
         dialog = tk.Toplevel(self.root)
-        dialog.title(f"Threat Details & Remediation — {indicator}")
-        dialog.geometry("640x520")
+        dialog.title(f"Forensic Triage & Threat Remediation — {indicator}")
+        dialog.geometry("780x680")
+        dialog.minsize(700, 560)
         dialog.configure(bg=BG_CANVAS)
         dialog.transient(self.root)
         dialog.grab_set()
 
-        card = tk.Frame(dialog, bg=BG_CARD, padx=20, pady=16, highlightbackground=BORDER_COLOR, highlightthickness=1)
+        # Canvas with scrollbar for comfortable viewing
+        canvas = tk.Canvas(dialog, bg=BG_CANVAS, highlightthickness=0)
+        v_scroll = ttk.Scrollbar(dialog, orient="vertical", command=canvas.yview)
+        scroll_content = tk.Frame(canvas, bg=BG_CANVAS)
+
+        scroll_content.bind(
+            "<Configure>",
+            lambda e: canvas.configure(scrollregion=canvas.bbox("all")),
+        )
+        cw = canvas.create_window((0, 0), window=scroll_content, anchor="nw")
+        canvas.bind(
+            "<Configure>",
+            lambda e: canvas.itemconfig(cw, width=e.width),
+        )
+        canvas.configure(yscrollcommand=v_scroll.set)
+
+        v_scroll.pack(side=tk.RIGHT, fill=tk.Y)
+        canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+        card = tk.Frame(scroll_content, bg=BG_CARD, padx=20, pady=16, highlightbackground=BORDER_COLOR, highlightthickness=1)
         card.pack(fill=tk.BOTH, expand=True, padx=16, pady=16)
 
-        # Title row
+        # 1. Title Row & Severity Pill
         t_row = tk.Frame(card, bg=BG_CARD)
         t_row.pack(fill=tk.X, pady=(0, 10))
-        tk.Label(t_row, text="🚨 Threat Interception Breakdown", font=("Segoe UI", 12, "bold"), fg=TEXT_TITLE, bg=BG_CARD).pack(side=tk.LEFT)
-        tk.Label(t_row, text=f"Layer: {layer}", font=("Segoe UI", 9, "bold"), fg=BORDER_FOCUS, bg=BG_ELEVATED, padx=8, pady=2).pack(side=tk.RIGHT)
+        tk.Label(
+            t_row,
+            text=f"🚨 {threat_exp.threat_type}",
+            font=("Segoe UI", 12, "bold"),
+            fg=TEXT_TITLE,
+            bg=BG_CARD,
+        ).pack(side=tk.LEFT)
 
-        # Details Grid
+        sev_bg = ALERT_RED if threat_exp.risk_level == "CRITICAL" else (ACCENT_YELLOW if threat_exp.risk_level == "HIGH" else ACCENT_BLUE)
+        sev_fg = "#ffffff" if threat_exp.risk_level in ("CRITICAL", "HIGH") else BG_CANVAS
+        tk.Label(
+            t_row,
+            text=f"SEVERITY: {threat_exp.risk_level}",
+            font=("Segoe UI", 8, "bold"),
+            fg=sev_fg,
+            bg=sev_bg,
+            padx=8,
+            pady=2,
+        ).pack(side=tk.RIGHT, padx=(6, 0))
+
+        tk.Label(
+            t_row,
+            text=f"Layer: {layer}",
+            font=("Segoe UI", 8, "bold"),
+            fg=BORDER_FOCUS,
+            bg=BG_ELEVATED,
+            padx=8,
+            pady=2,
+        ).pack(side=tk.RIGHT)
+
+        # 2. Details Grid
         details = [
-            ("Flagged Target / Indicator:", indicator, ALERT_RED),
-            ("Source Intelligence Feed:", feed, "#c084fc"),
-            ("Attributed Origin Process:", proc or "System / Wire Socket", TEXT_TITLE),
-            ("Detection Timestamp (UTC):", ts, TEXT_MUTED),
+            ("Target / Indicator:", indicator, ALERT_RED),
+            ("Source Threat Feed:", feed, "#c084fc"),
+            ("Origin Process:", proc or "System / Wire Socket", TEXT_TITLE),
+            ("Detection Timestamp:", ts, TEXT_MUTED),
         ]
         for label, val, val_color in details:
             d_row = tk.Frame(card, bg=BG_CARD)
             d_row.pack(fill=tk.X, pady=2)
-            tk.Label(d_row, text=label, font=("Segoe UI", 9, "bold"), fg=TEXT_MUTED, bg=BG_CARD, width=24, anchor="w").pack(side=tk.LEFT)
+            tk.Label(d_row, text=label, font=("Segoe UI", 9, "bold"), fg=TEXT_MUTED, bg=BG_CARD, width=22, anchor="w").pack(side=tk.LEFT)
             tk.Label(d_row, text=val, font=("Consolas" if "Target" in label else "Segoe UI", 9), fg=val_color, bg=BG_CARD, anchor="w").pack(side=tk.LEFT, fill=tk.X, expand=True)
 
-        # Plain-English Explanation Box
-        tk.Label(card, text="Plain-English Threat Analysis:", font=("Segoe UI", 9, "bold"), fg=TEXT_TITLE, bg=BG_CARD).pack(anchor=tk.W, pady=(12, 4))
-        exp_box = tk.Text(card, bg=BG_CANVAS, fg=TEXT_BODY, font=("Segoe UI", 9), relief=tk.FLAT, wrap=tk.WORD, height=4, padx=8, pady=8, highlightbackground=BORDER_COLOR, highlightthickness=1)
-        exp_box.pack(fill=tk.X, pady=(0, 12))
-        exp_box.insert(tk.END, f"{explanation}\n\nSentinelWire intercepted this communication locally. 0 outbound telemetry was transmitted to any third party.")
+        # 3. Plain-English Threat Analysis Box
+        tk.Label(card, text="Plain-English Threat Analysis & Context:", font=("Segoe UI", 9, "bold"), fg=TEXT_TITLE, bg=BG_CARD).pack(anchor=tk.W, pady=(12, 4))
+        exp_box = tk.Text(card, bg=BG_CANVAS, fg=TEXT_BODY, font=("Segoe UI", 9), relief=tk.FLAT, wrap=tk.WORD, height=5, padx=8, pady=8, highlightbackground=BORDER_COLOR, highlightthickness=1)
+        exp_box.pack(fill=tk.X, pady=(0, 8))
+        exp_box.insert(tk.END, threat_exp.why_suspicious)
         exp_box.config(state="disabled")
 
-        # Action Buttons
-        tk.Label(card, text="Recommended Remediation Actions:", font=("Segoe UI", 9, "bold"), fg=TEXT_TITLE, bg=BG_CARD).pack(anchor=tk.W, pady=(0, 6))
+        # 4. Potential Attack Vectors
+        if threat_exp.attack_vectors:
+            tk.Label(card, text="Probable Attack Vectors & Execution Context:", font=("Segoe UI", 9, "bold"), fg=TEXT_TITLE, bg=BG_CARD).pack(anchor=tk.W, pady=(4, 2))
+            av_frame = tk.Frame(card, bg=BG_CANVAS, padx=8, pady=6, highlightbackground=BORDER_COLOR, highlightthickness=1)
+            av_frame.pack(fill=tk.X, pady=(0, 10))
+            for av in threat_exp.attack_vectors:
+                tk.Label(av_frame, text=f"• {av}", font=("Segoe UI", 8), fg=TEXT_BODY, bg=BG_CANVAS, anchor="w", justify=tk.LEFT).pack(fill=tk.X, pady=1)
 
-        def _terminate_process() -> None:
+        # 5. Automated Forensic Triage Findings Section
+        tk.Label(card, text="Automated Forensic Triage & Binary Inspection:", font=("Segoe UI", 9, "bold"), fg=TEXT_TITLE, bg=BG_CARD).pack(anchor=tk.W, pady=(6, 4))
+        forensic_box = tk.Frame(card, bg=BG_CANVAS, padx=10, pady=8, highlightbackground=BORDER_COLOR, highlightthickness=1)
+        forensic_box.pack(fill=tk.X, pady=(0, 10))
+
+        # Runtime lineage info
+        if forensic_ctx:
+            exe_display = forensic_ctx.exe_path or "Path unavailable"
+            auth_str = "Not Checked"
+            if forensic_ctx.authenticode:
+                auth = forensic_ctx.authenticode
+                auth_str = f"{auth.status} ({auth.signer_subject or 'No Subject'})"
+            lineage_text = (
+                f"PID: {forensic_ctx.pid} | Parent: {forensic_ctx.parent_name or 'N/A'} (PID {forensic_ctx.parent_pid})\n"
+                f"Binary: {exe_display}\n"
+                f"Authenticode Signature: {auth_str}"
+            )
+            if forensic_ctx.is_masquerading:
+                lineage_text += f"\n🚨 WARNING: {forensic_ctx.masquerading_reason}"
+        else:
+            lineage_text = f"Process '{proc}' is not currently running in active memory or requires administrative access."
+
+        proc_lbl = tk.Label(forensic_box, text=lineage_text, font=("Consolas", 8), fg=TEXT_BODY, bg=BG_CANVAS, justify=tk.LEFT, anchor="w")
+        proc_lbl.pack(fill=tk.X)
+
+        # Container for scanned findings
+        scan_results_frame = tk.Frame(forensic_box, bg=BG_CANVAS)
+        scan_results_frame.pack(fill=tk.X, pady=(6, 0))
+
+        detected_rogue_dlls: List[RogueDllFinding] = []
+        detected_persistence: List[PersistenceFinding] = []
+
+        def _run_deep_forensic_scan() -> None:
+            nonlocal detected_rogue_dlls, detected_persistence
+            scan_btn.config(state="disabled", text="Scanning...")
+
+            for widget in scan_results_frame.winfo_children():
+                widget.destroy()
+
+            # Target directory to scan
+            target_dir = None
+            if forensic_ctx and forensic_ctx.exe_path:
+                target_dir = Path(forensic_ctx.exe_path).parent
+            else:
+                # Fallback to standard appdata candidate
+                appdata = os.environ.get("APPDATA") or ""
+                p_clean = proc.lower().replace(".exe", "")
+                candidate = Path(appdata) / p_clean
+                if candidate.exists():
+                    target_dir = candidate
+
+            if target_dir and target_dir.exists():
+                detected_rogue_dlls = scan_directory_for_unsigned_dlls(target_dir, max_dlls=40)
+            else:
+                detected_rogue_dlls = []
+
+            detected_persistence = check_persistence_entries(proc, forensic_ctx.exe_path if forensic_ctx else None)
+
+            # Display findings
+            header = tk.Label(
+                scan_results_frame,
+                text=f"Scan Complete: {len(detected_rogue_dlls)} DLL(s) checked, {len(detected_persistence)} persistence entry(ies) audited.",
+                font=("Segoe UI", 8, "bold"),
+                fg=BORDER_FOCUS,
+                bg=BG_CANVAS,
+                anchor="w",
+            )
+            header.pack(fill=tk.X, pady=(2, 4))
+
+            suspicious_dlls = [d for d in detected_rogue_dlls if d.is_suspicious]
+            if suspicious_dlls:
+                for d in suspicious_dlls:
+                    row = tk.Frame(scan_results_frame, bg=BG_CANVAS)
+                    row.pack(fill=tk.X, pady=1)
+                    tk.Label(row, text="⚠️ [ROGUE DLL CANDIDATE]", font=("Segoe UI", 8, "bold"), fg=ALERT_RED, bg=BG_CANVAS).pack(side=tk.LEFT)
+                    tk.Label(row, text=f" {d.dll_name} — {d.reason}", font=("Segoe UI", 8), fg=TEXT_TITLE, bg=BG_CANVAS).pack(side=tk.LEFT)
+                quarantine_btn.config(state="normal")
+            else:
+                tk.Label(scan_results_frame, text="✅ No unsigned or rogue DLLs detected in binary directory.", font=("Segoe UI", 8), fg=ACCENT_GREEN, bg=BG_CANVAS, anchor="w").pack(fill=tk.X)
+
+            if detected_persistence:
+                for p in detected_persistence:
+                    row = tk.Frame(scan_results_frame, bg=BG_CANVAS)
+                    row.pack(fill=tk.X, pady=1)
+                    tk.Label(row, text="📌 [PERSISTENCE]", font=("Segoe UI", 8, "bold"), fg=ACCENT_YELLOW, bg=BG_CANVAS).pack(side=tk.LEFT)
+                    tk.Label(row, text=f" {p.location}: [{p.name}] {p.command}", font=("Segoe UI", 8), fg=TEXT_BODY, bg=BG_CANVAS).pack(side=tk.LEFT)
+
+            scan_btn.config(state="normal", text="Re-Scan Directory & Persistence")
+
+        scan_btn = create_styled_button(
+            forensic_box,
+            text="Run Deep Sideload & Persistence Scan",
+            icon="🔍",
+            style="secondary",
+            command=_run_deep_forensic_scan,
+            font=FONT_BODY,
+            padx=8,
+            pady=3,
+        )
+        scan_btn.pack(anchor=tk.W, pady=(6, 0))
+
+        # 6. Recommended Containment & Remediation Actions
+        tk.Label(card, text="Recommended Remediation Actions (1-Click):", font=("Segoe UI", 9, "bold"), fg=TEXT_TITLE, bg=BG_CARD).pack(anchor=tk.W, pady=(6, 4))
+
+        def _terminate_process_action() -> None:
             if not proc or proc.lower() in ("unknown", "system"):
                 messagebox.showwarning("Cannot Terminate", "Origin process is system-level or unknown.")
                 return
-            if messagebox.askyesno("Confirm Process Termination", f"Terminate all running instances of '{proc}'?"):
-                import psutil
-                killed = 0
-                for p in psutil.process_iter(["name"]):
-                    try:
-                        if (p.info.get("name") or "").lower() == proc.lower():
-                            p.kill()
-                            killed += 1
-                    except Exception:
-                        continue
-                messagebox.showinfo("Process Terminated", f"Successfully terminated {killed} instance(s) of '{proc}'.")
-                dialog.destroy()
+            if messagebox.askyesno("Confirm Process Termination", f"Terminate all running instances and child processes of '{proc}'?"):
+                pid_to_kill = forensic_ctx.pid if forensic_ctx else 0
+                if pid_to_kill > 0:
+                    success, msg = terminate_process_tree(pid_to_kill)
+                else:
+                    import psutil
+                    killed = 0
+                    for p in psutil.process_iter(["name"]):
+                        try:
+                            if (p.info.get("name") or "").lower() == proc.lower():
+                                p.kill()
+                                killed += 1
+                        except Exception:
+                            continue
+                    success, msg = True, f"Terminated {killed} instance(s) of '{proc}'."
 
-        def _copy_firewall_rule() -> None:
-            rule_cmd = (
-                f'New-NetFirewallRule -DisplayName "SentinelWire_Block_{indicator}" '
-                f'-Direction Outbound -RemoteAddress "{indicator}" -Action Block'
+                if success:
+                    messagebox.showinfo("Process Terminated", msg)
+                    dialog.destroy()
+                else:
+                    messagebox.showerror("Termination Failed", msg)
+
+        def _apply_firewall_action() -> None:
+            success, msg = apply_firewall_block_rule(indicator)
+            if success:
+                messagebox.showinfo("Firewall Block Active", msg)
+            else:
+                cmds = get_firewall_block_commands(indicator)
+                try:
+                    self.root.clipboard_clear()
+                    self.root.clipboard_append(cmds["powershell"])
+                except Exception:
+                    pass
+                messagebox.showwarning(
+                    "Elevation Required",
+                    f"{msg}\n\nPowerShell command copied to clipboard. Run as Administrator:\n\n{cmds['powershell']}",
+                )
+
+        def _quarantine_dlls_action() -> None:
+            suspicious_dlls = [d for d in detected_rogue_dlls if d.is_suspicious]
+            if not suspicious_dlls:
+                messagebox.showinfo("No Rogue DLLs", "No unsigned or suspicious DLLs have been flagged to quarantine.")
+                return
+            if messagebox.askyesno("Confirm Quarantine", f"Quarantine {len(suspicious_dlls)} suspicious DLL(s) to secure local storage?"):
+                quarantined_count = 0
+                for d in suspicious_dlls:
+                    ok, _, _ = quarantine_file(d.dll_path)
+                    if ok:
+                        quarantined_count += 1
+                messagebox.showinfo("Quarantine Complete", f"Successfully moved {quarantined_count} rogue DLL(s) to quarantine.")
+                _run_deep_forensic_scan()
+
+        def _copy_sanitized_dossier() -> None:
+            dossier = generate_sanitized_incident_dossier(
+                indicator=indicator,
+                feed=feed,
+                proc=proc,
+                layer=layer,
+                threat_exp=threat_exp,
+                forensic_ctx=forensic_ctx,
+                rogue_dlls=detected_rogue_dlls,
+                persistence=detected_persistence,
+                sanitizer=self.sanitizer,
             )
+            self._save_voice_prompt_to_mcp_buffer(dossier)
             try:
                 self.root.clipboard_clear()
-                self.root.clipboard_append(rule_cmd)
-                messagebox.showinfo("Firewall Rule Copied", f"PowerShell firewall block command copied to clipboard:\n\n{rule_cmd}")
-            except Exception as exc:
-                messagebox.showerror("Clipboard Error", str(exc))
-
-        def _ask_ai_remediation() -> None:
-            prompt = (
-                f"Security Incident Alert Analysis:\n"
-                f"Indicator: {indicator}\n"
-                f"Threat Feed: {feed}\n"
-                f"Process: {proc}\n"
-                f"Layer: {layer}\n"
-                f"Please explain what this threat does, how it may have gotten onto this machine, and the steps to clean it."
-            )
-            clean_p = self.sanitizer.sanitize_text(prompt)
-            self._save_voice_prompt_to_mcp_buffer(clean_p)
-            try:
-                self.root.clipboard_clear()
-                self.root.clipboard_append(clean_p)
+                self.root.clipboard_append(dossier)
             except Exception:
                 pass
-            messagebox.showinfo("AI Incident Prompt Ready", "Sanitized incident prompt sent to MCP buffer and clipboard! Ask your AI assistant to analyze it.")
+            messagebox.showinfo(
+                "Incident Dossier Copied",
+                "Sanitized 5-Gate incident dossier copied to clipboard & local MCP buffer!\n\n"
+                "You can now paste it directly into an AI assistant (Claude, Cursor, Copilot) with 0 personal data leaks.",
+            )
 
         btn_row = tk.Frame(card, bg=BG_CARD)
-        btn_row.pack(fill=tk.X, pady=(4, 0))
+        btn_row.pack(fill=tk.X, pady=(6, 0))
 
         create_styled_button(
             btn_row,
-            text="Terminate Process",
+            text="Kill Process Tree",
             icon="🛑",
             style="danger",
-            command=_terminate_process,
+            command=_terminate_process_action,
             font=FONT_BOLD,
             padx=10,
             pady=5,
@@ -2869,10 +3490,40 @@ class PacketSentinelDesktopApp:
 
         create_styled_button(
             btn_row,
-            text="Copy Firewall Block",
+            text="Block in Firewall",
             icon="🛡️",
             style="primary",
-            command=_copy_firewall_rule,
+            command=_apply_firewall_action,
+            font=FONT_BOLD,
+            padx=10,
+            pady=5,
+        ).pack(side=tk.LEFT, padx=(0, 6))
+
+        quarantine_btn = create_styled_button(
+            btn_row,
+            text="Quarantine Rogue DLLs",
+            icon="🧹",
+            style="accent",
+            command=_quarantine_dlls_action,
+            font=FONT_BOLD,
+            padx=10,
+            pady=5,
+        )
+        quarantine_btn.pack(side=tk.LEFT, padx=(0, 6))
+        quarantine_btn.config(state="disabled")
+
+        def _trust_indicator_action() -> None:
+            if not indicator:
+                return
+            if self._trust_and_allowlist_domain(indicator):
+                dialog.destroy()
+
+        create_styled_button(
+            btn_row,
+            text="Trust Indicator",
+            icon="🛡️",
+            style="accent",
+            command=_trust_indicator_action,
             font=FONT_BOLD,
             padx=10,
             pady=5,
@@ -2880,10 +3531,10 @@ class PacketSentinelDesktopApp:
 
         create_styled_button(
             btn_row,
-            text="Ask AI Remediation",
-            icon="🤖",
-            style="accent",
-            command=_ask_ai_remediation,
+            text="Copy AI Dossier",
+            icon="📋",
+            style="secondary",
+            command=_copy_sanitized_dossier,
             font=FONT_BOLD,
             padx=10,
             pady=5,
@@ -3012,6 +3663,27 @@ class PacketSentinelDesktopApp:
                 activebackground=BG_CARD,
                 activeforeground=TEXT_TITLE,
             ).pack(anchor=tk.W, pady=2)
+
+        # Secure Web Gateway Toggle (Optional AI Web Pulls)
+        self.var_web_gateway = tk.BooleanVar(value=self.vault_settings.enable_web_gateway)
+        tk.Checkbutton(
+            s2,
+            text="🌐 Enable Secure Web Gateway MCP (safe_fetch_web_content for AI agents)",
+            variable=self.var_web_gateway,
+            font=("Segoe UI", 9, "bold"),
+            fg=BORDER_FOCUS if self.vault_settings.enable_web_gateway else TEXT_TITLE,
+            bg=BG_CARD,
+            selectcolor=BG_CANVAS,
+            activebackground=BG_CARD,
+            activeforeground=TEXT_TITLE,
+        ).pack(anchor=tk.W, pady=(8, 2))
+        tk.Label(
+            s2,
+            text="   Enforces SSRF defense, 95k threat feed checks, binary blocker, and prompt-injection stripping.",
+            font=("Segoe UI", 8),
+            fg=TEXT_MUTED,
+            bg=BG_CARD,
+        ).pack(anchor=tk.W, pady=(0, 2))
 
         # Section 3: Notification & Audio Alerts
         s3 = tk.Frame(scrollable_frame, bg=BG_CARD, padx=14, pady=12, highlightbackground=BORDER_COLOR, highlightthickness=1)
@@ -3162,6 +3834,53 @@ class PacketSentinelDesktopApp:
         )
         nuke_btn.pack(side=tk.RIGHT)
 
+        # Section 5: Developer Machine Security & Port Exposure Audit
+        s5 = create_card_frame(scrollable_frame, padx=14, pady=12)
+        s5.pack(fill=tk.X, pady=(0, 16))
+
+        tk.Label(s5, text="5. Developer Machine Security & Port Exposure Audit", font=FONT_SECTION, fg=TEXT_MAIN, bg=BG_CARD).pack(anchor=tk.W, pady=(0, 4))
+        tk.Label(
+            s5,
+            text="Scans local sockets (<5ms) for dev servers/databases accidentally exposed to the LAN on 0.0.0.0 (Ollama 11434, Redis, Postgres, Vite) and checks environment variables for hijacking:",
+            font=FONT_BODY,
+            fg=TEXT_MUTED,
+            bg=BG_CARD,
+            wraplength=700,
+            justify=tk.LEFT,
+        ).pack(anchor=tk.W, pady=(0, 6))
+
+        self.sec_audit_text = tk.Text(
+            s5,
+            bg=BG_CANVAS,
+            fg=TEXT_BODY,
+            font=FONT_MONO,
+            relief=tk.FLAT,
+            wrap=tk.NONE,
+            height=7,
+            highlightbackground=BORDER_COLOR,
+            highlightthickness=1,
+            padx=8,
+            pady=6,
+        )
+        self.sec_audit_text.pack(fill=tk.BOTH, expand=True, pady=(0, 8))
+        self.sec_audit_text.insert(tk.END, "Ready to audit. Click 'Run Security Audit' below to inspect listening ports & environment.")
+        self.sec_audit_text.config(state=tk.DISABLED)
+
+        sec_act_row = tk.Frame(s5, bg=BG_CARD)
+        sec_act_row.pack(fill=tk.X)
+
+        run_audit_btn = create_styled_button(
+            sec_act_row,
+            text="Run Security Audit",
+            icon="🛡️",
+            style="primary",
+            command=self._run_security_audit_handler,
+            font=FONT_BOLD,
+            padx=10,
+            pady=5,
+        )
+        run_audit_btn.pack(side=tk.LEFT, padx=(0, 6))
+
         self._refresh_diag_logs()
 
     def _save_settings_vault(self) -> None:
@@ -3185,6 +3904,7 @@ class PacketSentinelDesktopApp:
             dlp_gate_usernames=self.var_gate_users.get(),
             dlp_gate_national_ids=self.var_gate_ids.get(),
             dlp_gate_ips=self.var_gate_ips.get(),
+            enable_web_gateway=self.var_web_gateway.get(),
         )
 
         ok = self.vault_mgr.save_settings(self.vault_settings)
@@ -3467,6 +4187,45 @@ class PacketSentinelDesktopApp:
         except Exception as e:
             messagebox.showerror("Error Opening AppData", f"Could not open directory: {e}")
 
+    def _quick_run_security_audit(self) -> None:
+        self._select_nav(3)  # Switch to Settings & Vault tab
+        self._run_security_audit_handler()
+
+    def _run_security_audit_handler(self) -> None:
+        if not hasattr(self, "sec_audit_text"):
+            return
+        self.sec_audit_text.config(state=tk.NORMAL)
+        self.sec_audit_text.delete("1.0", tk.END)
+
+        port_res = audit_listening_ports()
+        env_res = audit_environment_security()
+
+        lines = [
+            f"=== Developer Machine Security Audit ({time.strftime('%Y-%m-%d %H:%M:%S')}) ===",
+            f"Total listening sockets evaluated: {port_res.get('total_listeners', 0)}",
+        ]
+
+        exposed = port_res.get("exposed_ports", [])
+        if exposed:
+            lines.append(f"\n⚠️  [WARN] {len(exposed)} Port(s) Exposed on 0.0.0.0 (Local Network Accessible):")
+            for p in exposed:
+                lines.append(
+                    f"  • Port {p['port']}/TCP ({p.get('service', 'unknown')}): PID {p.get('pid')} [{p.get('process_name')}] - {p.get('recommendation', '')}"
+                )
+        else:
+            lines.append("\n✅ All dev ports & databases safely bound to 127.0.0.1 (No 0.0.0.0 exposure).")
+
+        env_findings = env_res.get("findings", [])
+        if env_findings:
+            lines.append(f"\n⚠️  [WARN] {len(env_findings)} Suspicious Environment Variables:")
+            for f in env_findings:
+                lines.append(f"  • [{f.get('severity')}] {f.get('variable')}: {f.get('description')}")
+        else:
+            lines.append("✅ Environment variables clean (No proxy hijack or loader injection detected).")
+
+        self.sec_audit_text.insert(tk.END, "\n".join(lines))
+        self.sec_audit_text.config(state=tk.DISABLED)
+
     def _refresh_diag_logs(self) -> None:
         log_file = get_log_dir() / "sentinelwire.log"
         self.diag_log_text.delete("1.0", tk.END)
@@ -3534,6 +4293,66 @@ class PacketSentinelDesktopApp:
             pady=6,
         )
         close_b.pack(side=tk.RIGHT)
+
+    def _copy_ai_diagnostic_summary(self) -> None:
+        """
+        Gathers sanitized recent operational logs, voice status, and threat alerts,
+        scrubs them via 5-Gate DLP to guarantee zero machine leaks, and copies directly
+        to the clipboard for instant AI assistant pasting and debugging.
+        """
+        lines = []
+        lines.append("=== SentinelWire Diagnostic & AI Debug Summary ===")
+        lines.append(f"Timestamp UTC: {time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())}")
+        lines.append(f"OS: {platform.system()} {platform.release()} ({platform.machine()})")
+        lines.append(f"Python: {platform.python_version()} ({platform.python_implementation()})")
+
+        # Telemetry Snapshot
+        snap = self._monitor_service.snapshot()
+        lines.append(f"Sniffer Running: {snap.running} (Mode: {snap.capture_mode})")
+        lines.append(f"Packets Monitored: {snap.events_inspected:,} | Threats Flagged: {snap.alerts_emitted:,}")
+
+        # Voice Engine Status
+        if self._voice_status:
+            lines.append(f"Voice Engine Ready: {self._voice_status.ready} (STT: {self._voice_status.stt_installed}, Cached: {self._voice_status.model_cached}, Detail: {self._voice_status.detail})")
+        else:
+            lines.append("Voice Engine Status: Uninitialized")
+
+        # Recent Threats
+        recent_alerts = list(self._monitor_service.recent_alerts(limit=10))
+        lines.append(f"\n--- Recent Intercepted Threats ({len(recent_alerts)}) ---")
+        if recent_alerts:
+            for a in recent_alerts:
+                lines.append(f"  * [{a.timestamp_utc}] {a.indicator} ({a.source_feed}) -> Process: {a.process_name} (Layer: {a.detection_layer})")
+        else:
+            lines.append("  (No suspicious network connections flagged)")
+
+        # Recent Logs (tail 40 lines of sentinelwire.log)
+        log_file = get_log_dir() / "sentinelwire.log"
+        lines.append("\n--- Recent Operational Logs (Tail 40 lines) ---")
+        if log_file.exists():
+            try:
+                with open(log_file, "r", encoding="utf-8", errors="replace") as f:
+                    log_lines = f.readlines()
+                    lines.extend(l.rstrip() for l in log_lines[-40:])
+            except Exception as exc:
+                lines.append(f"[Error reading log file: {exc}]")
+        else:
+            lines.append("  (Log file not created yet)")
+
+        raw_summary = "\n".join(lines)
+        clean_summary = sanitize_log_text(raw_summary, sanitizer=self.sanitizer)
+
+        try:
+            self.root.clipboard_clear()
+            self.root.clipboard_append(clean_summary)
+            messagebox.showinfo(
+                "Logs Copied for AI",
+                "✅ Sanitized diagnostic logs and alert summary copied to clipboard!\n\n"
+                "All personal usernames, IP addresses, and file paths have been scrubbed.\n"
+                "You can now paste (Ctrl + V) directly into chat for instant AI debugging.",
+            )
+        except Exception as exc:
+            logger.warning(f"Failed to copy AI diagnostic summary to clipboard: {exc}")
 
     def _view_kill_incidents(self) -> None:
         incidents = list_kill_switch_incidents(limit=10)

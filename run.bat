@@ -60,8 +60,9 @@ pause
 exit /b 1
 
 :python_found
-:: Set companion on PYTHONPATH
+:: Set companion on PYTHONPATH and prevent Intel OpenMP runtime collisions on Windows
 set "PYTHONPATH=%~dp0companion;%PYTHONPATH%"
+set "KMP_DUPLICATE_LIB_OK=TRUE"
 
 :: If arguments provided (e.g. run.bat --ui), execute directly
 if not "%~1"=="" (

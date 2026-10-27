@@ -51,6 +51,7 @@ class VaultSettings:
     dlp_gate_usernames: bool = True
     dlp_gate_national_ids: bool = True
     dlp_gate_ips: bool = True
+    enable_web_gateway: bool = False
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -81,6 +82,7 @@ class VaultSettings:
             dlp_gate_usernames=bool(data.get("dlp_gate_usernames", True)),
             dlp_gate_national_ids=bool(data.get("dlp_gate_national_ids", True)),
             dlp_gate_ips=bool(data.get("dlp_gate_ips", True)),
+            enable_web_gateway=bool(data.get("enable_web_gateway", False)),
         )
 
 

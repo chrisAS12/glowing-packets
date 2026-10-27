@@ -18,7 +18,12 @@ from pathlib import Path
 from typing import List, Optional, Set, Tuple
 
 from .config import VERIFIED_TSHARK_PATHS, AppConfig
-from .lots_guard import check_lots_risk
+from .lots_guard import (
+    PACKAGE_MANAGERS,
+    check_ai_egress_risk,
+    check_lots_risk,
+    check_supply_chain_risk,
+)
 from .notifier import AlertNotifier
 from .process_mapper import UNKNOWN_PROCESS, ProcessInfo, ProcessMapper
 from .security import (
@@ -30,6 +35,66 @@ from .security import (
 from .threat_intel import ThreatIntelEngine, ThreatMatch
 
 logger = logging.getLogger("packetsentinel.capture")
+
+AI_PROCESS_NAMES: frozenset[str] = frozenset(
+    {
+        "cursor.exe",
+        "cursor",
+        "code.exe",
+        "code",
+        "kiro.exe",
+        "kiro",
+        "windsurf.exe",
+        "windsurf",
+        "claude.exe",
+        "claude",
+        "antigravity.exe",
+        "antigravity",
+        "python.exe",
+        "python",
+        "python3.exe",
+        "python3",
+        "node.exe",
+        "node",
+        "powershell.exe",
+        "pwsh.exe",
+        "cmd.exe",
+        "curl.exe",
+        "curl",
+        "npm.exe",
+        "npm",
+        "npm.cmd",
+        "pnpm.exe",
+        "pnpm",
+        "pnpm.cmd",
+        "yarn.exe",
+        "yarn",
+        "yarn.cmd",
+        "pip.exe",
+        "pip",
+        "pip3.exe",
+        "pip3",
+        "poetry.exe",
+        "poetry",
+        "cargo.exe",
+        "cargo",
+        "sentinelwire-self-test",
+        "sentinelwire",
+        "test.exe",
+    }
+)
+
+DEFAULT_IGNORED_PROCESSES: frozenset[str] = frozenset(
+    {
+        "steam.exe",
+        "steamservice.exe",
+        "steamwebhelper.exe",
+        "epicgameslauncher.exe",
+        "onedrive.exe",
+        "dropbox.exe",
+        "spotify.exe",
+    }
+)
 
 
 @dataclass(frozen=True)
@@ -175,8 +240,26 @@ class PacketSentinelMonitor:
         self._baseline_initialized: bool = False
         self._process_packet_counts: Dict[str, int] = {}
         self._pid_packet_counts: Dict[int, int] = {}
+        self._ai_only_mode: bool = False
+        self._ignored_processes: Set[str] = set(DEFAULT_IGNORED_PROCESSES)
 
         atexit.register(self.stop)
+
+    def set_ai_only_mode(self, enabled: bool) -> None:
+        """Toggle AI-only filtering to eliminate 90%+ of non-AI background packet processing."""
+        self._ai_only_mode = bool(enabled)
+
+    def set_ignored_processes(self, procs: Sequence[str]) -> None:
+        """Set process basenames to ignore during packet inspection."""
+        self._ignored_processes = {p.lower().strip() for p in procs if p.strip()}
+
+    @property
+    def ai_only_mode(self) -> bool:
+        return self._ai_only_mode
+
+    @property
+    def ignored_processes(self) -> Set[str]:
+        return set(self._ignored_processes)
 
     @property
     def packets_inspected(self) -> int:
@@ -189,6 +272,11 @@ class PacketSentinelMonitor:
     @property
     def tls_sni_seen(self) -> int:
         return self._tls_sni_seen
+
+    @property
+    def threat_engine(self) -> ThreatIntelEngine:
+        """Expose the threat intel engine for runtime allowlist updates and metric queries."""
+        return self._threat_engine
 
     def get_process_event_count(self, process_name: str, pid: Optional[int] = None) -> int:
         """Return total wire/socket events attributed to a specific process or PID."""
@@ -281,6 +369,26 @@ class PacketSentinelMonitor:
             if proc.pid > 0:
                 self._pid_packet_counts[proc.pid] = self._pid_packet_counts.get(proc.pid, 0) + 1
 
+            # Performance filtering: skip packet inspection for ignored background processes
+            # (unless an anomalous LOTS webhook connection is detected)
+            if self._ignored_processes and p_name in self._ignored_processes:
+                if domain:
+                    lots_risk = check_lots_risk(proc.name, domain, port=dst_port or 443)
+                    if not (lots_risk and lots_risk.is_threat):
+                        return
+                else:
+                    return
+
+            # AI-only mode: only inspect AI editors/tools, script interpreters, and test canaries
+            is_canary = bool(domain and "canary" in domain.lower())
+            if self._ai_only_mode and not is_canary and p_name not in AI_PROCESS_NAMES and p_name != "unknown":
+                if domain:
+                    lots_risk = check_lots_risk(proc.name, domain, port=dst_port or 443)
+                    if not (lots_risk and lots_risk.is_threat):
+                        return
+                else:
+                    return
+
         # 1. Check domain name (DNS query or TLS ClientHello SNI)
         if domain:
             for single_dom in domain.split(","):
@@ -322,6 +430,42 @@ class PacketSentinelMonitor:
                     )
                     return
 
+                supply_risk = check_supply_chain_risk(proc.name, clean_dom, port=dst_port or 443)
+                if supply_risk and supply_risk.is_threat:
+                    supply_match = ThreatMatch(
+                        indicator=clean_dom,
+                        matched_rule=supply_risk.matched_domain or clean_dom,
+                        source_feed=f"Supply-Chain-Guard ({supply_risk.category.upper()})",
+                        match_type=f"supply_chain_{supply_risk.severity.lower()}",
+                    )
+                    self._notifier.notify_match(
+                        match=supply_match,
+                        process=proc,
+                        protocol=protocol,
+                        dst_ip=dst_ip or "",
+                        dst_port=dst_port,
+                        detection_layer="supply-chain-wire",
+                    )
+                    return
+
+                ai_egress_risk = check_ai_egress_risk(proc.name, clean_dom, port=dst_port or 443)
+                if ai_egress_risk and ai_egress_risk.is_threat:
+                    ai_match = ThreatMatch(
+                        indicator=clean_dom,
+                        matched_rule=ai_egress_risk.matched_domain or clean_dom,
+                        source_feed="Shadow-AI-Guard (UNVETTED_MODEL_GATEWAY)",
+                        match_type=f"shadow_ai_{ai_egress_risk.severity.lower()}",
+                    )
+                    self._notifier.notify_match(
+                        match=ai_match,
+                        process=proc,
+                        protocol=protocol,
+                        dst_ip=dst_ip or "",
+                        dst_port=dst_port,
+                        detection_layer="shadow-ai-wire",
+                    )
+                    return
+
         # 2. Check destination IP against botnet C2 / malicious IP feeds
         if dst_ip:
             for single_ip in dst_ip.split(","):
@@ -354,8 +498,9 @@ class PacketSentinelMonitor:
         for idx_str, _ in ifaces:
             cmd.extend(["-i", idx_str])
 
-        # BPF filter captures only DNS (port 53), HTTPS/TLS handshakes (port 443), and new TCP SYN packets
-        bpf_filter = "udp port 53 or tcp port 53 or tcp dst port 443 or (tcp[tcpflags] & tcp-syn != 0)"
+        # Optimized BPF filter: captures DNS (port 53), TCP SYN handshakes, and TLS ClientHello records (0x16)
+        # Avoids capturing bulk encrypted payload segments (video/audio streaming) to eliminate CPU spikes
+        bpf_filter = "udp port 53 or tcp port 53 or (tcp[tcpflags] & tcp-syn != 0) or (tcp port 443 and tcp[((tcp[12:1] & 0xf0) >> 2):1] == 0x16)"
         cmd.extend(
             [
                 "-l",  # Flush stdout line-by-line immediately
@@ -499,16 +644,17 @@ class PacketSentinelMonitor:
                             explicit_process=proc_info,
                         )
 
-                # 2. Check Windows DNS Resolver Cache every 2.0 seconds
+                # 2. Check Windows DNS Resolver Cache only when tshark is not active, throttled to 4.0s
                 now = time.monotonic()
-                if ipconfig_path and (now - last_dnscache_poll) >= 2.0:
+                tshark_alive = self._tshark_proc is not None and self._tshark_proc.poll() is None
+                if not tshark_alive and ipconfig_path and (now - last_dnscache_poll) >= 4.0:
                     last_dnscache_poll = now
                     self._poll_windows_dns_cache(ipconfig_path)
 
             except Exception:
                 pass
 
-            self._stop_event.wait(1.0)
+            self._stop_event.wait(2.0)
 
     def _poll_windows_dns_cache(self, ipconfig_path: str) -> None:
         """

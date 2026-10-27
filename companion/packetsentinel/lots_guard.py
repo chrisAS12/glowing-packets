@@ -11,7 +11,7 @@ from __future__ import annotations
 import os
 import re
 from dataclasses import dataclass
-from typing import Optional, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 _BEARER_TOKEN_RE = re.compile(r"(?i)\bBearer\s+[A-Za-z0-9_\-\.\=\+]{8,}")
 _SENSITIVE_KEY_RE = re.compile(
@@ -110,6 +110,324 @@ KNOWN_SCRIPT_LOLBINS: frozenset[str] = frozenset(
     }
 )
 
+PACKAGE_MANAGERS: frozenset[str] = frozenset(
+    {
+        "npm.exe",
+        "npm",
+        "npm.cmd",
+        "pnpm.exe",
+        "pnpm",
+        "pnpm.cmd",
+        "yarn.exe",
+        "yarn",
+        "yarn.cmd",
+        "pip.exe",
+        "pip",
+        "pip3.exe",
+        "pip3",
+        "poetry.exe",
+        "poetry",
+        "cargo.exe",
+        "cargo",
+        "gem.exe",
+        "gem",
+        "go.exe",
+        "go",
+        "mvn.exe",
+        "mvn",
+        "gradle.exe",
+        "gradle",
+    }
+)
+
+LEGITIMATE_PACKAGE_REGISTRIES: frozenset[str] = frozenset(
+    {
+        "npmjs.org",
+        "npmjs.com",
+        "yarnpkg.com",
+        "pypi.org",
+        "pythonhosted.org",
+        "crates.io",
+        "github.com",
+        "githubusercontent.com",
+        "golang.org",
+        "pkg.go.dev",
+        "rubygems.org",
+        "maven.org",
+        "apache.org",
+        "nuget.org",
+    }
+)
+
+RECOGNIZED_AI_PROVIDERS: frozenset[str] = frozenset(
+    {
+        "openai.com",
+        "api.openai.com",
+        "anthropic.com",
+        "api.anthropic.com",
+        "googleapis.com",
+        "generativelanguage.googleapis.com",
+        "githubcopilot.com",
+        "copilot-proxy.githubusercontent.com",
+        "azure.com",
+        "openai.azure.com",
+    }
+)
+
+SHADOW_AI_GATEWAYS: frozenset[str] = frozenset(
+    {
+        "openrouter.ai",
+        "api.groq.com",
+        "groq.com",
+        "together.xyz",
+        "api.together.xyz",
+        "deepseek.com",
+        "api.deepseek.com",
+        "aimlapi.com",
+        "hyperbolic.xyz",
+        "replicate.com",
+        "api.mistral.ai",
+        "mistral.ai",
+        "anyscale.com",
+        "fireworks.ai",
+        "cohere.ai",
+        "api.cohere.ai",
+    }
+)
+
+POPULAR_PYPI_PACKAGES: frozenset[str] = frozenset(
+    {
+        "requests",
+        "urllib3",
+        "numpy",
+        "pandas",
+        "scipy",
+        "torch",
+        "tensorflow",
+        "flask",
+        "django",
+        "fastapi",
+        "pydantic",
+        "cryptography",
+        "boto3",
+        "pytest",
+        "httpx",
+        "aiohttp",
+        "pillow",
+        "openai",
+        "anthropic",
+        "transformers",
+        "scikit-learn",
+        "setuptools",
+        "wheel",
+        "pip",
+    }
+)
+
+POPULAR_NPM_PACKAGES: frozenset[str] = frozenset(
+    {
+        "express",
+        "lodash",
+        "axios",
+        "react",
+        "react-dom",
+        "next",
+        "typescript",
+        "vue",
+        "chalk",
+        "commander",
+        "glob",
+        "fs-extra",
+        "moment",
+        "dotenv",
+        "webpack",
+        "tailwindcss",
+        "cors",
+        "jsonwebtoken",
+    }
+)
+
+HALLUCINATION_PREFIXES: Tuple[str, ...] = ("python-", "py-", "node-", "lib-")
+HALLUCINATION_SUFFIXES: Tuple[str, ...] = (
+    "-python",
+    "-py",
+    "-js",
+    "-lib",
+    "-helper",
+    "-client-v2",
+    "-extended",
+    "-auth-helper",
+)
+
+
+@dataclass(frozen=True)
+class SlopsquatRiskResult:
+    """Security assessment for AI-hallucinated or typosquatted packages."""
+
+    is_suspicious: bool
+    severity: str  # "HIGH", "MEDIUM", "LOW"
+    reason: str
+    package_name: str
+    ecosystem: str
+    similar_popular_package: Optional[str] = None
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "is_suspicious": self.is_suspicious,
+            "severity": self.severity,
+            "reason": self.reason,
+            "package_name": self.package_name,
+            "ecosystem": self.ecosystem,
+            "similar_popular_package": self.similar_popular_package,
+        }
+
+
+def _damerau_levenshtein_distance(s1: str, s2: str) -> int:
+    """Compute Damerau-Levenshtein distance (including adjacent transposition)."""
+    d: Dict[Tuple[int, int], int] = {}
+    len1 = len(s1)
+    len2 = len(s2)
+    for i in range(-1, len1 + 1):
+        d[(i, -1)] = i + 1
+    for j in range(-1, len2 + 1):
+        d[(-1, j)] = j + 1
+
+    for i in range(len1):
+        for j in range(len2):
+            cost = 0 if s1[i] == s2[j] else 1
+            d[(i, j)] = min(
+                d[(i - 1, j)] + 1,
+                d[(i, j - 1)] + 1,
+                d[(i - 1, j - 1)] + cost,
+            )
+            if i > 0 and j > 0 and s1[i] == s2[j - 1] and s1[i - 1] == s2[j]:
+                d[(i, j)] = min(d[(i, j)], d[(i - 2, j - 2)] + 1)
+
+    return d[(len1 - 1, len2 - 1)]
+
+
+def check_ai_package_safety(
+    package_name: str,
+    ecosystem: str = "pypi",
+) -> SlopsquatRiskResult:
+    """
+    Validate whether a package name matches known AI hallucination patterns (slopsquatting),
+    prefix/suffix variations of top libraries, or edit-distance 1 typosquats.
+    """
+    if not package_name or not isinstance(package_name, str):
+        return SlopsquatRiskResult(
+            is_suspicious=False,
+            severity="LOW",
+            reason="Empty package name",
+            package_name="",
+            ecosystem=ecosystem,
+        )
+
+    clean_pkg = package_name.strip().lower()
+    popular_set = POPULAR_PYPI_PACKAGES if ecosystem.lower() == "pypi" else POPULAR_NPM_PACKAGES
+
+    # 1. Exact legitimate top package
+    if clean_pkg in popular_set:
+        return SlopsquatRiskResult(
+            is_suspicious=False,
+            severity="LOW",
+            reason=f"Verified top-tier {ecosystem.upper()} package.",
+            package_name=clean_pkg,
+            ecosystem=ecosystem,
+        )
+
+    # 2. Check for prefix spoofing (e.g., python-requests instead of requests)
+    for pfx in HALLUCINATION_PREFIXES:
+        if clean_pkg.startswith(pfx):
+            candidate = clean_pkg[len(pfx) :]
+            if candidate in popular_set:
+                return SlopsquatRiskResult(
+                    is_suspicious=True,
+                    severity="HIGH",
+                    reason=(
+                        f"AI hallucination / slopsquatting pattern detected: '{clean_pkg}' "
+                        f"mimics canonical library '{candidate}' with '{pfx}' prefix. "
+                        f"Did you mean to install '{candidate}'?"
+                    ),
+                    package_name=clean_pkg,
+                    ecosystem=ecosystem,
+                    similar_popular_package=candidate,
+                )
+
+    # 3. Check for suffix spoofing (e.g., requests-python or express-lib)
+    for sfx in HALLUCINATION_SUFFIXES:
+        if clean_pkg.endswith(sfx):
+            candidate = clean_pkg[: -len(sfx)]
+            if candidate in popular_set:
+                return SlopsquatRiskResult(
+                    is_suspicious=True,
+                    severity="HIGH",
+                    reason=(
+                        f"AI hallucination / slopsquatting pattern detected: '{clean_pkg}' "
+                        f"mimics canonical library '{candidate}' with '{sfx}' suffix. "
+                        f"Did you mean to install '{candidate}'?"
+                    ),
+                    package_name=clean_pkg,
+                    ecosystem=ecosystem,
+                    similar_popular_package=candidate,
+                )
+
+    # 4. Check for 1-character typo-squats or character swaps (transpositions)
+    for pop in popular_set:
+        if abs(len(clean_pkg) - len(pop)) <= 1:
+            dist = _damerau_levenshtein_distance(clean_pkg, pop)
+            if dist == 1:
+                return SlopsquatRiskResult(
+                    is_suspicious=True,
+                    severity="HIGH",
+                    reason=(
+                        f"Typosquat alert: '{clean_pkg}' is 1 typo/swap character away from "
+                        f"widely used package '{pop}'. Verify spelling before installing."
+                    ),
+                    package_name=clean_pkg,
+                    ecosystem=ecosystem,
+                    similar_popular_package=pop,
+                )
+
+    return SlopsquatRiskResult(
+        is_suspicious=False,
+        severity="LOW",
+        reason="No known hallucination or typosquat patterns detected.",
+        package_name=clean_pkg,
+        ecosystem=ecosystem,
+    )
+
+
+def check_ai_egress_risk(
+    process_name: str,
+    domain: str,
+    port: int = 443,
+) -> Optional[LOTSRiskResult]:
+    """
+    Check if a process is sending outbound telemetry to unapproved Shadow AI model endpoints.
+    """
+    if not (1 <= port <= 65535):
+        return None
+    norm_dom = normalize_domain_for_lots(domain)
+    if not norm_dom:
+        return None
+
+    # Check if domain matches any known Shadow AI endpoints
+    for shadow_endpoint in SHADOW_AI_GATEWAYS:
+        if norm_dom == shadow_endpoint or norm_dom.endswith(f".{shadow_endpoint}"):
+            proc_base = normalize_process_name(process_name) or "unknown"
+            return LOTSRiskResult(
+                is_threat=True,
+                severity="HIGH",
+                reason=(
+                    f"Shadow AI egress detected: Process '{proc_base}' communicating with "
+                    f"unvetted AI model gateway '{norm_dom}'"
+                ),
+                category="shadow_ai_egress",
+                matched_domain=norm_dom,
+            )
+    return None
+
 
 def normalize_domain_for_lots(raw_domain: str) -> str:
     """Normalize domain by trimming whitespace, trailing/leading dots, and lowercasing."""
@@ -153,6 +471,64 @@ def is_known_script_lolbin(process_name: str) -> bool:
     """Check if process basename is a known script interpreter or LOLBIN."""
     proc = normalize_process_name(process_name)
     return proc in KNOWN_SCRIPT_LOLBINS
+
+
+def is_package_manager_process(process_name: str) -> bool:
+    """Check if process basename is a known developer package manager."""
+    proc = normalize_process_name(process_name)
+    return proc in PACKAGE_MANAGERS
+
+
+def is_legitimate_registry_domain(domain: str) -> bool:
+    """Check if destination domain belongs to an official package registry or developer code host."""
+    norm = normalize_domain_for_lots(domain)
+    if not norm:
+        return False
+    for reg in LEGITIMATE_PACKAGE_REGISTRIES:
+        if norm == reg or norm.endswith(f".{reg}"):
+            return True
+    return False
+
+
+def check_supply_chain_risk(
+    process_name: str,
+    domain: str,
+    port: int = 443,
+) -> Optional[LOTSRiskResult]:
+    """
+    Evaluate if a developer package manager or build tool is connecting to an
+    unverified external domain (potential malicious postinstall hook or setup.py exfiltration).
+    """
+    if not is_package_manager_process(process_name):
+        return None
+
+    norm_dom = normalize_domain_for_lots(domain)
+    if not norm_dom:
+        return None
+
+    # Official package registries and code repos are expected egress
+    if is_legitimate_registry_domain(norm_dom):
+        return None
+
+    # Check if connecting to a known LOTS exfiltration service (webhook, tunnel, pastebin)
+    lots_match = find_matching_lots_endpoint(norm_dom)
+    proc_base = normalize_process_name(process_name)
+    if lots_match:
+        return LOTSRiskResult(
+            is_threat=True,
+            severity="CRITICAL",
+            reason=f"Supply-chain exfiltration alert: Package manager '{proc_base}' connecting to {lots_match.category} endpoint '{norm_dom}'",
+            category=f"supply_chain_{lots_match.category}",
+            matched_domain=norm_dom,
+        )
+
+    return LOTSRiskResult(
+        is_threat=True,
+        severity="HIGH",
+        reason=f"Supply-chain egress alert: Package manager '{proc_base}' contacting non-registry domain '{norm_dom}'",
+        category="supply_chain_unverified_egress",
+        matched_domain=norm_dom,
+    )
 
 
 def check_lots_risk(

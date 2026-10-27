@@ -62,6 +62,10 @@ class LiveMonitorService:
         self._running = False
         self._feeds_loaded = False
         self._lock = threading.Lock()
+        self._has_tshark = bool(find_verified_tshark())
+        self._cached_alerts: List[AlertRow] = []
+        self._last_alerts_mtime: float = -1.0
+        self._last_alerts_size: int = -1
 
     @property
     def alerts_file(self) -> Path:
@@ -88,6 +92,27 @@ class LiveMonitorService:
             self._monitor.stop()
             self._running = False
 
+    def set_ai_only_mode(self, enabled: bool) -> None:
+        """Filter packet monitoring to AI IDE tools and script interpreters only."""
+        self._monitor.set_ai_only_mode(enabled)
+
+    def set_ignored_processes(self, procs: List[str]) -> None:
+        """Set process names to skip during packet inspection to save CPU."""
+        self._monitor.set_ignored_processes(procs)
+
+    def clear_alerts(self, wipe_disk: bool = False) -> None:
+        """Clear cached alerts and optionally wipe the local alerts.jsonl file."""
+        with self._lock:
+            self._cached_alerts.clear()
+            self._last_alerts_mtime = -1.0
+            self._last_alerts_size = -1
+        if wipe_disk:
+            try:
+                if self.alerts_file.exists():
+                    self.alerts_file.write_text("", encoding="utf-8")
+            except Exception:
+                pass
+
     def shutdown(self) -> None:
         self.stop()
         self._notifier.close()
@@ -106,7 +131,7 @@ class LiveMonitorService:
         )
 
     def snapshot(self) -> MonitorSnapshot:
-        mode = "Wireshark tshark wire capture" if find_verified_tshark() else "Socket + DNS-cache polling"
+        mode = "Wireshark tshark wire capture" if self._has_tshark else "Socket + DNS-cache polling"
         return MonitorSnapshot(
             running=self._running,
             capture_mode=mode,
@@ -119,7 +144,19 @@ class LiveMonitorService:
         )
 
     def recent_alerts(self, limit: int = 50) -> List[AlertRow]:
-        return read_recent_alerts(self.alerts_file, limit)
+        p = self.alerts_file
+        if not p.exists():
+            return []
+        try:
+            stat = p.stat()
+            if stat.st_mtime == self._last_alerts_mtime and stat.st_size == self._last_alerts_size:
+                return self._cached_alerts[:limit]
+            self._last_alerts_mtime = stat.st_mtime
+            self._last_alerts_size = stat.st_size
+            self._cached_alerts = read_recent_alerts(p, limit=limit)
+            return self._cached_alerts
+        except Exception:
+            return read_recent_alerts(p, limit=limit)
 
     def get_process_event_count(self, process_name: str, pid: Optional[int] = None) -> int:
         """Return total wire events inspected and attributed to this process/PID."""
